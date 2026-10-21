@@ -230,7 +230,9 @@ impl Cloud {
             None if info.points > SLICE_ALL_LIMIT => Some(0.005),
             None => None,
         };
-        let slice = crate::slice(path, z0, z1, eff)?;
+        let cap = if max_points == 0 { ALL_POINTS_LIMIT } else { max_points.max(10_000) };
+        // The read never holds more than the cap: the cell grows while the file streams.
+        let slice = crate::slice_capped(path, z0, z1, eff, cap)?;
         Ok(Self::from_slice(name, path.display().to_string(), z0, z1, eff, slice, max_points, color).with_crs(info.crs))
     }
 

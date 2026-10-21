@@ -731,9 +731,10 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
             if c.ground_only && level.classes.get(i).is_none_or(|k| *k != cadcraft_pointcloud::CLASS_GROUND) {
                 continue;
             }
-            let x = f64::from(v.x) + c.origin[0];
-            let y = f64::from(v.y) + c.origin[1];
-            if c.clip.is_some_and(|clip| !clip.contains(x, y, f64::from(v.z))) {
+            // The site frame: the drawing's (0, 0, 0) is the world's origin point.
+            let x = f64::from(v.x) + c.origin[0] - app.session.local_origin[0];
+            let y = f64::from(v.y) + c.origin[1] - app.session.local_origin[1];
+            if c.clip.is_some_and(|clip| !clip.contains(x + app.session.local_origin[0], y + app.session.local_origin[1], f64::from(v.z))) {
                 continue;
             }
             if x < far.min.x || x > far.max.x || y < far.min.y || y > far.max.y {

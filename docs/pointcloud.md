@@ -1,6 +1,6 @@
 # Point clouds (LAS/LAZ) — RENCAD
 
-> **Last reviewed:** 2026-10-21 · **Status:** M11 — the ground filter and the scan's coordinate system · **Fork addition**
+> **Last reviewed:** 2026-10-21 · **Status:** M11 — the ground filter, the scan's coordinate system, the site frame · **Fork addition**
 
 RENCAD is the working name of this fork of CADCraft (the crates and the binary keep their upstream
 names so the weekly rebase stays a fast-forward). The fork adds point cloud support: M1 read a
@@ -289,6 +289,22 @@ exported slice keeps its place on the globe.
 The fork does not reproject: the drawing is 2D in local units, and a scan is placed where its file
 puts it. A file that names no system says so plainly instead of pretending.
 
+### `LASORIGIN {x?, y?, z?, reset?}` · `LASCRS {epsg?, name?, reset?}`
+
+`LASORIGIN` sets the site frame — the world point that sits at the drawing's (0, 0, 0). Without
+arguments it is the middle of the first cloud with its lowest point at zero; with `x`, `y`, `z` it
+is the point the survey office gives. `LASCRS` declares the coordinate system of the project for
+the files that name none (a registered Faro scan has no CRS record at all).
+
+```json
+{"command":"lasorigin","params":{}}
+```
+
+```json
+{"message":"the site origin is at 498003.760, 290188.238, 101.311: the drawing's (0, 0, 0) is that point in the world",
+ "origin":[498003.76029999997,290188.2384,101.311]}
+```
+
 ### `LASGROUND {cell?, tolerance?, bump?, sigma?, show?, index?}`
 
 `cell` is the size of the cells the surface is built on (0.5 m), `tolerance` how far above the
@@ -305,6 +321,34 @@ drawing between everything and the ground alone.
 {"message":"Ap 1: 737687 ground points, 43078 noise, 3118780 unclassified (showing the ground only)",
  "ground":737687,"noise":43078,"unclassified":3118780,"groundOnly":true}
 ```
+
+### The site frame
+
+A registered survey sits hundreds of kilometres from the drawing's origin — the factory at
+E 498 162, N 290 290 is 500 km from (0, 0) — so a scan in a projected system and a drawing in
+local metres have to meet somewhere. The **site origin** is that meeting point: the world point
+that sits at the drawing's (0, 0, 0). The clouds and the drawing share the local frame, and the
+origin is the tie between them (the same idea as AutoCAD's georeferencing point).
+
+`LASORIGIN` sets it: without arguments the middle of the first cloud, with its lowest point at
+zero; with `x`, `y`, `z` the point is placed where the survey office says it is. The 2D overlay,
+the 3D view, `LASFRAME` and the ground filter all follow it.
+
+`LASCRS {epsg}` declares the system's code for the files that name none — a registered Faro scan
+carries no CRS record at all, the georeference lives in the survey project. The code is shown in
+the palette, and `LASEXPORT` writes the matching WKT next to the exported drawing as a `.prj`.
+
+### Reading a 50-million-point survey
+
+A registered scan is 1.8–3.3 GB and 53–98 million points. The read never holds them: the points
+are binned into cells while the file streams, and when the kept points outgrow the cap the cell
+doubles and the points kept so far are re-binned. The memory stays flat, and the levels built
+from the result are the ones the whole file would have given.
+
+The cap (`maxPoints`, 6 million by default) decides how much detail survives: the finest level of
+a 53-million-point survey holds the first `maxPoints` points of the read, spread evenly, not the
+walls in full detail. A survey that wants the structures sharp needs the streaming LOD of the
+next milestone.
 
 ### 3D drafting
 
@@ -435,6 +479,9 @@ buffer.
 - No classification filter: the ground is found by the fork's own filter, but the file's own
   class codes are not read back into the drawing.
 - No reprojection: a scan is placed where its file puts it, in local units.
+- A huge survey thins evenly: the finest level of a 50-million-point scan holds the first
+  `maxPoints` points spread evenly, so the walls lose their detail before the open yard does
+  (the streaming LOD of the next milestone fixes it).
 - No ortho PNG/GeoTIFF export, no intensity histogram.
 - The finest level is capped by `maxPoints`; above it the grid is coarsened silently (the returned
   `points` says so). Raise `maxPoints` for a dense survey workstation.

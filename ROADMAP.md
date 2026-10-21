@@ -94,9 +94,12 @@ workflow a survey office actually does — open the scan, cut it, look at it, tr
 | M9 | Clarity without a depth buffer: front wall cut and depth cue in the vertex shader; colour ramps over the 2%–98% window so outliers can't flatten the contrast | done |
 | M10a | **The ground under the cloud**: a morphological filter with a slope correction (the apartment's floor plan comes out of the scan), classes beside the 16-byte vertex, `LASGROUND` and the palette's **Find ground** / **Ground only** | done |
 | M11a | **Georeferencing**: the CRS the file names (GeoTIFF keys or WKT) in the palette, `LASINFO` and a `.prj` sidecar next to an exported drawing. No reprojection: the drawing is 2D in local units | done |
+| M11b | **The site frame**: `LASORIGIN` ties the drawing's (0, 0, 0) to a world point, so a registered survey 500 km from the origin lands where the drawing is; `LASCRS` declares the system's code for the files that name none | done |
+| M11c | **Big surveys**: the read keeps the memory flat (the cell grows while the file streams), so a 53-million-point, 1.8 GB scan opens without holding the file in memory | done |
 | M10b | A vertical section through the cloud: cut it with a plane, get a profile polyline, export it as a drawing (≈ 6–10 h) | planned |
 | M10c | COPC read on the octree (level + bounds query, so only the points in view are fetched) and LAZ writing (≈ 10–16 h) | planned |
-| Next | Reprojection, a height/DSM grid, the section tool, the 3D strokes as drawing entities | planned |
+| M12 | A streaming LOD: the levels built while the file is read, so a 50-million-point survey keeps its walls sharp instead of thinning evenly (≈ 12–20 h) | planned |
+| Next | Reprojection, a height/DSM grid, the 3D strokes as drawing entities | planned |
 
 The fork's own overview is [RENCAD.md](RENCAD.md); the detail is [docs/pointcloud.md](docs/pointcloud.md).
 These milestones do not change the AutoCAD parity numbers above: they add a capability the

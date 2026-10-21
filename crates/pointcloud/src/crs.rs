@@ -61,6 +61,38 @@ impl Crs {
     pub fn prj(&self) -> Option<&str> {
         self.wkt.as_deref()
     }
+
+    /// The WKT of a system the fork knows, for the files that name none: WGS 84, NAD83 and their
+    /// UTM zones. `None` for the rest — the code is still the honest answer.
+    pub fn wkt_for(epsg: u32) -> Option<String> {
+        let geographic = |name: &str, datum: &str, ellipsoid: &str, code: &str| {
+            format!(
+                "GEOGCS[\"{name}\",DATUM[\"{datum}\",SPHEROID[\"{ellipsoid}\",6378137,298.257223563,AUTHORITY[\"EPSG\",\"7030\"]],AUTHORITY[\"EPSG\",\"6326\"]],PRIMEM[\"Greenwich\",0,AUTHORITY[\"EPSG\",\"8901\"]],UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]],AUTHORITY[\"EPSG\",\"{code}\"]]"
+            )
+        };
+        let projected = |name: &str, base: &str, zone: u32, south: bool, code: u32| {
+            let central_meridian = 6.0 * f64::from(zone) - 183.0;
+            let false_northing = if south { 10_000_000.0 } else { 0.0 };
+            format!(
+                "PROJCS[\"{name}\",{base},PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",{central_meridian}],PARAMETER[\"scale_factor\",0.9996],PARAMETER[\"false_easting\",500000],PARAMETER[\"false_northing\",{false_northing}],UNIT[\"metre\",1,AUTHORITY[\"EPSG\",\"9001\"]],AUTHORITY[\"EPSG\",\"{code}\"]]",
+                name = name,
+                base = base,
+                central_meridian = central_meridian,
+                false_northing = false_northing,
+                code = code
+            )
+        };
+        let wgs84 = geographic("WGS 84", "WGS_1984", "WGS 84", "4326");
+        let nad83 = geographic("NAD83", "North_American_Datum_1983", "GRS 1980", "4269");
+        Some(match epsg {
+            4326 => wgs84,
+            4269 => nad83,
+            32601..=32660 => projected(&format!("WGS 84 / UTM zone {}N", epsg - 32600), &wgs84, epsg - 32600, false, epsg),
+            32701..=32760 => projected(&format!("WGS 84 / UTM zone {}S", epsg - 32700), &wgs84, epsg - 32700, true, epsg),
+            26901..=26923 => projected(&format!("NAD83 / UTM zone {}N", epsg - 26900), &nad83, epsg - 26900, false, epsg),
+            _ => return None,
+        })
+    }
 }
 
 /// The EPSG code out of a WKT string: the last `AUTHORITY["EPSG","32610"]` (or `ID["EPSG",32610]`)
@@ -95,6 +127,58 @@ pub fn epsg_from_wkt(wkt: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A diagnostic: `RENCAD_CRS_PROBE=<file.las> cargo test -p cadcraft-pointcloud crs_probe`
+    /// prints the header's variable length records, to see how a file names its system.
+    #[test]
+    fn crs_probe() {
+        let Ok(path) = std::env::var("RENCAD_CRS_PROBE") else { return };
+        let reader = las::Reader::from_path(&path).expect("the file opens");
+        let header = reader.header();
+        println!("version {:?} format {:?}", header.version(), header.point_format());
+        for vlr in header.all_vlrs() {
+            println!("VLR user={:?} record={} desc={:?} bytes={}", vlr.user_id, vlr.record_id, vlr.description, vlr.data.len());
+            if vlr.data.len() < 400 {
+                println!("   text: {}", String::from_utf8_lossy(&vlr.data));
+            }
+        }
+    }
+
+    /// A diagnostic: `RENCAD_READ_PROBE=<file.las> cargo test -p cadcraft-pointcloud read_probe`
+    /// times the read on its own and with the cell set, to see where a 50-million-point file goes.
+    #[test]
+    fn read_probe() {
+        let Ok(path) = std::env::var("RENCAD_READ_PROBE") else { return };
+        let t = std::time::Instant::now();
+        let mut reader = las::Reader::from_path(&path).expect("the file opens");
+        let mut n = 0u64;
+        loop {
+            let batch = reader.read_points(1_000_000).expect("the batch reads");
+            if batch.is_empty() {
+                break;
+            }
+            n += batch.points().count() as u64;
+        }
+        println!("read {n} points in {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let mut reader = las::Reader::from_path(&path).expect("the file opens");
+        let mut seen: std::collections::HashSet<(i64, i64, i64)> = std::collections::HashSet::new();
+        let mut kept = 0u64;
+        loop {
+            let batch = reader.read_points(1_000_000).expect("the batch reads");
+            if batch.is_empty() {
+                break;
+            }
+            for p in batch.points() {
+                let p = p.expect("the point reads");
+                let key = ((p.x / 0.005).floor() as i64, (p.y / 0.005).floor() as i64, (p.z / 0.005).floor() as i64);
+                if seen.insert(key) {
+                    kept += 1;
+                }
+            }
+        }
+        println!("read + binned {kept} points in {:?}", t.elapsed());
+    }
 
     const WKT: &str = r#"PROJCS["WGS 84 / UTM zone 10N",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],UNIT["metre",1],AUTHORITY["EPSG","32610"]]"#;
 
@@ -177,5 +261,19 @@ mod tests {
     fn a_geographic_system_is_told_from_a_projected_one() {
         assert!(Crs { epsg: Some(4326), wkt: None }.is_geographic());
         assert!(!Crs { epsg: Some(32610), wkt: None }.is_geographic());
+    }
+
+    /// The WKT the fork writes next to an exported drawing when only the code is known.
+    #[test]
+    fn the_known_systems_get_a_wkt() {
+        let wkt = Crs::wkt_for(32610).expect("UTM 10N is known");
+        assert!(wkt.contains("AUTHORITY[\"EPSG\",\"32610\"]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"central_meridian\",-123]"), "zone 10's meridian is 123°W: {wkt}");
+        assert!(wkt.contains("PARAMETER[\"false_easting\",500000]"), "{wkt}");
+        let south = Crs::wkt_for(32734).expect("UTM 34S is known");
+        assert!(south.contains("PARAMETER[\"false_northing\",10000000]"), "{south}");
+        let geographic = Crs::wkt_for(4326).expect("WGS 84 is known");
+        assert!(geographic.starts_with("GEOGCS[\"WGS 84\""), "{geographic}");
+        assert_eq!(Crs::wkt_for(1234), None, "an unknown code gets no WKT, only the number");
     }
 }

@@ -36,6 +36,7 @@ for. Detail: [pointcloud.md](pointcloud.md).
 | P6 | **No point classification, no intensity histogram and no colour export** (the orthophoto-style PNG/GeoTIFF export of a coloured cloud) | — | Low-medium | 6–10 |
 | P7 | **The 2%–98% window clips the extreme values**: a point far above the rest takes the top colour instead of its own | `crates/pointcloud/src/cloud.rs` | Low: the price of the contrast | 0 (accepted) |
 | P8 | **No reprojection**: the CRS of a scan is read and reported, but the points are not moved between systems | `crates/pointcloud/src/crs.rs` | Medium: a georeferenced drawing and a scan cannot share a frame yet | 12–20 |
+| P9 | **A huge survey thins evenly**: the read keeps the memory flat, but the finest level of a 50-million-point scan holds the first `maxPoints` points spread evenly, so the walls lose their detail before the open yard does. The fix is a streaming LOD (levels built while the file is read) | `crates/pointcloud/src/slice.rs` | Medium-high: a 50 M survey draws flatter than it should | 12–20 |
 
 ## Features
 

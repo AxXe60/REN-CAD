@@ -715,6 +715,13 @@ pub struct Session {
     /// How a click in the 3D view picks its point: the exact cloud point, or the average of the
     /// points around it (fork addition; set with 3DSNAP).
     pub snap3d: cadcraft_pointcloud::SnapMode,
+    /// The site frame: the world point that sits at the drawing's (0, 0, 0). A registered survey
+    /// sits hundreds of kilometres from the origin, so the clouds and the drawing share a local
+    /// frame and this is the tie between the two (fork addition; set with LASORIGIN).
+    pub local_origin: [f64; 3],
+    /// The coordinate reference system the project is in, when the files do not name one
+    /// (fork addition; set with LASCRS).
+    pub crs: Option<cadcraft_pointcloud::Crs>,
 }
 
 impl Default for Session {
@@ -767,6 +774,8 @@ impl Session {
             clouds: Vec::new(),
             sketch: cadcraft_pointcloud::Sketch3d::default(),
             snap3d: cadcraft_pointcloud::SnapMode::default(),
+            local_origin: [0.0; 3],
+            crs: None,
         }
     }
     pub fn new_drawing(&mut self, metric: bool) -> usize {

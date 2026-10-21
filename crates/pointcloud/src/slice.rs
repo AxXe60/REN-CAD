@@ -35,6 +35,16 @@ pub struct Slice {
 /// and drops the noise. The cell is a cube, not an XY square, so a wall keeps points up its
 /// height. Streaming: the whole file is never held in memory.
 pub fn slice(path: &Path, z0: f64, z1: f64, decimate: Option<f64>) -> Result<Slice> {
+    slice_capped(path, z0, z1, decimate, usize::MAX)
+}
+
+/// The same, but never keeping more than `max_points` points in memory.
+///
+/// A registered survey is 50–100 million points (1.8–3.3 GB). Holding them all would cost
+/// gigabytes, so the cell grows while the file is read: when the kept points outgrow the cap, the
+/// cell is coarsened by half again and the points kept so far are re-binned. The memory stays
+/// flat, and the levels built from the result are the ones the whole file would have given.
+pub fn slice_capped(path: &Path, z0: f64, z1: f64, decimate: Option<f64>, max_points: usize) -> Result<Slice> {
     if z1 <= z0 {
         return Err(Error::EmptyBand { z0, z1 });
     }
@@ -45,10 +55,15 @@ pub fn slice(path: &Path, z0: f64, z1: f64, decimate: Option<f64>) -> Result<Sli
     };
     let mut reader = las::Reader::from_path(path).map_err(|e| Error::Las { path: path.display().to_string(), source: e })?;
     let total = reader.header().number_of_points();
-    let mut points = Vec::new();
+    let mut points: Vec<Pt> = Vec::new();
     let mut bounds = Bounds3::EMPTY;
     let mut seen: HashSet<(i64, i64, i64)> = HashSet::new();
     let mut in_band = 0u64;
+    // The cell the points are binned on; it grows when the band holds too many.
+    let mut cell = cell;
+    // Re-binning is the expensive part, so it waits until the kept points are half again over the
+    // cap, and the cell then doubles: a survey of 50 million points is read in a handful of passes.
+    let limit = max_points.saturating_mul(3) / 2;
     // Batches of a million keep memory flat while streaming a 12-million-point scan.
     loop {
         let batch = reader.read_points(1_000_000).map_err(|e| Error::Las { path: path.display().to_string(), source: e })?;
@@ -70,6 +85,21 @@ pub fn slice(path: &Path, z0: f64, z1: f64, decimate: Option<f64>) -> Result<Sli
             let rgb = p.color.map(|c| [to_u8(c.red), to_u8(c.green), to_u8(c.blue)]);
             bounds.add(p.x, p.y, p.z);
             points.push(Pt { x: p.x, y: p.y, z: p.z, rgb, intensity: p.intensity, class: u8::from(p.classification) });
+        }
+        // Too many points kept: coarser cells, and the points kept so far are re-binned.
+        if points.len() > limit {
+            let c = cell.map_or(0.005, |c| c * 2.0);
+            cell = Some(c);
+            let mut kept: Vec<Pt> = Vec::with_capacity(points.len() / 2);
+            let mut cells: HashSet<(i64, i64, i64)> = HashSet::with_capacity(points.len() / 2);
+            for pt in points.drain(..) {
+                let key = ((pt.x / c).floor() as i64, (pt.y / c).floor() as i64, (pt.z / c).floor() as i64);
+                if cells.insert(key) {
+                    kept.push(pt);
+                }
+            }
+            points = kept;
+            seen = cells;
         }
     }
     if points.is_empty() {

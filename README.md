@@ -48,6 +48,8 @@ RENCAD reads LAS/LAZ scans and puts them where you can work with them: under the
 | **Crop without re-reading** | Raise the Z to drop the floor, lower it to drop the ceiling, pull X and Y in to take the walls away. |
 | **The ground under the cloud** | **Find ground** separates the floor from the furniture with a morphological filter that follows a slope; **Ground only** then draws the floor plan and nothing else. |
 | **Where the scan is** | The coordinate system the file names (EPSG code and WKT) is read, shown in the palette and written next to an exported drawing as a `.prj` file. |
+| **The site frame** | A registered survey sits 500 km from the drawing's origin: `LASORIGIN` ties the drawing's (0, 0, 0) to a world point, and `LASCRS` declares the system for the files that name none. |
+| **Huge surveys** | A 53-million-point, 1.8 GB scan opens without ever holding the file in memory: the points are binned while the file streams. |
 | **3D view** | An orbit camera with a 35° lens or a true orthographic projection, zoom anchored at the cursor, Top/Front/Iso views, and only the points on screen are uploaded. |
 | **Clarity without a depth buffer** | A **front wall cut** drops the points between the camera and the target, so you can look into a room; a **depth cue** fades the far ones into the background and shrinks them, so the near geometry stands out. |
 | **3D drafting** | Click to place vertices that snap to the cloud, hold a plane with the **Z lock**, follow one axis with **Shift**, close the polyline with **C**, and export DXF `LINE`s with their Z — one layer per stroke. |

@@ -211,6 +211,7 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
     // Where the scan says it is: the EPSG code and the system's name.
     ui.horizontal(|ui| {
         ui.add_space(8.0);
+        let crs = app.session.crs.clone().or_else(|| crs.clone());
         let text = match &crs {
             Some(crs) => match (crs.epsg, crs.name()) {
                 (Some(code), Some(name)) => format!("CRS: EPSG:{code} · {name}"),
@@ -218,6 +219,17 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
                 (None, _) => "CRS: the file names a system, but no EPSG code".to_string(),
             },
             None => "CRS: the file names none".to_string(),
+        };
+        ui.label(egui::RichText::new(text).color(t.text_dim).size(11.0));
+    });
+    // The site frame: the drawing's (0, 0, 0) is that point in the world.
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let o = app.session.local_origin;
+        let text = if o == [0.0; 3] {
+            "Site origin: the drawing's (0, 0, 0) is the world's (0, 0, 0)".to_string()
+        } else {
+            format!("Site origin: {:.3}, {:.3}, {:.3}", o[0], o[1], o[2])
         };
         ui.label(egui::RichText::new(text).color(t.text_dim).size(11.0));
     });

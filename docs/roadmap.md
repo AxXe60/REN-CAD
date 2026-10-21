@@ -40,11 +40,14 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M9 | Front wall cut and depth cue in the vertex shader (clarity without a depth buffer); colour ramps over the 2%–98% window | done |
 | M10a | The ground under the cloud: a morphological filter with a slope correction, classes beside the 16-byte vertex, `LASGROUND`, **Find ground** / **Ground only** | done |
 | M11a | Georeferencing: the CRS the file names (GeoTIFF keys or WKT), shown in the palette and `LASINFO`, written as a `.prj` sidecar next to an exported drawing | done |
+| M11b | The site frame: `LASORIGIN` ties the drawing's (0, 0, 0) to a world point; `LASCRS` declares the system's code for the files that name none | done |
+| M11c | Big surveys: the read keeps the memory flat — the cell grows while the file streams — so a 53-million-point scan opens without holding the file in memory | done |
 | M10b | A vertical section through the cloud: a plane cut, a profile polyline, exported as a drawing (≈ 6–10 h) | planned |
 | M10c | COPC on the octree (read only the levels and bounds in view) and LAZ writing (≈ 10–16 h) | planned |
-| M11b | Reprojection between CRSs, so a scan and a georeferenced drawing can share a frame (≈ 12–20 h) | planned |
+| M11d | Reprojection between CRSs, so a scan and a georeferenced drawing can share a frame (≈ 12–20 h) | planned |
+| M12 | A streaming LOD: the levels built while the file is read, so a huge survey keeps its walls sharp (≈ 12–20 h) | planned |
 | M11 | The 3D strokes as real drawing entities — waits for the 3D kernel, so the upstream's own 3D milestone is the blocker | planned |
-| M12 | A height/DSM grid over the band, with contours (≈ 12–18 h) | planned |
+| M13 | A height/DSM grid over the band, with contours (≈ 12–18 h) | planned |
 
 M10b is the next one that can land without the upstream's 3D kernel.
 

@@ -30,6 +30,8 @@ selecția, undo-ul și salvarea văd doar ce a desenat utilizatorul.
 | **Măsurare 3D**: lungime, dXY, dZ, pantă — live și ca comandă | gata |
 | **Teren sub nor**: filtru morfologic cu ajustare pe pantă (planul etajului) | gata |
 | **Georeferențiere**: CRS din fișier (GeoTIFF keys / WKT) + `.prj` la export | gata |
+| **Cadrul de șantier**: `LASORIGIN` (punctul din lume de la 0,0,0) + `LASCRS` | gata |
+| **Nori de 50–100M puncte**: citire cu plafon, fără să țină fișierul în memorie | gata |
 | **Claritate 3D fără depth buffer**: front wall cut + depth cue | gata |
 | **Contrast robust**: rampele folosesc percentilele 2%–98% | gata |
 | Layere pe stroke (DXF per layer) + închidere polilinie | gata |
@@ -134,6 +136,21 @@ LAS ──► 3DLINE ──► Session.sketch ───────────�
 - Fork-ul **nu reproiectează**: desenul e 2D în unități locale, iar norul rămâne unde îl pune
   fișierul. Un fișier fără CRS spune asta, nu inventează.
 
+### 3.10 Cadrul de șantier (M11b) — `LASORIGIN`, `LASCRS`
+- Un scan înregistrat e la sute de km de originea desenului (fabrica: E 498 162, N 290 290).
+  **Cadrul de șantier** le leagă: punctul din lume care stă în (0,0,0)-ul desenului.
+- `LASORIGIN` îl pune (implicit: mijlocul primului nor, solul la 0); overlay-ul 2D, vederea 3D,
+  `LASFRAME` și filtrul de teren îl respectă.
+- `LASCRS {epsg}` declară sistemul proiectului pentru fișierele care nu-l spun (un scan Faro
+  înregistrat nu are niciun VLR: georeferențierea stă în proiectul de topografie) → `.prj` la export.
+
+### 3.11 Nori de 50–100 de milioane de puncte
+- Citirea nu ține niciodată fișierul în memorie: punctele sunt puse în celule în timp ce fișierul
+  se citește, iar când cele păstrate depășesc plafonul, celula se dublează și se regrupează.
+- Plafonul (`maxPoints`, 6 milioane implicit) decide cât de mult detaliu rămâne: nivelul cel mai
+  fin al unui scan de 53M are primele `maxPoints` puncte, repartizate uniform, nu pereții în
+  detaliu. LOD-ul de streaming (niveluri pe măsură ce se citesc) e milestone-ul următor.
+
 Nu există depth buffer în pipeline-ul 3D (folosește doar stencil), deci liniile și punctele nu se
 ocludează reciproc. E o alegere conștientă: nu atingem pipeline-urile upstream. În schimb, snap-ul
 prioritizat pe adâncime compensează lipsa depth buffer-ului.
@@ -152,6 +169,8 @@ Toate sunt `CommandSpec`, deci merg din linia de comandă, CLI, control JSON și
 | `LASCLIP {min,max,index?}` / `{reset:true}` | crop box (tavan/pereți/podea) |
 | `LASVISIBLE {visible?,index?}` | arată/ascunde |
 | `LASGROUND {cell?,tolerance?,bump?,sigma?,show?}` | găsește terenul / desenează doar terenul |
+| `LASORIGIN {x?,y?,z?,reset?}` | cadrul de șantier: punctul din lume de la (0,0,0) |
+| `LASCRS {epsg?,name?,reset?}` | sistemul proiectului, pentru fișierele care nu-l spun |
 | `LASFRAME {index?}` | încadrează XY în 2D |
 | `LASCLOSE {index?,all?}` · `LASCLOUDS {}` | închide / listează |
 | `3DLINE {points:[[x,y,z],…], layer?, closed?}` | adaugă o polilinie 3D (implicit `3D_DRAFT`) |

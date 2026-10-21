@@ -371,16 +371,22 @@ impl View3d {
     }
 }
 
-/// The box around every visible cloud (world coordinates).
+/// The box around every visible cloud, in the site frame (the drawing's (0, 0, 0) is the world's
+/// origin point).
 fn cloud_bounds(app: &CadApp) -> Option<([f64; 3], [f64; 3])> {
     let mut it = app.session.clouds.iter().filter(|c| c.visible);
     let first = it.next()?;
+    let local = app.session.local_origin;
     let (mut min, mut max) = (first.bounds.min, first.bounds.max);
     for c in it {
         for i in 0..3 {
             min[i] = min[i].min(c.bounds.min[i]);
             max[i] = max[i].max(c.bounds.max[i]);
         }
+    }
+    for i in 0..3 {
+        min[i] -= local[i];
+        max[i] -= local[i];
     }
     Some((min, max))
 }
@@ -464,7 +470,7 @@ fn scene_key(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudL
 }
 
 /// Recolour the picked levels and pack the visible ones for upload.
-fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)], center: [f64; 3], radius: f64) -> Scene3d {
+fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)], center: [f64; 3], radius: f64, local: [f64; 3]) -> Scene3d {
     let total: usize = picks.iter().map(|(_, level)| level.pts.len()).sum();
     let r2 = radius * radius;
     let mut scene = Scene3d { points: Vec::with_capacity(total.min(MAX_SCENE_POINTS)) };
@@ -474,7 +480,8 @@ fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::Clou
             if c.ground_only && level.classes.get(i).is_none_or(|k| *k != cadcraft_pointcloud::CLASS_GROUND) {
                 continue;
             }
-            let (x, y, z) = (f64::from(v.x) + c.origin[0], f64::from(v.y) + c.origin[1], f64::from(v.z));
+            // The site frame: the drawing's (0, 0, 0) is the world's origin point.
+            let (x, y, z) = (f64::from(v.x) + c.origin[0] - local[0], f64::from(v.y) + c.origin[1] - local[1], f64::from(v.z) - local[2]);
             let (dx, dy, dz) = (x - center[0], y - center[1], z - center[2]);
             if dx * dx + dy * dy + dz * dz > r2 {
                 continue;
@@ -763,7 +770,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     let key = scene_key(&picks, center, radius);
     if app.view3d.key != Some(key) {
         let started = std::time::Instant::now();
-        let scene = build_scene(&picks, center, radius);
+        let scene = build_scene(&picks, center, radius, app.session.local_origin);
         let drawn = scene.points.len();
         if let Ok(mut slot) = app.view3d.slot.lock() {
             *slot = Some(scene);
@@ -1071,7 +1078,7 @@ mod tests {
     #[test]
     fn an_empty_cloud_selection_builds_an_empty_scene() {
         let picks = pick_levels(&[], 50.0, [0.0; 3], 10.0);
-        let scene = build_scene(&picks, [0.0; 3], 10.0);
+        let scene = build_scene(&picks, [0.0; 3], 10.0, [0.0; 3]);
         assert_eq!(scene.points.len(), 0);
         assert_eq!(scene_key(&picks, [0.0; 3], 10.0), scene_key(&[], [0.0; 3], 10.0));
     }
@@ -1093,7 +1100,7 @@ mod tests {
         assert!((90..=110).contains(&n), "a 10 m ball of a 0.1 m line: {n}");
         let clouds = [c];
         let picks = pick_levels(&clouds, 4000.0, center, radius);
-        assert_eq!(build_scene(&picks, center, radius).points.len(), n);
+        assert_eq!(build_scene(&picks, center, radius, [0.0; 3]).points.len(), n);
     }
 
     /// Orbiting changes no key input; zooming and panning do, in coarse steps.

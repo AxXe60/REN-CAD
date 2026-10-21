@@ -14,7 +14,7 @@ use crate::View;
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("lasinfo", "Point Cloud Information", |_, p| lasinfo(p)).params("{path: string}").enabled(always).noundo(),
-        CommandSpec::new("lasexport", "Export Point Cloud Slice", |_, p| lasexport(p))
+        CommandSpec::new("lasexport", "Export Point Cloud Slice", lasexport)
             .params("{path: string, out: string, z0?: number, z1?: number, decimate?: number, layer?: string}")
             .enabled(always)
             .noundo(),
@@ -36,6 +36,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{cell?: number, tolerance?: number, bump?: number, sigma?: number, show?: bool, index?: int}")
             .enabled(always)
             .noundo(),
+        CommandSpec::new("lasorigin", "Set the Site Origin", lasorigin)
+            .params("{x?: number, y?: number, z?: number, reset?: bool}")
+            .enabled(always)
+            .noundo(),
+        CommandSpec::new("lascrs", "Set the Project CRS", lascrs).params("{epsg?: int, name?: string, reset?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasclouds", "List Point Clouds", |s, _| lasclouds(s)).params("{}").enabled(always).noundo(),
@@ -100,7 +105,7 @@ fn crs_json(crs: &Option<cadcraft_pointcloud::Crs>) -> Value {
     }
 }
 
-fn lasexport(p: &Value) -> Result<Value> {
+fn lasexport(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(text(p, "path")?);
     let out = PathBuf::from(text(p, "out")?);
     let info = cadcraft_pointcloud::read_info(&path).map_err(oops)?;
@@ -109,12 +114,16 @@ fn lasexport(p: &Value) -> Result<Value> {
     let decimate = number(p, "decimate").filter(|v| *v > 0.0);
     let layer = p.get("layer").and_then(Value::as_str).unwrap_or("PC-SLICE").to_string();
 
-    let slice = cadcraft_pointcloud::slice(&path, z0, z1, decimate).map_err(oops)?;
+    // The export reads the whole band: the memory stays bounded by the all-points limit, and the
+    // cell grows if the band holds more than that.
+    let slice = cadcraft_pointcloud::slice_capped(&path, z0, z1, decimate, cadcraft_pointcloud::ALL_POINTS_LIMIT).map_err(oops)?;
     let written = cadcraft_pointcloud::write_points_dxf(&out, &slice.points, &layer).map_err(oops)?;
     // The CRS of the scan goes next to the drawing as a `.prj` sidecar (the convention every
-    // GIS tool reads), so the exported slice keeps its place on the globe.
-    let crs = cadcraft_pointcloud::read_info(&path).map_err(oops)?.crs;
-    let prj = crs.as_ref().and_then(|c| c.prj()).map(|wkt| {
+    // GIS tool reads), so the exported slice keeps its place on the globe. The file's own system
+    // wins; the project's (LASCRS) is the fallback for the files that name none.
+    let file_crs = cadcraft_pointcloud::read_info(&path).map_err(oops)?.crs;
+    let crs = file_crs.clone().or_else(|| s.crs.clone());
+    let prj = crs.as_ref().and_then(|c| c.prj().map(str::to_string).or_else(|| c.epsg.and_then(cadcraft_pointcloud::Crs::wkt_for))).map(|wkt| {
         let sidecar = out.with_extension("prj");
         if let Err(e) = std::fs::write(&sidecar, wkt) {
             log::warn!("could not write the .prj sidecar: {e}");
@@ -376,6 +385,70 @@ fn lasground(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// The site frame: the world point that sits at the drawing's (0, 0, 0).
+///
+/// A registered survey sits hundreds of kilometres from the origin — a factory in Romania is at
+/// E 498 162, N 290 290 — so the clouds and the drawing share a local frame, and this is the tie
+/// between the two. Without `x`/`y`/`z` the origin is the middle of the first cloud, with the
+/// ground at zero.
+fn lasorigin(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("reset").and_then(Value::as_bool).unwrap_or(false) {
+        s.local_origin = [0.0; 3];
+        return Ok(json!({
+            "message": "the site origin is back at the drawing's (0, 0, 0)",
+            "origin": s.local_origin,
+        }));
+    }
+    let given = number(p, "x").is_some() || number(p, "y").is_some() || number(p, "z").is_some();
+    let origin = if given {
+        [number(p, "x").unwrap_or(s.local_origin[0]), number(p, "y").unwrap_or(s.local_origin[1]), number(p, "z").unwrap_or(s.local_origin[2])]
+    } else {
+        // The middle of the first cloud, with its lowest point at zero.
+        match s.clouds.first() {
+            Some(c) => {
+                let b = c.bounds;
+                [(b.min[0] + b.max[0]) / 2.0, (b.min[1] + b.max[1]) / 2.0, b.min[2]]
+            }
+            None => s.local_origin,
+        }
+    };
+    s.local_origin = origin;
+    Ok(json!({
+        "message": format!(
+            "the site origin is at {:.3}, {:.3}, {:.3}: the drawing's (0, 0, 0) is that point in the world",
+            origin[0], origin[1], origin[2]
+        ),
+        "origin": origin,
+        "clouds": s.clouds.len(),
+    }))
+}
+
+/// The coordinate reference system of the project, for the files that do not name one.
+///
+/// A scan that says nothing is not a scan without a system: the survey office knows. The code is
+/// remembered with the drawing and written next to an exported drawing.
+fn lascrs(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("reset").and_then(Value::as_bool).unwrap_or(false) {
+        s.crs = None;
+        return Ok(json!({ "message": "the project's CRS is forgotten", "crs": Value::Null }));
+    }
+    let epsg = p.get("epsg").and_then(Value::as_u64).map(|v| v as u32);
+    let name = p.get("name").and_then(Value::as_str).map(str::to_string);
+    if epsg.is_none() && name.is_none() {
+        return Err(EngineError::Other("`epsg` or `name` is required".into()));
+    }
+    let crs = cadcraft_pointcloud::Crs { epsg, wkt: name };
+    s.crs = Some(crs.clone());
+    Ok(json!({
+        "message": match (crs.epsg, crs.name()) {
+            (Some(code), Some(name)) => format!("the project is in EPSG:{code} ({name})"),
+            (Some(code), None) => format!("the project is in EPSG:{code}"),
+            _ => "the project's CRS is set".to_string(),
+        },
+        "crs": crs_json(&Some(crs)),
+    }))
+}
+
 /// Show or hide a cloud; without `visible` it toggles.
 fn lasvisible(s: &mut Session, p: &Value) -> Result<Value> {
     let i = cloud_index(s, p)?;
@@ -393,7 +466,8 @@ fn lasframe(s: &mut Session, p: &Value) -> Result<Value> {
         (c.name.clone(), (c.bounds.min, c.bounds.max))
     };
     let (w, h) = (b.1[0] - b.0[0], b.1[1] - b.0[1]);
-    let center = Vec2::new((b.0[0] + b.1[0]) / 2.0, (b.0[1] + b.1[1]) / 2.0);
+    // The site frame: the cloud is drawn where the drawing is.
+    let center = Vec2::new((b.0[0] + b.1[0]) / 2.0 - s.local_origin[0], (b.0[1] + b.1[1]) / 2.0 - s.local_origin[1]);
     let height = w.max(h).max(1e-6) * 1.15;
     let mut framed = false;
     if let Ok(st) = s.state_mut() {
