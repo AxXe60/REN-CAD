@@ -112,12 +112,49 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         return Some(crate::docking::command(app, false, &json!({"operation": "open", "panel": "pointCloud"})));
     }
     if id == "ui.view3d" {
-        let on = params.get("on").and_then(Value::as_bool).unwrap_or(!app.view3d.active);
+        // Bare `ui.view3d` toggles; a call that only changes the camera or drafting keeps the state.
+        let has_params = params.as_object().is_some_and(|o| !o.is_empty());
+        let on = params.get("on").and_then(Value::as_bool).unwrap_or(if has_params { app.view3d.active } else { !app.view3d.active });
         app.view3d.active = on;
         if on {
             app.view3d.fitted = false;
         }
-        return Some(Ok(json!({"view3d": on, "points": app.view3d.drawn})));
+        // Camera and drafting, so a script can drive what the palette's 3D section does.
+        match params.get("projection").and_then(Value::as_str) {
+            Some("ortho" | "orthographic") => app.view3d.projection = crate::view3d::Projection::Ortho,
+            Some("persp" | "perspective") => app.view3d.projection = crate::view3d::Projection::Perspective,
+            _ => {}
+        }
+        if let Some(deg) = params.get("lens").and_then(Value::as_f64).filter(|d| d.is_finite()) {
+            app.view3d.fov_y = deg.clamp(15.0, 90.0).to_radians();
+        }
+        match params.get("view").and_then(Value::as_str) {
+            Some("top") => app.view3d.top(),
+            Some("front") => app.view3d.front(),
+            Some("iso") => app.view3d.iso(),
+            _ => {}
+        }
+        if params.get("fit").and_then(Value::as_bool).unwrap_or(false) {
+            app.view3d.fitted = false;
+        }
+        if let Some(draw) = params.get("draw").and_then(Value::as_bool) {
+            app.view3d.draft.active = draw;
+            app.view3d.draft.cancel();
+        }
+        if params.get("finish").and_then(Value::as_bool).unwrap_or(false) {
+            crate::view3d::finish_draft(app);
+        }
+        if params.get("cancel").and_then(Value::as_bool).unwrap_or(false) {
+            crate::view3d::cancel_draft(app);
+        }
+        return Some(Ok(json!({
+            "view3d": on,
+            "points": app.view3d.drawn,
+            "projection": app.view3d.projection.name(),
+            "lens": app.view3d.fov_y.to_degrees(),
+            "drawing": app.view3d.draft.active,
+            "strokeVertices": app.view3d.draft.points.len(),
+        })));
     }
     // Explicit opens remain idempotent; typed QUICKCALC with JSON parameters uses the engine's CAL alias.
     if id == "ui.panel.quickcalc" || (matches!(id, "quickcalc" | "qc") && params.is_null()) {

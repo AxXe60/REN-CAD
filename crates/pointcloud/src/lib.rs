@@ -13,11 +13,13 @@
 mod cloud;
 mod dxf;
 mod read;
+mod sketch;
 mod slice;
 
 pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
-pub use dxf::write_points_dxf;
+pub use dxf::{SKETCH_RGB, write_points_dxf, write_strokes_dxf};
 pub use read::{CloudInfo, read_info};
+pub use sketch::Sketch3d;
 pub use slice::{Pt, Slice, slice};
 
 /// An axis-aligned box in world units.

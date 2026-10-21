@@ -1,12 +1,23 @@
-//! The 3D view: an orbit camera over the session's point clouds.
+//! The 3D view: an orbit camera over the session's point clouds, and 3D drafting on top of them.
 //!
 //! The drawing canvas is 2D; when the 3D view is on, [`show`] replaces it inside the same rect
-//! and handles its own input (drag orbits, middle/shift-drag pans, wheel dollies, double-click
-//! fits). The points come from the clouds' existing decimation pyramid, picked by the on-screen
-//! density, culled to the ball the camera can see and capped at [`MAX_SCENE_POINTS`], and drawn by
-//! [`crate::gpu3d`] — one upload per level, colour, crop or visible-ball change, then one instanced
-//! draw call per frame. Orbiting never re-uploads: the ball around the target is the same at every
-//! angle.
+//! and handles its own input (drag orbits, middle/shift-drag pans, wheel zooms towards the cursor,
+//! double-click fits). The points come from the clouds' existing decimation pyramid, picked by the
+//! on-screen density, culled to the ball the camera can see and capped at [`MAX_SCENE_POINTS`], and
+//! drawn by [`crate::gpu3d`] — one upload per level, colour, crop or visible-ball change, then one
+//! instanced draw call per frame. Orbiting never re-uploads: the ball around the target is the same
+//! at every angle.
+//!
+//! The camera has two projections: [`Projection::Perspective`] with a long lens (35° by default,
+//! adjustable), and [`Projection::Ortho`], which removes perspective entirely so walls stay
+//! parallel and measuring off the screen is honest. Both frame the same world height at the
+//! target, so toggling keeps the view.
+//!
+//! Drafting ([`Draft3d`]) turns clicks into a 3D polyline: a click snaps to the nearest cloud point
+//! on screen (or lands on the view plane through the orbit target), and the finished stroke goes
+//! into the session's [`cadcraft_pointcloud::Sketch3d`] through the `3dline` command. The strokes
+//! are projected with the same camera and painted over the points, so a wall can be traced in
+//! elevation without ever leaving the 3D view.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
@@ -17,6 +28,24 @@ use egui::{Pos2, Rect, Sense, pos2, vec2};
 use crate::CadApp;
 use crate::gpu3d::{MAX_SCENE_POINTS, Point3d, Scene3d, SceneSlot};
 use crate::theme::Tokens;
+
+/// How the camera projects the world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Projection {
+    /// A long-lens perspective: parallel lines still converge, but gently.
+    Perspective,
+    /// Parallel projection: no fish-eye at all, and equal world lengths stay equal on screen.
+    Ortho,
+}
+
+impl Projection {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Perspective => "persp",
+            Self::Ortho => "ortho",
+        }
+    }
+}
 
 /// Orbit camera state; world Z is up (the scanner's vertical).
 #[derive(Debug)]
@@ -30,16 +59,40 @@ pub struct View3d {
     pub pitch: f64,
     /// Eye distance to `target`, world units.
     pub dist: f64,
-    /// Vertical field of view, radians.
+    /// Vertical field of view, radians (the "lens": small is telephoto, large is wide).
     pub fov_y: f64,
+    pub projection: Projection,
     /// Point square side, points.
     pub point_size: f32,
     /// Fit the camera to the clouds on the next frame.
     pub fitted: bool,
+    /// The stroke being drawn, if 3D drafting is on.
+    pub draft: Draft3d,
     /// The scene last handed to the GPU, and how many points it holds.
     pub key: Option<u64>,
     pub drawn: usize,
     slot: SceneSlot,
+}
+
+/// The 3D polyline being drawn in the view.
+#[derive(Debug, Default)]
+pub struct Draft3d {
+    pub active: bool,
+    /// Vertices placed so far in the current stroke.
+    pub points: Vec<[f64; 3]>,
+    /// Where the next click would land.
+    pub hover: Option<[f64; 3]>,
+    /// Whether [`Self::hover`] is a cloud point (snapped) rather than the view plane.
+    pub snapped: bool,
+}
+
+impl Draft3d {
+    /// Drop the vertices and the preview, staying in drafting mode for the next stroke.
+    pub fn cancel(&mut self) {
+        self.points.clear();
+        self.hover = None;
+        self.snapped = false;
+    }
 }
 
 impl Default for View3d {
@@ -50,9 +103,12 @@ impl Default for View3d {
             yaw: -2.2,
             pitch: 0.55,
             dist: 30.0,
-            fov_y: 50.0_f64.to_radians(),
+            // 35° vertical: a normal lens, not the 50° wide angle that made near walls bend.
+            fov_y: 35.0_f64.to_radians(),
+            projection: Projection::Perspective,
             point_size: 1.5,
             fitted: false,
+            draft: Draft3d::default(),
             key: None,
             drawn: 0,
             slot: std::sync::Arc::new(Mutex::new(None)),
@@ -85,15 +141,34 @@ impl View3d {
         (forward, right, up)
     }
 
+    /// World height of the view volume at the target plane: the pan step and the pixels-per-metre
+    /// scale, the same in both projections so switching keeps the framing.
+    pub fn view_height(&self) -> f64 {
+        2.0 * self.dist * (self.fov_y * 0.5).tan()
+    }
+
     /// Column-major world → clip matrix for a canvas of `aspect` width/height.
     pub fn view_proj(&self, aspect: f64, radius: f64) -> [f32; 16] {
         let eye = self.eye();
         let view = look_at(eye, self.target, [0.0, 0.0, 1.0]);
-        let near = (self.dist * 0.01).max(1e-3);
-        // No depth test, so the far plane only has to be beyond the scene.
-        let far = (self.dist + radius * 4.0).max(1.0) * 1.5;
-        let proj = perspective(self.fov_y as f32, aspect.max(1e-3) as f32, near as f32, far as f32);
-        mul(&proj, &view)
+        let aspect = aspect.max(1e-3) as f32;
+        match self.projection {
+            Projection::Perspective => {
+                let near = (self.dist * 0.01).max(1e-3);
+                // No depth test, so the far plane only has to be beyond the scene (the visible
+                // ball reaches about four eye distances).
+                let far = (self.dist * 6.0 + radius * 4.0).max(1.0);
+                mul(&perspective(self.fov_y as f32, aspect, near as f32, far as f32), &view)
+            }
+            Projection::Ortho => {
+                let half_h = (self.dist * (self.fov_y * 0.5).tan()).max(1e-6);
+                let half_w = half_h * f64::from(aspect);
+                // Near at the eye plane: anything behind the camera is clipped (there is no
+                // perspective divide to sort it out), and the far side of the visible ball fits.
+                let far = (self.dist * 5.0).max(radius * 2.0).max(1.0);
+                mul(&ortho(half_w as f32, half_h as f32, far as f32), &view)
+            }
+        }
     }
 
     /// Frame the given world box (or a default 10 m cube when empty).
@@ -111,6 +186,93 @@ impl View3d {
         let radius = 0.5 * (dx * dx + dy * dy + dz * dz).sqrt();
         self.dist = (radius.max(0.1) / (self.fov_y * 0.5).sin()) * 1.15;
         self.fitted = true;
+    }
+
+    /// A standard view, keeping the target and distance.
+    pub fn preset(&mut self, yaw: f64, pitch: f64) {
+        self.yaw = yaw;
+        self.pitch = pitch.clamp(-1.5, 1.5);
+    }
+
+    /// Look from above: X right, Y up.
+    pub fn top(&mut self) {
+        self.preset(-std::f64::consts::FRAC_PI_2, 1.5);
+    }
+
+    /// Look along +Y: X right, Z up.
+    pub fn front(&mut self) {
+        self.preset(-std::f64::consts::FRAC_PI_2, 0.0);
+    }
+
+    /// The default three-quarter view.
+    pub fn iso(&mut self) {
+        self.preset(-2.2, 0.55);
+    }
+
+    /// The eye ray through a screen point: from the eye in perspective, parallel from the view
+    /// plane in ortho.
+    fn ray(&self, screen: Pos2, rect: Rect) -> Option<([f64; 3], [f64; 3])> {
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return None;
+        }
+        let nx = (f64::from(screen.x - rect.left()) / f64::from(rect.width())) * 2.0 - 1.0;
+        let ny = 1.0 - (f64::from(screen.y - rect.top()) / f64::from(rect.height())) * 2.0;
+        let aspect = f64::from(rect.width()) / f64::from(rect.height());
+        let (f, r, u) = self.basis();
+        let tan = (self.fov_y * 0.5).tan();
+        match self.projection {
+            Projection::Perspective => {
+                let d = normalize([
+                    f[0] + r[0] * nx * tan * aspect + u[0] * ny * tan,
+                    f[1] + r[1] * nx * tan * aspect + u[1] * ny * tan,
+                    f[2] + r[2] * nx * tan * aspect + u[2] * ny * tan,
+                ]);
+                Some((self.eye(), d))
+            }
+            Projection::Ortho => {
+                let h = self.dist * tan;
+                let eye = self.eye();
+                let o = [
+                    eye[0] + r[0] * nx * h * aspect + u[0] * ny * h,
+                    eye[1] + r[1] * nx * h * aspect + u[1] * ny * h,
+                    eye[2] + r[2] * nx * h * aspect + u[2] * ny * h,
+                ];
+                Some((o, f))
+            }
+        }
+    }
+
+    /// The world point under `screen` on the plane through the target facing the camera.
+    pub fn plane_point(&self, screen: Pos2, rect: Rect) -> Option<[f64; 3]> {
+        let (origin, dir) = self.ray(screen, rect)?;
+        let (f, _, _) = self.basis();
+        let denom = dot(dir, f);
+        if denom.abs() < 1e-9 {
+            return None;
+        }
+        let t = dot(sub(self.target, origin), f) / denom;
+        if !t.is_finite() || t <= 0.0 {
+            return None;
+        }
+        Some([origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t])
+    }
+
+    /// Zoom by `wheel` points, keeping the world point under the cursor where it is.
+    pub fn zoom_at(&mut self, wheel: f64, at: Option<Pos2>, rect: Rect) {
+        if wheel == 0.0 {
+            return;
+        }
+        let factor = (-wheel * 0.002).exp();
+        let before = at.and_then(|p| self.plane_point(p, rect));
+        self.dist = (self.dist * factor).clamp(0.02, 1e7);
+        if let (Some(before), Some(_), Some(after)) = (before, at, at.and_then(|p| self.plane_point(p, rect))) {
+            for i in 0..3 {
+                let shift = before[i] - after[i];
+                if shift.is_finite() {
+                    self.target[i] += shift;
+                }
+            }
+        }
     }
 }
 
@@ -227,6 +389,94 @@ fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::Clou
     scene
 }
 
+/// A screen projection cached for a whole frame: the points, the sketch and snapping all use it.
+struct Screen {
+    vp: [f32; 16],
+    rect: Rect,
+    eye: [f64; 3],
+    forward: [f64; 3],
+}
+
+impl Screen {
+    fn new(view: &View3d, vp: [f32; 16], rect: Rect) -> Self {
+        let (forward, _, _) = view.basis();
+        Self { vp, rect, eye: view.eye(), forward }
+    }
+
+    /// Project a world point, rejecting what the camera cannot see (behind it, or clipped by the
+    /// near/far planes). Outside the rect is kept: egui clips the sketch at the view edge.
+    fn project(&self, p: [f64; 3]) -> Option<Pos2> {
+        let relative = sub(p, self.eye);
+        if dot(relative, self.forward) <= 0.0 {
+            return None;
+        }
+        let c = transform(&self.vp, [p[0] as f32, p[1] as f32, p[2] as f32]);
+        if c[3] <= 1e-6 || !(0.0..=1.0).contains(&(c[2] / c[3])) {
+            return None;
+        }
+        let x = c[0] / c[3];
+        let y = c[1] / c[3];
+        Some(pos2(self.rect.left() + (x + 1.0) * 0.5 * self.rect.width(), self.rect.top() + (1.0 - y) * 0.5 * self.rect.height()))
+    }
+}
+
+/// How close to a cloud point, in screen points, a click snaps to it.
+const SNAP_PX: f32 = 14.0;
+
+/// The nearest uploaded cloud point to `at`, searched on a sample of the scene so a hover costs a
+/// millisecond: the scan is dense enough that a 1-in-12 sample still lands within a millimetre.
+fn snap_to_cloud(slot: &SceneSlot, screen: &Screen, at: Pos2) -> Option<[f64; 3]> {
+    let guard = slot.lock().ok()?;
+    let scene = guard.as_ref()?;
+    let n = scene.points.len();
+    if n == 0 {
+        return None;
+    }
+    let step = (n / 250_000).max(1);
+    let mut best = SNAP_PX * SNAP_PX;
+    let mut hit = None;
+    for p in scene.points.iter().step_by(step) {
+        let world = [f64::from(p.pos[0]), f64::from(p.pos[1]), f64::from(p.pos[2])];
+        if let Some(q) = screen.project(world) {
+            let d = (q.x - at.x).powi(2) + (q.y - at.y).powi(2);
+            if d < best {
+                best = d;
+                hit = Some(world);
+            }
+        }
+    }
+    hit
+}
+
+/// Where a click at `at` places a vertex: the nearest cloud point within [`SNAP_PX`], else the
+/// view plane through the orbit target.
+fn place_point(app: &CadApp, screen: &Screen, at: Pos2) -> Option<([f64; 3], bool)> {
+    if let Some(p) = snap_to_cloud(&app.view3d.slot, screen, at) {
+        return Some((p, true));
+    }
+    app.view3d.plane_point(at, screen.rect).map(|p| (p, false))
+}
+
+/// Commit the stroke being drawn through `3dline` (the same command a script would call).
+pub fn finish_draft(app: &mut CadApp) {
+    let points = std::mem::take(&mut app.view3d.draft.points);
+    app.view3d.draft.hover = None;
+    app.view3d.draft.snapped = false;
+    if points.is_empty() {
+        return;
+    }
+    if let Err(error) = app.run("3dline", serde_json::json!({ "points": points })) {
+        app.session.echo(error.clone());
+        app.set_status(error);
+    }
+}
+
+/// Drop the stroke being drawn and leave drafting mode.
+pub fn cancel_draft(app: &mut CadApp) {
+    app.view3d.draft.cancel();
+    app.view3d.draft.active = false;
+}
+
 /// Show the 3D view in `rect` (the canvas area). Called by [`crate::canvas::show`].
 pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     let t = Tokens::get();
@@ -240,31 +490,36 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
         app.view3d.fit(bounds);
     }
 
+    let height = f64::from(rect.height()).max(1.0);
+    let aspect = f64::from(rect.width()) / height;
+    let radius = cloud_bounds(app).map_or(10.0, |(min, max)| {
+        let d = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+        0.5 * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(0.1)
+    });
+
     // ---------- input ----------
     let resp = ui.interact(rect, ui.id().with("view3d"), Sense::click_and_drag());
-    let (shift, wheel, middle, pointer_delta, inside) = ui.input(|i| {
-        (
-            i.modifiers.shift,
-            i.smooth_scroll_delta.y,
-            i.pointer.middle_down(),
-            i.pointer.delta(),
-            i.pointer.hover_pos().is_some_and(|p| rect.contains(p)),
-        )
+    let (shift, wheel, middle, pointer_delta, pointer, inside) = ui.input(|i| {
+        let pointer = i.pointer.hover_pos();
+        (i.modifiers.shift, i.smooth_scroll_delta.y, i.pointer.middle_down(), i.pointer.delta(), pointer, pointer.is_some_and(|p| rect.contains(p)))
     });
     if inside && wheel != 0.0 {
-        app.view3d.dist = (app.view3d.dist * (-f64::from(wheel) * 0.0015).exp()).clamp(0.02, 1e7);
+        app.view3d.zoom_at(f64::from(wheel), pointer, rect);
     }
     // Middle-drag panning is read from the pointer (egui's drag sense follows the primary button).
     let drag = if inside && middle && pointer_delta != egui::Vec2::ZERO {
         Some((pointer_delta, false))
     } else if resp.dragged() {
         Some((resp.drag_delta(), shift && resp.dragged_by(egui::PointerButton::Primary)))
+    } else if resp.dragged_by(egui::PointerButton::Secondary) && pointer_delta != egui::Vec2::ZERO && !app.view3d.draft.active {
+        // Right-drag pans too (a 3D view habit); in drafting, right-click ends the stroke.
+        Some((pointer_delta, true))
     } else {
         None
     };
     if let Some((d, pan)) = drag {
         if pan {
-            let k = 2.0 * app.view3d.dist * (app.view3d.fov_y * 0.5).tan() / f64::from(rect.height()).max(1.0);
+            let k = app.view3d.view_height() / height;
             let (_f, right, up) = app.view3d.basis();
             for i in 0..3 {
                 app.view3d.target[i] += (-right[i] * f64::from(d.x) + up[i] * f64::from(d.y)) * k;
@@ -274,14 +529,43 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
             app.view3d.pitch = (app.view3d.pitch - f64::from(d.y) * 0.008).clamp(-1.5, 1.5);
         }
     }
-    if resp.double_clicked() {
+
+    // The matrix the clicks of this frame use: after the camera input, before the scene rebuild.
+    let vp = app.view3d.view_proj(aspect, radius);
+
+    // ---------- drafting ----------
+    let mut finished = false;
+    let mut cancelled = false;
+    if app.view3d.draft.active {
+        let screen = Screen::new(&app.view3d, vp, rect);
+        let at = pointer.filter(|p| rect.contains(*p));
+        let placed = at.and_then(|p| place_point(app, &screen, p));
+        app.view3d.draft.hover = placed.map(|(p, _)| p);
+        app.view3d.draft.snapped = placed.is_some_and(|(_, s)| s);
+
+        // A double-click ends the stroke (its first click already placed the last vertex); a
+        // right-click ends it without adding one.
+        finished = resp.double_clicked() || resp.secondary_clicked();
+        let add = resp.clicked() && !resp.dragged() && !finished;
+        if add && let Some((p, _)) = placed {
+            app.view3d.draft.points.push(p);
+        }
+        cancelled = inside && ui.input(|i| i.key_pressed(egui::Key::Escape));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+    if cancelled {
+        app.view3d.draft.cancel();
+    }
+    if finished {
+        finish_draft(app);
+    }
+    if resp.double_clicked() && !app.view3d.draft.active {
         let bounds = cloud_bounds(app);
         app.view3d.fit(bounds);
     }
 
     // ---------- scene ----------
-    let height = f64::from(rect.height()).max(1.0);
-    let px_per_m = height / (2.0 * app.view3d.dist * (app.view3d.fov_y * 0.5).tan()).max(1e-9);
+    let px_per_m = height / app.view3d.view_height().max(1e-9);
     // Only the ball around the orbit target is uploaded; zooming in shrinks it, so the finer
     // levels become affordable where their detail shows.
     let center = app.view3d.target;
@@ -300,12 +584,6 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
         log::info!("cloud 3d scene: {drawn} visible points in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
     }
 
-    let aspect = f64::from(rect.width()) / height;
-    let radius = cloud_bounds(app).map_or(10.0, |(min, max)| {
-        let d = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
-        0.5 * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(0.1)
-    });
-    let vp = app.view3d.view_proj(aspect, radius);
     if let Some(target) = app.canvas.gpu {
         painter.add(egui_wgpu::Callback::new_paint_callback(
             rect,
@@ -323,14 +601,68 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
         draw_cpu_fallback(&painter, rect, &vp, &app.view3d, &app.session.clouds, px_per_m, center, radius);
     }
 
+    // ---------- sketch ----------
+    draw_sketch(&painter, &app.view3d, &vp, rect, &app.session.sketch);
+
     // ---------- HUD ----------
     let clouds = app.session.clouds.iter().filter(|c| c.visible).count();
-    let info = format!(
-        "3D · {clouds} cloud{}, {} points on screen\nDrag: orbit · Shift or middle drag: pan · Wheel: zoom · Double-click: fit",
+    let mut info = format!(
+        "3D · {} · {clouds} cloud{}, {} points on screen\nDrag: orbit · Shift or middle drag: pan · Wheel: zoom at cursor · Double-click: fit",
+        app.view3d.projection.name(),
         if clouds == 1 { "" } else { "s" },
         app.view3d.drawn
     );
+    if app.view3d.draft.active {
+        info.push_str("\nDraw 3D: click places a vertex (snaps to the cloud) · right-click or double-click ends · Esc cancels");
+    } else if !app.session.sketch.is_empty() {
+        info.push_str(&format!("\n3D sketch: {} strokes, {} segments", app.session.sketch.count(), app.session.sketch.segments()));
+    }
     painter.text(rect.left_top() + vec2(10.0, 8.0), egui::Align2::LEFT_TOP, info, egui::FontId::proportional(12.0), t.text_dim);
+}
+
+/// Paint the committed strokes and the stroke being drawn over the points.
+fn draw_sketch(painter: &egui::Painter, view: &View3d, vp: &[f32; 16], rect: Rect, sketch: &cadcraft_pointcloud::Sketch3d) {
+    if sketch.is_empty() && !view.draft.active {
+        return;
+    }
+    let screen = Screen::new(view, *vp, rect);
+    let color = egui::Color32::from_rgb(0xF2, 0x7A, 0x1A);
+    for (a, b) in sketch.iter_segments() {
+        if let (Some(pa), Some(pb)) = (screen.project(a), screen.project(b)) {
+            painter.line_segment([pa, pb], egui::Stroke::new(2.0, color));
+        }
+    }
+    for stroke in sketch.strokes() {
+        for p in stroke {
+            if let Some(q) = screen.project(*p) {
+                painter.circle_filled(q, 2.5, color);
+            }
+        }
+    }
+
+    let draft = &view.draft;
+    if !draft.active {
+        return;
+    }
+    for p in &draft.points {
+        if let Some(q) = screen.project(*p) {
+            painter.circle_filled(q, 3.5, color);
+        }
+    }
+    if let (Some(last), Some(hover)) = (draft.points.last(), draft.hover)
+        && let (Some(a), Some(b)) = (screen.project(*last), screen.project(hover))
+    {
+        painter.line_segment([a, b], egui::Stroke::new(1.5, color.gamma_multiply(0.75)));
+    }
+    if let Some(hover) = draft.hover
+        && let Some(q) = screen.project(hover)
+    {
+        let stroke = egui::Stroke::new(1.5, if draft.snapped { egui::Color32::from_rgb(0x6C, 0xE0, 0x7A) } else { color });
+        painter.circle_stroke(q, 6.0, stroke);
+        if draft.snapped {
+            painter.circle_filled(q, 2.0, stroke.color);
+        }
+    }
 }
 
 fn draw_cpu_fallback(
@@ -345,6 +677,7 @@ fn draw_cpu_fallback(
 ) {
     let mut shapes = Vec::new();
     let r2 = radius * radius;
+    let screen = Screen::new(view, *vp, rect);
     for c in clouds.iter().filter(|c| c.visible) {
         let level = c.level_for(px_per_m);
         let step = (level.pts.len() / 50_000).max(1);
@@ -354,11 +687,10 @@ fn draw_cpu_fallback(
             if dx * dx + dy * dy + dz * dz > r2 {
                 continue;
             }
-            let p = [x as f32, y as f32, z as f32];
-            if c.clip.is_some_and(|clip| !clip.contains(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))) {
+            if c.clip.is_some_and(|clip| !clip.contains(x, y, z)) {
                 continue;
             }
-            if let Some(at) = project(vp, p, rect) {
+            if let Some(at) = screen.project([x, y, z]) {
                 let [r, g, b] = c.color_of(v);
                 shapes.push(egui::Shape::rect_filled(
                     Rect::from_center_size(at, vec2(view.point_size, view.point_size)),
@@ -371,6 +703,7 @@ fn draw_cpu_fallback(
     painter.extend(shapes);
 }
 
+#[cfg(test)]
 fn project(m: &[f32; 16], p: [f32; 3], rect: Rect) -> Option<Pos2> {
     let c = transform(m, p);
     if c[3] <= 1e-6 {
@@ -412,6 +745,13 @@ fn look_at(eye: [f64; 3], target: [f64; 3], up: [f64; 3]) -> [f32; 16] {
 fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
     let f = 1.0 / (fov_y * 0.5).tan();
     [f / aspect, 0.0, 0.0, 0.0, 0.0, f, 0.0, 0.0, 0.0, 0.0, far / (near - far), -1.0, 0.0, 0.0, (near * far) / (near - far), 0.0]
+}
+
+/// Right-handed orthographic, WebGPU clip depth 0..1, column-major. Near is the eye plane.
+fn ortho(half_w: f32, half_h: f32, far: f32) -> [f32; 16] {
+    let (w, h) = (half_w.max(1e-6), half_h.max(1e-6));
+    let f = far.max(1e-6);
+    [1.0 / w, 0.0, 0.0, 0.0, 0.0, 1.0 / h, 0.0, 0.0, 0.0, 0.0, -1.0 / f, 0.0, 0.0, 0.0, 0.0, 1.0]
 }
 
 fn mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
@@ -540,5 +880,49 @@ mod tests {
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 1000.0));
         let at = project(&m, [1.0, 2.0, 3.0], rect).expect("the target is visible");
         assert!((at.x - 800.0).abs() < 1.0 && (at.y - 500.0).abs() < 1.0, "{at:?}");
+    }
+
+    /// Ortho has no perspective divide, so the same world offset is the same on screen at any
+    /// depth. That is the property that kills the fish-eye look.
+    #[test]
+    fn ortho_keeps_the_scale_with_depth() {
+        let mut v = default_view();
+        v.projection = Projection::Ortho;
+        let m = v.view_proj(1.0, 5.0);
+        let near = project(&m, [1.0, 2.0 + 1.0, 3.0], Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 1000.0)));
+        let far = project(&m, [1.0 - 5.0, 2.0 + 1.0, 3.0], Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 1000.0)));
+        let (near, far) = (near.unwrap_or(pos2(0.0, 0.0)), far.unwrap_or(pos2(0.0, 0.0)));
+        assert!((near.x - far.x).abs() < 0.01, "same offset, same pixel column: {near:?} vs {far:?}");
+    }
+
+    /// Zooming at the cursor keeps the world point under it fixed, so the view grows towards what
+    /// the user points at instead of the middle of the screen.
+    #[test]
+    fn zoom_anchors_the_point_under_the_cursor() {
+        let mut v = default_view();
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0));
+        let at = pos2(820.0, 260.0);
+        let before = v.plane_point(at, rect).expect("the cursor ray crosses the target plane");
+        v.zoom_at(120.0, Some(at), rect);
+        let after = v.plane_point(at, rect).expect("still crosses after zooming");
+        for i in 0..3 {
+            assert!((before[i] - after[i]).abs() < 1e-6, "axis {i}: {before:?} vs {after:?}");
+        }
+        assert!(v.dist < 10.0, "a positive wheel zooms in: {}", v.dist);
+    }
+
+    #[test]
+    fn presets_look_where_their_names_say() {
+        let mut v = default_view();
+        v.top();
+        assert!(v.pitch > 1.4, "top looks down: {}", v.pitch);
+        let (f, _, _) = v.basis();
+        assert!(f[2] < -0.99, "top looks along -Z: {f:?}");
+        v.front();
+        assert!(v.pitch.abs() < 1e-9);
+        let (f, r, u) = v.basis();
+        assert!((f[1] - 1.0).abs() < 1e-9 && r[0] > 0.99 && u[2] > 0.99, "front: +Y with X right and Z up");
+        v.iso();
+        assert!((v.yaw + 2.2).abs() < 1e-9 && (v.pitch - 0.55).abs() < 1e-9);
     }
 }

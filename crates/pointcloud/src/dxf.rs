@@ -74,6 +74,82 @@ pub fn write_points_dxf(path: &Path, points: &[Pt], layer: &str) -> Result<usize
     Ok(written)
 }
 
+/// The true colour of the 3D sketch in exported drawings: warm orange, so it reads over a grey
+/// cloud when the DXF is opened next to the trace.
+pub const SKETCH_RGB: i64 = 0x00F2_7A1A;
+
+/// Write 3D strokes as LINE entities (a lone vertex becomes a POINT), keeping their Z. Returns the
+/// number of entities written.
+pub fn write_strokes_dxf(path: &Path, strokes: &[Vec<[f64; 3]>], layer: &str) -> Result<usize> {
+    let layer = if layer.trim().is_empty() { "3D-SKETCH" } else { layer.trim() };
+    let mut tags: Vec<Tag> = Vec::with_capacity(64 + strokes.iter().map(Vec::len).sum::<usize>() * 12);
+
+    // HEADER: R2000, metres.
+    s(&mut tags, 0, "SECTION");
+    s(&mut tags, 2, "HEADER");
+    s(&mut tags, 9, "$ACADVER");
+    s(&mut tags, 1, "AC1015");
+    s(&mut tags, 9, "$INSUNITS");
+    tags.push(Tag::new(70, Value::Int(6)));
+    s(&mut tags, 0, "ENDSEC");
+
+    // TABLES: layer 0 and the sketch layer.
+    s(&mut tags, 0, "SECTION");
+    s(&mut tags, 2, "TABLES");
+    s(&mut tags, 0, "TABLE");
+    s(&mut tags, 2, "LAYER");
+    tags.push(Tag::new(70, Value::Int(2)));
+    for (name, color) in [("0", 7), (layer, 7)] {
+        s(&mut tags, 0, "LAYER");
+        s(&mut tags, 2, name);
+        tags.push(Tag::new(70, Value::Int(0)));
+        tags.push(Tag::new(62, Value::Int(color)));
+        s(&mut tags, 6, "CONTINUOUS");
+    }
+    s(&mut tags, 0, "ENDTAB");
+    s(&mut tags, 0, "ENDSEC");
+
+    // ENTITIES: one LINE per segment, one POINT for a stroke of a single vertex.
+    s(&mut tags, 0, "SECTION");
+    s(&mut tags, 2, "ENTITIES");
+    let mut written = 0usize;
+    for stroke in strokes {
+        let pts: Vec<&[f64; 3]> = stroke.iter().filter(|p| p.iter().all(|v| v.is_finite())).collect();
+        match pts.as_slice() {
+            [] => {}
+            [p] => {
+                s(&mut tags, 0, "POINT");
+                s(&mut tags, 8, layer);
+                tags.push(Tag::new(10, Value::Real(p[0])));
+                tags.push(Tag::new(20, Value::Real(p[1])));
+                tags.push(Tag::new(30, Value::Real(p[2])));
+                tags.push(Tag::new(420, Value::Int(SKETCH_RGB)));
+                written += 1;
+            }
+            _ => {
+                for w in pts.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    s(&mut tags, 0, "LINE");
+                    s(&mut tags, 8, layer);
+                    tags.push(Tag::new(10, Value::Real(a[0])));
+                    tags.push(Tag::new(20, Value::Real(a[1])));
+                    tags.push(Tag::new(30, Value::Real(a[2])));
+                    tags.push(Tag::new(11, Value::Real(b[0])));
+                    tags.push(Tag::new(21, Value::Real(b[1])));
+                    tags.push(Tag::new(31, Value::Real(b[2])));
+                    tags.push(Tag::new(420, Value::Int(SKETCH_RGB)));
+                    written += 1;
+                }
+            }
+        }
+    }
+    s(&mut tags, 0, "ENDSEC");
+    s(&mut tags, 0, "EOF");
+
+    std::fs::write(path, write_ascii(&tags)).map_err(|e| Error::Io { path: path.display().to_string(), source: e })?;
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +166,29 @@ mod tests {
         assert!(text.contains("POINT"));
         assert!(text.contains("PC-SLICE"));
         assert!(text.contains("420"));
+    }
+
+    #[test]
+    fn writes_a_line_per_segment_with_its_z() {
+        let dir = std::env::temp_dir().join("cadcraft-pc-test");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("sketch.dxf");
+        let strokes = vec![vec![[0.0, 0.0, 2.5], [3.0, 0.0, 2.5], [3.0, 4.0, 2.5]], vec![[9.0, 9.0, 1.0]]];
+        let n = write_strokes_dxf(&path, &strokes, "3D-SKETCH").unwrap_or(0);
+        assert_eq!(n, 3, "two segments and one lone vertex");
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(text.matches("LINE").count(), 2);
+        assert_eq!(text.matches("POINT").count(), 1);
+        assert!(text.contains("3D-SKETCH"));
+        assert!(text.contains("2.5"), "the stroke keeps its height: {text}");
+    }
+
+    #[test]
+    fn non_finite_sketch_vertices_are_skipped() {
+        let dir = std::env::temp_dir().join("cadcraft-pc-test");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("sketch-bad.dxf");
+        let strokes = vec![vec![[0.0, 0.0, 0.0], [f64::NAN, 0.0, 0.0]], vec![[f64::INFINITY; 3]]];
+        assert_eq!(write_strokes_dxf(&path, &strokes, "S").unwrap_or(9), 1, "the finite vertex survives as a POINT; the rest is dropped");
     }
 }

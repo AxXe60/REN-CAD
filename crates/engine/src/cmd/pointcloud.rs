@@ -35,8 +35,17 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasclouds", "List Point Clouds", |s, _| lasclouds(s)).params("{}").enabled(always).noundo(),
+        CommandSpec::new("3dline", "3D Line", draw3d).params("{points: [[x,y,z], ...]}").enabled(always).noundo(),
+        CommandSpec::new("3dclear", "Clear 3D Sketch", |s, _| sketch_clear(s)).params("{}").enabled(always).noundo(),
+        CommandSpec::new("3dundo", "Undo 3D Stroke", |s, _| sketch_undo(s)).params("{}").enabled(always).noundo(),
+        CommandSpec::new("3dlist", "List 3D Sketch", |s, _| sketch_list(s)).params("{}").enabled(always).noundo(),
+        CommandSpec::new("3dexport", "Export 3D Sketch", sketch_export).params("{path: string, layer?: string}").enabled(always).noundo(),
     ]
 }
+
+/// The most vertices one 3D stroke may hold: drawn by hand it never comes close, and a script that
+/// asks for millions should hear about it instead of allocating them.
+const MAX_STROKE_VERTICES: usize = 100_000;
 
 fn text<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
     p.get(key).and_then(Value::as_str).filter(|s| !s.trim().is_empty()).ok_or_else(|| EngineError::Other(format!("`{key}` is required")))
@@ -316,6 +325,97 @@ fn lasframe(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "index": i, "name": name, "framed": framed, "center": [center.x, center.y], "height": height }))
 }
 
+fn point3(v: &Value) -> Option<[f64; 3]> {
+    let a = v.as_array().filter(|a| a.len() == 3)?;
+    let mut p = [0.0; 3];
+    for (i, s) in a.iter().enumerate() {
+        p[i] = s.as_f64().filter(|f| f.is_finite())?;
+    }
+    Some(p)
+}
+
+/// Add one 3D polyline to the session's sketch (the 3D view calls this when a stroke is finished).
+fn draw3d(s: &mut Session, p: &Value) -> Result<Value> {
+    let a = p.get("points").and_then(Value::as_array).ok_or_else(|| EngineError::Other("`points` must be an array of [x, y, z]".into()))?;
+    if a.is_empty() {
+        return Err(EngineError::Other("`points` needs at least one vertex".into()));
+    }
+    if a.len() > MAX_STROKE_VERTICES {
+        return Err(EngineError::Other(format!("a 3D stroke holds at most {MAX_STROKE_VERTICES} vertices, {} asked", a.len())));
+    }
+    let mut pts = Vec::with_capacity(a.len());
+    for (i, v) in a.iter().enumerate() {
+        let pt = point3(v).ok_or_else(|| EngineError::Other(format!("`points[{i}]` must be [x, y, z] with finite numbers")))?;
+        pts.push(pt);
+    }
+    let vertices = s.sketch.add(&pts);
+    Ok(json!({
+        "message": format!("3D stroke: {vertices} vertices ({} strokes, {} segments)", s.sketch.count(), s.sketch.segments()),
+        "vertices": vertices,
+        "strokes": s.sketch.count(),
+        "segments": s.sketch.segments(),
+    }))
+}
+
+fn sketch_clear(s: &mut Session) -> Result<Value> {
+    let n = s.sketch.clear();
+    Ok(json!({
+        "message": if n == 0 { "the 3D sketch is empty".to_string() } else { format!("{n} 3D strokes cleared") },
+        "cleared": n,
+        "strokes": 0,
+    }))
+}
+
+fn sketch_undo(s: &mut Session) -> Result<Value> {
+    let removed = s.sketch.undo();
+    Ok(json!({
+        "message": match removed {
+            Some(n) => format!("3D stroke undone ({n} vertices)"),
+            None => "the 3D sketch is empty".to_string(),
+        },
+        "undone": removed.is_some(),
+        "strokes": s.sketch.count(),
+    }))
+}
+
+fn sketch_list(s: &mut Session) -> Result<Value> {
+    let strokes: Vec<Value> = s
+        .sketch
+        .strokes()
+        .iter()
+        .enumerate()
+        .map(|(i, st)| {
+            let first = st.first().copied().unwrap_or([0.0; 3]);
+            let last = st.last().copied().unwrap_or([0.0; 3]);
+            json!({ "index": i, "vertices": st.len(), "first": first, "last": last })
+        })
+        .collect();
+    Ok(json!({
+        "strokes": strokes,
+        "count": strokes.len(),
+        "vertices": s.sketch.points(),
+        "segments": s.sketch.segments(),
+    }))
+}
+
+/// Write the 3D sketch as DXF LINE entities, Z included, so it survives the session and can be
+/// traced over in the 2D drawing.
+fn sketch_export(s: &mut Session, p: &Value) -> Result<Value> {
+    let out = PathBuf::from(text(p, "path")?);
+    if s.sketch.is_empty() {
+        return Err(EngineError::Other("the 3D sketch is empty: draw with 3DLINE first".into()));
+    }
+    let layer = p.get("layer").and_then(Value::as_str).unwrap_or("3D-SKETCH");
+    let written = cadcraft_pointcloud::write_strokes_dxf(&out, s.sketch.strokes(), layer).map_err(oops)?;
+    Ok(json!({
+        "message": format!("{written} entities written to {} on layer {layer}", out.display()),
+        "path": out.display().to_string(),
+        "layer": layer,
+        "entities": written,
+        "strokes": s.sketch.count(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +458,48 @@ mod tests {
         assert!(lasclip(&mut s, &json!({"min": [0.0, 0.0, 2.0], "max": [1.0, 1.0, 1.0]})).is_err(), "a box with max below min is refused");
         assert!(lasclip(&mut s, &json!({"reset": true})).is_ok());
         assert!(s.clouds[0].clip.is_none());
+    }
+
+    #[test]
+    fn a_3d_stroke_is_stored_listed_and_undone() {
+        let mut s = Session::new();
+        let r = draw3d(&mut s, &json!({"points": [[0.0, 0.0, 1.5], [2.0, 0.0, 1.5], [2.0, 2.0, 1.5]]})).ok();
+        assert_eq!(r.as_ref().and_then(|v| v["vertices"].as_u64()), Some(3));
+        assert_eq!(s.sketch.segments(), 2, "three vertices make two segments");
+        let list = sketch_list(&mut s).ok();
+        assert_eq!(list.as_ref().and_then(|v| v["count"].as_u64()), Some(1));
+        assert_eq!(list.as_ref().and_then(|v| v["segments"].as_u64()), Some(2));
+        assert_eq!(sketch_undo(&mut s).ok().and_then(|v| v["undone"].as_bool()), Some(true));
+        assert!(s.sketch.is_empty());
+        assert_eq!(sketch_undo(&mut s).ok().and_then(|v| v["undone"].as_bool()), Some(false), "undo on empty is a message, not an error");
+        draw3d(&mut s, &json!({"points": [[1.0, 1.0, 1.0]]})).ok();
+        assert_eq!(sketch_clear(&mut s).ok().and_then(|v| v["cleared"].as_u64()), Some(1));
+        assert_eq!(s.sketch.points(), 0);
+    }
+
+    #[test]
+    fn hostile_3d_points_are_refused_without_storing_anything() {
+        let mut s = Session::new();
+        for bad in
+            [json!({}), json!({"points": []}), json!({"points": [[0.0, 0.0]]}), json!({"points": [[0.0, "x", 1.0]]}), json!({"points": "not a list"})]
+        {
+            assert!(draw3d(&mut s, &bad).is_err(), "{bad}");
+            assert!(s.sketch.is_empty(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_sketch_exports_as_dxf_and_needs_strokes_first() {
+        let mut s = Session::new();
+        let dir = std::env::temp_dir().join("cadcraft-3d-test");
+        std::fs::create_dir_all(&dir).ok();
+        let out = dir.join("sketch.dxf");
+        assert!(sketch_export(&mut s, &json!({"path": out.to_string_lossy()})).is_err(), "nothing to export yet");
+        draw3d(&mut s, &json!({"points": [[0.0, 0.0, 0.5], [1.0, 1.0, 0.5]]})).ok();
+        let r = sketch_export(&mut s, &json!({"path": out.to_string_lossy()})).ok();
+        assert_eq!(r.as_ref().and_then(|v| v["entities"].as_u64()), Some(1));
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(text.contains("LINE") && text.contains("3D-SKETCH"));
     }
 
     #[test]

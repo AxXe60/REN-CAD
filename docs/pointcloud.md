@@ -1,6 +1,6 @@
 # Point clouds (LAS/LAZ) — RENCAD
 
-> **Last reviewed:** 2026-10-21 · **Status:** M5 — full resolution, intensity spectrum, crop · **Fork addition**
+> **Last reviewed:** 2026-10-21 · **Status:** M6 — camera (ortho/perspective) and 3D drafting · **Fork addition**
 
 RENCAD is the working name of this fork of CADCraft (the crates and the binary keep their upstream
 names so the weekly rebase stays a fast-forward). The fork adds point cloud support: M1 read a
@@ -10,6 +10,9 @@ kept the band in the session and drew it in the canvas; M3 made that overlay fas
 Cloud** palette and a **3D view** with an orbit camera over the same pyramid; M5 makes it practical
 on real scans: the finest level can be every point of the file, intensity is a colour spectrum, the
 grid is a 3D cube so walls keep their height, and a crop box removes the ceiling or the walls.
+M6 makes the 3D view a working surface: a long-lens perspective or true orthographic camera, zoom
+anchored at the cursor and named views, plus **3D drafting** — polylines traced over the cloud that
+snap to its points and export as DXF `LINE` entities.
 
 ## Commands
 
@@ -176,18 +179,28 @@ script cannot drift apart.
 - **Remove walls / ceiling** enables a crop box: one min/max pair per axis. Lower the Z maximum to
   drop the ceiling, raise the Z minimum for the floor, pull X and Y in for the walls; untick it to
   restore every point (the file is not re-read).
-- When the 3D view is on, a point-size slider and **Fit 3D** appear, plus the number of points on
-  screen.
+- When the 3D view is on, the camera controls appear: **Persp/Ortho**, the **Lens** slider,
+  **Top/Front/Iso**, **Fit**, the point-size slider and the number of points on screen.
+- Below them, **Draw 3D** enables 3D drafting, with **Finish** and **Cancel** for the stroke being
+  drawn, **Undo**/**Clear** for the committed ones and a stroke/segment count.
 
 ## The 3D view
 
 `ui.view3d {"on": true}` (or the palette's **3D** button) replaces the drawing canvas with a
 perspective view of the visible clouds in the same rectangle; `{"on": false}` returns to 2D.
 
-- **Drag** orbits, **Shift+drag** or **middle drag** pans, the **wheel** dollies and
-  **double-click** fits the clouds. **Fit 3D** re-frames without touching the camera angles.
-- The camera is an orbit around the cloud's centre with world Z up (the scanner's vertical), 50°
-  vertical field of view. Angles survive switching to 2D and back.
+- **Drag** orbits, **Shift+drag**, **middle drag** or **right drag** pans, the **wheel** zooms
+  towards the cursor and **double-click** fits the clouds. **Fit 3D** re-frames without touching the
+  camera angles.
+- The camera is an orbit around the cloud's centre with world Z up (the scanner's vertical). It has
+  two projections: **Perspective** with a 35° vertical field of view by default (a normal lens, not
+  the 50° wide angle that bent near walls) and an adjustable **Lens** slider from 15° to 90°, and
+  **Ortho**, a parallel projection where walls stay parallel and equal world lengths stay equal on
+  screen at any depth. Both frame the same world height at the target, so toggling keeps the view.
+  **Top**, **Front** and **Iso** restore the standard angles. Camera angles and projection survive
+  switching to 2D and back.
+- Zooming is anchored at the cursor: the world point under the pointer stays under it while `dist`
+  changes, instead of the view growing towards the middle of the screen.
 - The same decimation pyramid is used: the level is picked for the on-screen density at the camera
   target, then the scene keeps only the points inside a ball around the target (three times the
   camera distance, which covers the screen corners at every orbit angle). The uploaded set is
@@ -202,9 +215,42 @@ perspective view of the visible clouds in the same rectangle; `{"on": false}` re
 - Without a wgpu render state (a wasm build without a GPU) the view projects a sampled 50k points
   on the CPU with egui shapes, so it still shows something.
 
-Drawing in 3D is the next step: the camera and the scene are already independent of the 2D drawing,
-and the 2D entities are all at Z=0, so the overlay and then 3D entity creation can reuse the same
-view-projection.
+### 3D drafting
+
+The palette's **Draw 3D** turns the 3D view into a drafting surface (the `3DLINE` command is the
+same path for scripts):
+
+- A click places a vertex. It **snaps to the nearest cloud point** within 14 screen points (the
+  uploaded scene is searched on a ~250k-point sample, which is a millisecond per frame); with no
+  point nearby it lands on the view plane through the orbit target, so free vertices are always at
+  the depth you are looking at.
+- The next vertex is previewed as a rubber band; a green ring and dot mark a snapped point, an
+  orange ring a free one.
+- **Double-click** or **right-click** ends the stroke, **Esc** or **Cancel** drops it. Ending a
+  stroke calls `3DLINE`, so it lands in `Session::sketch` exactly as it would from a script.
+- Committed strokes are painted over the points in orange (the clouds' pipeline has no depth
+  buffer, so the sketch is deliberately always visible). `3DUNDO` drops the last stroke, `3DCLEAR`
+  all of them, and `3DEXPORT {path}` writes them as DXF `LINE` entities with their Z (a lone vertex
+  becomes a `POINT`), ready to open as an ordinary drawing file.
+
+### `3DLINE`, `3DCLEAR`, `3DUNDO`, `3DLIST`, `3DEXPORT`
+
+`3DLINE {points: [[x,y,z], …]}` appends one polyline (at most 100,000 vertices; non-finite
+coordinates are refused). `3DLIST` reports each stroke's vertex count and endpoints. `3DEXPORT
+{path, layer?}` writes the strokes on `3D-SKETCH` by default, and refuses an empty sketch instead of
+writing an empty file.
+
+```json
+{"command":"3dline","params":{"points":[[0,0,1.2],[4,0,1.2],[4,3,1.2]]}}
+```
+
+```json
+{"message":"3D stroke: 3 vertices (1 strokes, 2 segments)","vertices":3,"strokes":1,"segments":2}
+```
+
+The strokes live beside the clouds in `Session::sketch`, not in the drawing model: upstream entities
+are 2D (Z=0), so 3D geometry that must not disturb snaps, grips, undo or save stays a fork field
+until the 3D kernel can carry it.
 
 ## Measured on real data (Ap 1, Bucharest)
 
@@ -246,7 +292,7 @@ buffer.
 - The CPU path (no GPU target) draws the same list as egui rectangles — slower, but clouds stay
   visible.
 
-## Limits (M4)
+## Limits (M6)
 
 - LAZ is read, not written; no COPC streaming yet — a file is opened in one pass.
 - No classification filter, no ortho PNG/GeoTIFF export, no intensity histogram.
@@ -255,9 +301,12 @@ buffer.
 - One mesh rebuild per zoom step costs ~20 ms at half a million points; panning within the built
   area is free. The 3D view uploads at most 3 million points: the visible ball is counted first and
   the level is coarsened until it fits, so the cap applies to the points on screen, not the cloud.
-- The 3D view draws clouds only: the 2D drawing, the ViewCube and 3D drawing are not part of it yet.
-  It also has no depth buffer, so points do not occlude each other (fine for translucent scans,
-  wrong for solid surfaces later).
+- The 3D view draws clouds and 3D strokes only; the 2D drawing and the ViewCube are not part of it.
+  It has no depth buffer, so points and strokes do not occlude each other (fine for translucent
+  scans, wrong for solid surfaces later).
+- 3D strokes live in the session: they survive closing the palette and switching to 2D, but not a
+  restart. `3DEXPORT` is the way to keep them; the wrap-up into drawing entities waits for the 3D
+  kernel.
 
 ## Building this fork (Windows)
 

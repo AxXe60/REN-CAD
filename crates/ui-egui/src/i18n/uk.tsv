@@ -1374,6 +1374,11 @@
 	Point Cloud	Хмара точок
 	Show Point Cloud	Показати хмару точок
 	Frame Point Cloud	Кадрувати хмару точок
+	3D Line	3D-лінія
+	Clear 3D Sketch	Очистити 3D-ескіз
+	Export 3D Sketch	Експортувати 3D-ескіз
+	List 3D Sketch	Список 3D-ескізів
+	Undo 3D Stroke	Скасувати 3D-лінію
 	3D View	3D-вигляд
 	About RENCAD	Про RENCAD
 	RENCAD did not close normally. These drawings were autosaved:	RENCAD не завершив роботу належним чином. Ці креслення збережено автоматично:

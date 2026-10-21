@@ -710,6 +710,8 @@ pub struct Session {
     pub hatch_picks: Option<cmd::hatch::HatchPicks>,
     /// Point clouds opened with LASOPEN, drawn under the drawing (fork addition).
     pub clouds: Vec<cadcraft_pointcloud::Cloud>,
+    /// 3D strokes drawn over the clouds with 3DLINE (fork addition; the drawing model is 2D).
+    pub sketch: cadcraft_pointcloud::Sketch3d,
 }
 
 impl Default for Session {
@@ -760,6 +762,7 @@ impl Session {
             lisp_last: None,
             hatch_picks: None,
             clouds: Vec::new(),
+            sketch: cadcraft_pointcloud::Sketch3d::default(),
         }
     }
     pub fn new_drawing(&mut self, metric: bool) -> usize {
