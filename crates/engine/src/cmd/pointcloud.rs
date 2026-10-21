@@ -546,8 +546,11 @@ fn lascmp(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("the reference must be another cloud".into()));
     }
     let cell = number(p, "cell").unwrap_or(0.0);
-    let reference_cloud = s.clouds[reference].clone();
-    let stats = s.clouds[i].compare_with(&reference_cloud, cell);
+    // The reference's points are taken out of the session, not copied out of it: a scan of a
+    // hundred million points would not fit twice.
+    let reference_points = s.clouds[reference].world_points();
+    let cell = s.clouds[reference].search_cell(cell);
+    let stats = s.clouds[i].compare_with_points(&reference_points, cell);
     s.clouds[i].color = cadcraft_pointcloud::CloudColor::Deviation;
     let name = s.clouds[i].name.clone();
     let reference_name = s.clouds[reference].name.clone();

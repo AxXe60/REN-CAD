@@ -56,11 +56,33 @@ pub fn distances(tested: &[[f64; 3]], reference: &[[f64; 3]], cell: f64) -> Vec<
     }
     let cell = if cell > 0.0 && cell.is_finite() { cell } else { 1.0 };
     let inv = 1.0 / cell;
-    // The reference in a grid: the cell of every point, with the point's index.
-    let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+    // The cell of a point, mixed into one hash key.
+    let key = |cx: i64, cy: i64, cz: i64| -> u64 {
+        (cx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (cy as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ (cz as u64).wrapping_mul(0x1656_67B1_9E37_79F9)
+    };
+    // The reference in a grid: every cell gets its own run in one flat array, so a million cells
+    // cost one allocation and not a million small ones.
+    let mut grid: HashMap<u64, (u32, u32)> = HashMap::with_capacity(reference.len().min(1 << 21));
+    for p in reference {
+        let k = key((p[0] * inv).floor() as i64, (p[1] * inv).floor() as i64, (p[2] * inv).floor() as i64);
+        grid.entry(k).or_insert((0, 0)).1 += 1;
+    }
+    // The runs are laid out back to back: the first number of a cell is where its run ends, the
+    // second how long it is.
+    let mut total = 0u32;
+    for v in grid.values_mut() {
+        v.0 = total + v.1;
+        total += v.1;
+    }
+    let mut buckets = vec![0u32; reference.len()];
     for (i, p) in reference.iter().enumerate() {
-        let key = ((p[0] * inv).floor() as i64, (p[1] * inv).floor() as i64, (p[2] * inv).floor() as i64);
-        grid.entry(key).or_default().push(i as u32);
+        let k = key((p[0] * inv).floor() as i64, (p[1] * inv).floor() as i64, (p[2] * inv).floor() as i64);
+        if let Some(v) = grid.get_mut(&k) {
+            v.0 = v.0.saturating_sub(1);
+            buckets[v.0 as usize] = i as u32;
+        }
     }
     for (i, p) in tested.iter().enumerate() {
         let cx = (p[0] * inv).floor() as i64;
@@ -68,11 +90,12 @@ pub fn distances(tested: &[[f64; 3]], reference: &[[f64; 3]], cell: f64) -> Vec<
         let cz = (p[2] * inv).floor() as i64;
         let mut best = f64::INFINITY;
         // The 3x3x3 neighbourhood: with a cell of a few point spacings, the nearest point is in it.
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    let Some(bucket) = grid.get(&(cx + dx, cy + dy, cz + dz)) else { continue };
-                    for &j in bucket {
+        for dx in -1i64..=1 {
+            for dy in -1i64..=1 {
+                for dz in -1i64..=1 {
+                    let k = key(cx + dx, cy + dy, cz + dz);
+                    let Some(&(start, count)) = grid.get(&k) else { continue };
+                    for &j in &buckets[start as usize..(start + count) as usize] {
                         let q = reference[j as usize];
                         let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
                         if d < best {
@@ -181,5 +204,27 @@ mod tests {
         assert!(low[2] > low[0], "small deviation is blue: {low:?}");
         assert!(high[0] > high[2], "large deviation is red: {high:?}");
         assert_eq!(deviation_color(f32::NAN, 1.0), [120, 120, 120], "outside the reference is grey");
+    }
+
+    /// The grid is a flat array of buckets: the run of every cell must hold exactly its own
+    /// points. A layout that slips by one point would show it here.
+    #[test]
+    fn the_grid_finds_the_neighbour_of_every_point() {
+        let mut reference = Vec::new();
+        for i in 0..200 {
+            for j in 0..200 {
+                reference.push([i as f64 * 0.02, j as f64 * 0.02, 0.0]);
+            }
+        }
+        // The tested cloud is the reference, moved a little: the deviation must be that move.
+        let shift = [0.003, -0.004, 0.0];
+        let tested: Vec<[f64; 3]> = reference.iter().map(|p| [p[0] + shift[0], p[1] + shift[1], p[2] + shift[2]]).collect();
+        let d = distances(&tested, &reference, 0.08);
+        let s = stats(&d);
+        assert_eq!(s.count, reference.len());
+        assert_eq!(s.missing, 0);
+        let expected = (shift[0] * shift[0] + shift[1] * shift[1]).sqrt();
+        assert!((s.mean - expected).abs() < 1e-4, "{s:?}");
+        assert!(s.max < expected * 1.5, "{s:?}");
     }
 }

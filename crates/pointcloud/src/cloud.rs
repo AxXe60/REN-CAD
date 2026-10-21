@@ -346,19 +346,38 @@ impl Cloud {
     ///
     /// The reference must be denser than this cloud and must cover it; the points that find no
     /// neighbour are counted, not given a distance.
-    pub fn compare_with(&mut self, reference: &Cloud, cell: f64) -> crate::compare::DeviationStats {
-        let reference_points = reference.world_points();
-        // The search cell: a few times the spacing of the reference's points, so the nearest
-        // neighbour is in the neighbourhood that is looked at.
-        let cell = match reference.levels.first() {
-            Some(level) if level.cell > 0.0 => level.cell * 2.0,
-            _ => cell,
+    pub fn compare_with(&mut self, reference: &Cloud, wanted_cell: f64) -> crate::compare::DeviationStats {
+        let points = reference.world_points();
+        let cell = reference.search_cell(wanted_cell);
+        self.compare_with_points(&points, cell)
+    }
+
+    /// The size of the search cell of a comparison with this cloud as the reference: four times
+    /// the spacing of its points, so the neighbourhood that is looked at covers a misalignment of
+    /// two spacings and the nearest point is still found.
+    pub fn search_cell(&self, wanted_cell: f64) -> f64 {
+        let mut cell = match self.levels.first() {
+            Some(level) if level.cell > 0.0 => level.cell * 4.0,
+            _ => 0.05,
         };
+        // A cell asked for at the command line only widens the search.
+        if wanted_cell > 0.0 && wanted_cell > cell {
+            cell = wanted_cell;
+        }
+        cell
+    }
+
+    /// Compare the cloud with a reference given as points, in world coordinates.
+    ///
+    /// The points are taken as they are, so the caller does not have to copy the whole reference
+    /// cloud: a hundred-million-point scan would not fit twice.
+    pub fn compare_with_points(&mut self, reference_points: &[[f64; 3]], cell: f64) -> crate::compare::DeviationStats {
+        let cell = if cell > 0.0 { cell } else { 0.05 };
         let mut stats = crate::compare::DeviationStats::default();
         for level in &mut self.levels {
             let tested: Vec<[f64; 3]> =
                 level.pts.iter().map(|v| [f64::from(v.x) + self.origin[0], f64::from(v.y) + self.origin[1], f64::from(v.z)]).collect();
-            level.dev = crate::compare::distances(&tested, &reference_points, cell);
+            level.dev = crate::compare::distances(&tested, reference_points, cell);
         }
         if let Some(finest) = self.levels.first() {
             stats = crate::compare::stats(&finest.dev);

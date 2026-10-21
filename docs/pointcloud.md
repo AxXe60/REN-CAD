@@ -255,8 +255,10 @@ inventing a distance.
 {"message":"Ap 1 against Curte ulei: 3899545 points: mean 0.0121 m, σ 0.0090 m, RMS 0.0150 m, min 0.0000, max 0.2130, p95 0.0243 m"}
 ```
 
-The search is a uniform grid over the reference (the cell is twice the reference's point spacing),
-so a comparison of two four-million-point scans takes seconds, not minutes.
+The search is a uniform grid over the reference — one flat array of buckets, the cell four times
+the reference's point spacing — so a comparison of two four-million-point scans takes seconds, not
+minutes: the measured run (two 3 899 545-point scans of the same file, read and compared) took
+28.7 s, the comparison itself about 15 s of it.
 
 ### The viewport HUD and the Z band
 
