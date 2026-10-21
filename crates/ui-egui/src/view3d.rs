@@ -848,8 +848,11 @@ fn draw_sketch(painter: &egui::Painter, view: &View3d, vp: &[f32; 16], rect: Rec
     }
     let screen = Screen::new(view, *vp, rect);
     let color = egui::Color32::from_rgb(0xF2, 0x7A, 0x1A);
+    // The casing: a dark line under every stroke, so a traced line reads over a bright cloud.
+    let casing = egui::Color32::from_black_alpha(215);
     for (a, b) in sketch.iter_segments() {
         if let (Some(pa), Some(pb)) = (screen.project(a), screen.project(b)) {
+            painter.line_segment([pa, pb], egui::Stroke::new(4.5, casing));
             painter.line_segment([pa, pb], egui::Stroke::new(2.0, color));
         }
     }
@@ -873,6 +876,7 @@ fn draw_sketch(painter: &egui::Painter, view: &View3d, vp: &[f32; 16], rect: Rec
     if let (Some(last), Some(hover)) = (draft.points.last(), draft.hover)
         && let (Some(a), Some(b)) = (screen.project(*last), screen.project(hover))
     {
+        painter.line_segment([a, b], egui::Stroke::new(4.0, casing));
         painter.line_segment([a, b], egui::Stroke::new(1.5, color.gamma_multiply(0.75)));
         // The live numbers of the segment being drawn: its length, its run and its rise.
         let m = cadcraft_pointcloud::measure(*last, hover);
@@ -892,6 +896,7 @@ fn draw_sketch(painter: &egui::Painter, view: &View3d, vp: &[f32; 16], rect: Rec
         && let (Some(a), Some(b)) = (screen.project(m.a), screen.project(m.b))
     {
         let blue = egui::Color32::from_rgb(0x4A, 0xC8, 0xFF);
+        painter.line_segment([a, b], egui::Stroke::new(4.5, casing));
         painter.line_segment([a, b], egui::Stroke::new(2.0, blue));
         painter.circle_stroke(a, 4.0, egui::Stroke::new(1.5, blue));
         painter.circle_stroke(b, 4.0, egui::Stroke::new(1.5, blue));

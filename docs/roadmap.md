@@ -49,6 +49,10 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M13 | **Seeing through the cloud**: `LASOPACITY` plus a deterministic mask in the vertex shader, so a wall seen edge-on stops hiding the drawing (done) | done |
 | M14 | **The camera**: the orbit target follows the point under the cursor (the front-layer snap), the presets (Top/Front/Iso) animate instead of jumping, and a walk mode locks the eye's height for interiors (≈ 10–16 h) | planned |
 | M15 | **The palette**: a floating camera bar over the 3D view, collapsible sections, a mini Z-histogram behind the crop slider (≈ 8–14 h) | planned |
+| M16 | **Pick to pivot**: the orbit turns around the point under the cursor (the eye and the target both rotate around it, so the picture never jumps) and `Ctrl+Scroll` drives the front wall cut on its own (≈ 6–10 h) | planned |
+| M17 | **The focus lens**: near the cursor the cloud is whole again (the opacity and the thinning ramp back), so the vertex lands on a detail even with the cloud at 25% (≈ 4–8 h) | planned |
+| M18 | **A rotated crop**: the crop box turns with a wall (`Align Crop to Line`), so a facade at 37° can be cut (≈ 6–10 h) | planned |
+| M19 | **Romanian** in the interface catalog (`ro`), the fifteenth language (≈ 4–6 h) | planned |
 | M11 | The 3D strokes as real drawing entities — waits for the 3D kernel, so the upstream's own 3D milestone is the blocker | planned |
 | M13 | A height/DSM grid over the band, with contours (≈ 12–18 h) | planned |
 | M14 | A local cache of the decimated pyramid next to the scan, so a 1.8 GB survey opens in a second the second time (≈ 6–10 h) | planned |
