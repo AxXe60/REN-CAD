@@ -140,13 +140,17 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.label(egui::RichText::new("Intensity scale").color(t.text_dim).size(12.0));
         let current = app.session.clouds[selected].spectrum;
-        for spectrum in cadcraft_pointcloud::Spectrum::ALL {
-            let label = egui::RichText::new(spectrum.label()).size(11.0);
-            let selected_spectrum = spectrum == current;
-            if ui.selectable_label(selected_spectrum, label).on_hover_text("The colour scale the intensity band is read on").clicked() {
-                run(app, "lpectrum", json!({"index": selected, "spectrum": spectrum.name()}));
+        egui::ComboBox::from_id_salt("spectrum").selected_text(current.label()).show_ui(ui, |ui| {
+            for spectrum in cadcraft_pointcloud::Spectrum::ALL {
+                if ui
+                    .selectable_label(spectrum == current, spectrum.label())
+                    .on_hover_text("The colour scale the intensity band is read on")
+                    .clicked()
+                {
+                    run(app, "lpectrum", json!({"index": selected, "spectrum": spectrum.name()}));
+                }
             }
-        }
+        });
     });
 
     // ---------- resolution ----------
@@ -182,14 +186,9 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
                 run(app, "lasclass", json!({"index": selected, "mode": mode}));
             }
         }
-        if app.session.clouds[selected].has_classes()
-            && ui
-                .selectable_label(color == cadcraft_pointcloud::CloudColor::Class, "Class colours")
-                .on_hover_text("The ground brown, the vegetation green, the walls red")
-                .clicked()
-        {
-            run(app, "lascolor", json!({"index": selected, "mode": "class"}));
-        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
         if ui
             .button("AI")
             .on_hover_text(
@@ -198,6 +197,14 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             .clicked()
         {
             run(app, "lascluster", json!({"index": selected}));
+        }
+        if app.session.clouds[selected].has_classes()
+            && ui
+                .selectable_label(color == cadcraft_pointcloud::CloudColor::Class, "Class colours")
+                .on_hover_text("The ground brown, the vegetation green, the walls red")
+                .clicked()
+        {
+            run(app, "lascolor", json!({"index": selected, "mode": "class"}));
         }
     });
 
