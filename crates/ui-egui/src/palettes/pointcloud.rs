@@ -194,17 +194,20 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
     if app.view3d.active {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(egui::RichText::new(format!("3D: {} points drawn", num(app.view3d.drawn))).color(t.text_dim).size(11.0));
-            let mut size = app.view3d.point_size;
-            if ui.add(egui::Slider::new(&mut size, 0.5..=4.0).text("pt")).changed() {
-                app.view3d.point_size = size;
-            }
+            ui.label(egui::RichText::new(format!("3D: {} points on screen", num(app.view3d.drawn))).color(t.text_dim).size(11.0));
         });
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             if ui.button("Fit 3D").clicked() {
                 app.view3d.fitted = false;
             }
+            let mut size = app.view3d.point_size;
+            if ui.add(egui::Slider::new(&mut size, 0.5..=4.0).fixed_decimals(1).text("pt")).changed() {
+                app.view3d.point_size = size;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
             ui.label(egui::RichText::new("to draw over it, switch back to 2D").color(t.text_dim).size(11.0));
         });
     }

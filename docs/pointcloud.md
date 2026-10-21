@@ -176,8 +176,8 @@ script cannot drift apart.
 - **Remove walls / ceiling** enables a crop box: one min/max pair per axis. Lower the Z maximum to
   drop the ceiling, raise the Z minimum for the floor, pull X and Y in for the walls; untick it to
   restore every point (the file is not re-read).
-- When the 3D view is on, a point-size slider and **Fit 3D** appear, plus the number of points the
-  3D scene drew.
+- When the 3D view is on, a point-size slider and **Fit 3D** appear, plus the number of points on
+  screen.
 
 ## The 3D view
 
@@ -189,9 +189,13 @@ perspective view of the visible clouds in the same rectangle; `{"on": false}` re
 - The camera is an orbit around the cloud's centre with world Z up (the scanner's vertical), 50°
   vertical field of view. Angles survive switching to 2D and back.
 - The same decimation pyramid is used: the level is picked for the on-screen density at the camera
-  target, coarsened further if it would exceed 1.5 million points. Unlike 2D there is no view
-  filter, so orbiting and panning need **no rebuild and no upload** — each frame only writes an
-  80-byte view-projection uniform.
+  target, then the scene keeps only the points inside a ball around the target (three times the
+  camera distance, which covers the screen corners at every orbit angle). The uploaded set is
+  capped at 3 million points; because the ball shrinks as you zoom in, the full-resolution level
+  fits exactly where its detail is visible. Orbiting changes neither the ball nor the level, so it
+  still needs **no rebuild and no upload** — each frame only writes an 80-byte view-projection
+  uniform; zooming and panning rebuild in coarse steps (a quarter of the ball, half an e-fold of
+  its radius).
 - `crates/ui-egui/src/gpu3d.rs` owns a second pipeline (target format and stencil attachment shared
   with the 2D canvas). Points are 6-vertex instanced screen-space squares because WGSL has no
   `gl_PointSize`; the shader converts sRGB to linear when the target is sRGB, as the 2D shader does.
@@ -213,7 +217,8 @@ view-projection.
 | `LASOPEN` whole file at 2 mm | **1,394,540 points, 9 levels** (~38 MB of 16-byte vertices) |
 | Mesh at default zoom | 44,259 points → **2.1 ms** |
 | Mesh zoomed to 6 m | 551,870 points → **22 ms**, one draw call |
-| 3D scene at fit (`ui.view3d`) | 46,319 points → **0.8 ms** to build and upload; orbiting then rebuilds nothing |
+| 3D scene at fit, whole file open | 214,871 visible points → **3.4 ms** to build and upload; orbiting then rebuilds nothing |
+| 3D zoom steps | 506k → 8 ms, 1.13M → 18 ms, 2.45M → 40 ms; each upload holds only the ball around the target |
 | Recolour (`LASCOLOR`) | instant; the mesh rebuilds on the next frame |
 
 The LOD keeps the drawn count proportional to the screen, not to the file: ~550k is what a
@@ -229,10 +234,10 @@ buffer.
   20k points, capped at 16 levels. Each vertex is 16 bytes: `f32` x/y/z relative to the cloud origin
   plus RGB and intensity bytes. `level_for(px_per_m)` picks the level whose cell is nearest 2 screen
   pixels.
-- The canvas clips the chosen level to the view plus half a screen, builds a `DisplayList` with one
-  `Kind::Cloud` primitive, and hands it to the GPU instanced-quad pipeline on `LAYER_CLOUD` (5):
-  one instance per point with its own colour, one draw call. `gpu::CLOUD_SIZE` is 2 px, matching
-  the LOD spacing.
+- The canvas clips the chosen level to the view plus a quarter screen, builds a `DisplayList` with
+  one `Kind::Cloud` primitive, and hands it to the GPU instanced-quad pipeline on `LAYER_CLOUD`
+  (5): one instance per point with its own colour, one draw call. `gpu::CLOUD_SIZE` is 2 px,
+  matching the LOD spacing.
 - The mesh is rebuilt only when the level, the colour mode or the ground covered changes
   (quantised view centre and zoom); plain panning just moves it.
 - Clouds live in `Session::clouds`, never as drawing entities: snaps, picking, undo and save see
@@ -248,7 +253,8 @@ buffer.
 - The finest level is capped by `maxPoints`; above it the grid is coarsened silently (the returned
   `points` says so). Raise `maxPoints` for a dense survey workstation.
 - One mesh rebuild per zoom step costs ~20 ms at half a million points; panning within the built
-  area is free. The 3D view caps its scene at 1.5 million points per frame.
+  area is free. The 3D view uploads at most 3 million points: the visible ball is counted first and
+  the level is coarsened until it fits, so the cap applies to the points on screen, not the cloud.
 - The 3D view draws clouds only: the 2D drawing, the ViewCube and 3D drawing are not part of it yet.
   It also has no depth buffer, so points do not occlude each other (fine for translucent scans,
   wrong for solid surfaces later).

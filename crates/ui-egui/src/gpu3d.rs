@@ -19,8 +19,10 @@ use crate::gpu::GpuTarget;
 /// `[x, y, z]` f32 + RGBA8: 16 bytes per point.
 pub const VERTEX3D_SIZE: usize = 16;
 const UNIFORM3D_SIZE: u64 = 80;
-/// Points per drawn frame. A 1.5M-point upload is 24 MB; the LOD rarely picks that many.
-pub const MAX_SCENE_POINTS: usize = 1_500_000;
+/// Points in the uploaded scene. Only the part of the scan near the orbit target is uploaded, so
+/// this is the visible budget, not the cloud size: 3M points is 48 MB and still a small vertex load
+/// for a frame, and at deep zoom the full-resolution level fits inside it.
+pub const MAX_SCENE_POINTS: usize = 3_000_000;
 
 /// One point as the GPU sees it: world position and premultiplied-ready colour.
 #[derive(Clone, Copy, Debug)]

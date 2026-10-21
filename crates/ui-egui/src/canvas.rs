@@ -699,8 +699,8 @@ fn adaptive(unit: f64, scale: f64, min_px: f64) -> f64 {
 /// Point clouds opened with LASOPEN, drawn under the drawing so they can be traced over.
 ///
 /// The display list is a level of the cloud's decimation pyramid — the one whose grid spacing is
-/// about two screen pixels — clipped to the view plus half a screen of margin. It goes through the
-/// same GPU quad pipeline as the drawing (one instance per point, own colour), so a hundred
+/// about two screen pixels — clipped to the view plus a quarter screen of margin. It goes through
+/// the same GPU quad pipeline as the drawing (one instance per point, own colour), so a hundred
 /// thousand points cost one draw call. When the view moves into new ground or the zoom changes by
 /// a step, the level is chosen and the buffer rebuilt; otherwise panning only moves it.
 fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
@@ -710,7 +710,7 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
     }
     let area = xf.world_bounds();
     let span = area.width().max(area.height()).max(1e-6);
-    let far = area.expand(span * 0.5);
+    let far = area.expand(span * 0.25);
     let mut list = DisplayList::default();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for c in app.session.clouds.iter().filter(|c| c.visible) {
@@ -764,9 +764,9 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
         return;
     }
     list.bounds = Bounds2::from_points(list.verts.iter().copied());
-    // Which ground the buffer covers: rebuild after panning half a screen or zooming a step.
-    ((xf.center.x / (span * 0.5)).round() as i64).hash(&mut hasher);
-    ((xf.center.y / (span * 0.5)).round() as i64).hash(&mut hasher);
+    // Which ground the buffer covers: rebuild after panning a quarter screen or zooming a step.
+    ((xf.center.x / (span * 0.25)).round() as i64).hash(&mut hasher);
+    ((xf.center.y / (span * 0.25)).round() as i64).hash(&mut hasher);
     ((xf.scale.log2() * 4.0).round() as i64).hash(&mut hasher);
     let key = hasher.finish();
 

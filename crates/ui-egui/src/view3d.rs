@@ -3,8 +3,10 @@
 //! The drawing canvas is 2D; when the 3D view is on, [`show`] replaces it inside the same rect
 //! and handles its own input (drag orbits, middle/shift-drag pans, wheel dollies, double-click
 //! fits). The points come from the clouds' existing decimation pyramid, picked by the on-screen
-//! density, capped at [`MAX_SCENE_POINTS`], and drawn by [`crate::gpu3d`] — one upload per level
-//! or colour change, then one instanced draw call per frame.
+//! density, culled to the ball the camera can see and capped at [`MAX_SCENE_POINTS`], and drawn by
+//! [`crate::gpu3d`] — one upload per level, colour, crop or visible-ball change, then one instanced
+//! draw call per frame. Orbiting never re-uploads: the ball around the target is the same at every
+//! angle.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
@@ -126,21 +128,60 @@ fn cloud_bounds(app: &CadApp) -> Option<([f64; 3], [f64; 3])> {
     Some((min, max))
 }
 
-/// The level each visible cloud contributes at this density, coarsened to the point budget.
-fn pick_levels(clouds: &[cadcraft_pointcloud::Cloud], px_per_m: f64) -> Vec<(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)> {
+/// The ball around the orbit target that the camera can see at every orbit angle: the screen
+/// corners at the target plane are about one `dist` away, and the third `dist` of margin keeps the
+/// walls just behind the target (and a quarter of a pan step) inside it.
+///
+/// It is deliberately a sphere, not the real frustum: orbiting does not change it, so a drag costs
+/// nothing, while zooming in shrinks it to the part of the scan actually on screen.
+fn view_radius(dist: f64) -> f64 {
+    (dist * 3.0).max(0.1)
+}
+
+/// Points of `level` inside the visible ball.
+fn visible_points(c: &cadcraft_pointcloud::Cloud, level: &cadcraft_pointcloud::CloudLevel, center: [f64; 3], radius: f64) -> usize {
+    let r2 = radius * radius;
+    level
+        .pts
+        .iter()
+        .filter(|v| {
+            let x = f64::from(v.x) + c.origin[0] - center[0];
+            let y = f64::from(v.y) + c.origin[1] - center[1];
+            let z = f64::from(v.z) - center[2];
+            x * x + y * y + z * z <= r2
+        })
+        .count()
+}
+
+/// The level each visible cloud contributes at this density, coarsened until the points actually
+/// on screen fit the budget. Zoomed in on one wall the ball holds a small part of the scan, so the
+/// full-resolution level is affordable exactly when the detail would be visible.
+fn pick_levels(
+    clouds: &[cadcraft_pointcloud::Cloud],
+    px_per_m: f64,
+    center: [f64; 3],
+    radius: f64,
+) -> Vec<(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)> {
     let mut picks = Vec::new();
+    let mut budget = MAX_SCENE_POINTS;
     for c in clouds.iter().filter(|c| c.visible) {
         let chosen = c.level_for(px_per_m);
-        let level =
-            if chosen.pts.len() > MAX_SCENE_POINTS { c.levels.iter().find(|l| l.pts.len() <= MAX_SCENE_POINTS).unwrap_or(chosen) } else { chosen };
-        picks.push((c, level));
+        let mut i = c.levels.iter().position(|l| std::ptr::eq(l, chosen)).unwrap_or(0);
+        let mut n = visible_points(c, &c.levels[i], center, radius);
+        while n > budget && i + 1 < c.levels.len() {
+            i += 1;
+            n = visible_points(c, &c.levels[i], center, radius);
+        }
+        budget = budget.saturating_sub(n);
+        picks.push((c, &c.levels[i]));
     }
     picks
 }
 
-/// What the GPU buffer was built from: names, colour modes and level cells. Camera moves do not
-/// change it, so orbiting never re-uploads.
-fn scene_key(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)]) -> u64 {
+/// What the GPU buffer was built from: names, colour modes, level cells, the crop and the visible
+/// ball. Orbiting leaves every input alone, so a drag never re-uploads; zooming and panning enter
+/// in coarse steps (a quarter of the ball, half of an e-fold of its radius).
+fn scene_key(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)], center: [f64; 3], radius: f64) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for (c, level) in picks {
         c.name.hash(&mut hasher);
@@ -155,16 +196,27 @@ fn scene_key(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudL
             clip.max.map(f64::to_bits).hash(&mut hasher);
         }
     }
+    let r = radius.max(1e-6);
+    let step = r * 0.25;
+    for v in center {
+        ((v / step).round() as i64).hash(&mut hasher);
+    }
+    ((r.ln() * 2.0).round() as i64).hash(&mut hasher);
     hasher.finish()
 }
 
-/// Recolour the picked levels and pack them for upload.
-fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)]) -> Scene3d {
+/// Recolour the picked levels and pack the visible ones for upload.
+fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)], center: [f64; 3], radius: f64) -> Scene3d {
     let total: usize = picks.iter().map(|(_, level)| level.pts.len()).sum();
-    let mut scene = Scene3d { points: Vec::with_capacity(total) };
+    let r2 = radius * radius;
+    let mut scene = Scene3d { points: Vec::with_capacity(total.min(MAX_SCENE_POINTS)) };
     for (c, level) in picks {
         for v in &level.pts {
             let (x, y, z) = (f64::from(v.x) + c.origin[0], f64::from(v.y) + c.origin[1], f64::from(v.z));
+            let (dx, dy, dz) = (x - center[0], y - center[1], z - center[2]);
+            if dx * dx + dy * dy + dz * dz > r2 {
+                continue;
+            }
             if c.clip.is_some_and(|clip| !clip.contains(x, y, z)) {
                 continue;
             }
@@ -230,18 +282,22 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     // ---------- scene ----------
     let height = f64::from(rect.height()).max(1.0);
     let px_per_m = height / (2.0 * app.view3d.dist * (app.view3d.fov_y * 0.5).tan()).max(1e-9);
-    let picks = pick_levels(&app.session.clouds, px_per_m);
-    let key = scene_key(&picks);
+    // Only the ball around the orbit target is uploaded; zooming in shrinks it, so the finer
+    // levels become affordable where their detail shows.
+    let center = app.view3d.target;
+    let radius = view_radius(app.view3d.dist);
+    let picks = pick_levels(&app.session.clouds, px_per_m, center, radius);
+    let key = scene_key(&picks, center, radius);
     if app.view3d.key != Some(key) {
         let started = std::time::Instant::now();
-        let scene = build_scene(&picks);
+        let scene = build_scene(&picks, center, radius);
         let drawn = scene.points.len();
         if let Ok(mut slot) = app.view3d.slot.lock() {
             *slot = Some(scene);
         }
         app.view3d.key = Some(key);
         app.view3d.drawn = drawn;
-        log::info!("cloud 3d scene: {drawn} points in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        log::info!("cloud 3d scene: {drawn} visible points in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
     }
 
     let aspect = f64::from(rect.width()) / height;
@@ -264,26 +320,41 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
         ));
     } else {
         // No wgpu render state (wasm without a GPU): project on the CPU, sampled.
-        draw_cpu_fallback(&painter, rect, &vp, &app.view3d, &app.session.clouds, px_per_m);
+        draw_cpu_fallback(&painter, rect, &vp, &app.view3d, &app.session.clouds, px_per_m, center, radius);
     }
 
     // ---------- HUD ----------
     let clouds = app.session.clouds.iter().filter(|c| c.visible).count();
     let info = format!(
-        "3D · {clouds} cloud{}, {} points\nDrag: orbit · Shift or middle drag: pan · Wheel: zoom · Double-click: fit",
+        "3D · {clouds} cloud{}, {} points on screen\nDrag: orbit · Shift or middle drag: pan · Wheel: zoom · Double-click: fit",
         if clouds == 1 { "" } else { "s" },
         app.view3d.drawn
     );
     painter.text(rect.left_top() + vec2(10.0, 8.0), egui::Align2::LEFT_TOP, info, egui::FontId::proportional(12.0), t.text_dim);
 }
 
-fn draw_cpu_fallback(painter: &egui::Painter, rect: Rect, vp: &[f32; 16], view: &View3d, clouds: &[cadcraft_pointcloud::Cloud], px_per_m: f64) {
+fn draw_cpu_fallback(
+    painter: &egui::Painter,
+    rect: Rect,
+    vp: &[f32; 16],
+    view: &View3d,
+    clouds: &[cadcraft_pointcloud::Cloud],
+    px_per_m: f64,
+    center: [f64; 3],
+    radius: f64,
+) {
     let mut shapes = Vec::new();
+    let r2 = radius * radius;
     for c in clouds.iter().filter(|c| c.visible) {
         let level = c.level_for(px_per_m);
         let step = (level.pts.len() / 50_000).max(1);
         for v in level.pts.iter().step_by(step) {
-            let p = [(f64::from(v.x) + c.origin[0]) as f32, (f64::from(v.y) + c.origin[1]) as f32, v.z];
+            let (x, y, z) = (f64::from(v.x) + c.origin[0], f64::from(v.y) + c.origin[1], f64::from(v.z));
+            let (dx, dy, dz) = (x - center[0], y - center[1], z - center[2]);
+            if dx * dx + dy * dy + dz * dz > r2 {
+                continue;
+            }
+            let p = [x as f32, y as f32, z as f32];
             if c.clip.is_some_and(|clip| !clip.contains(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))) {
                 continue;
             }
@@ -428,10 +499,38 @@ mod tests {
 
     #[test]
     fn an_empty_cloud_selection_builds_an_empty_scene() {
-        let picks = pick_levels(&[], 50.0);
-        let scene = build_scene(&picks);
+        let picks = pick_levels(&[], 50.0, [0.0; 3], 10.0);
+        let scene = build_scene(&picks, [0.0; 3], 10.0);
         assert_eq!(scene.points.len(), 0);
-        assert_eq!(scene_key(&picks), scene_key(&[]));
+        assert_eq!(scene_key(&picks, [0.0; 3], 10.0), scene_key(&[], [0.0; 3], 10.0));
+    }
+
+    /// A 10 m ball over a 100 m line: only the points inside it are counted and uploaded, which is
+    /// what lets a zoomed-in view afford the full-resolution level.
+    #[test]
+    fn only_the_ball_around_the_target_is_counted_and_uploaded() {
+        let pts: Vec<_> = (0..1000).map(|i| cadcraft_pointcloud::Pt { x: f64::from(i) * 0.1, y: 0.0, z: 1.0, rgb: None, intensity: 0 }).collect();
+        let mut b = cadcraft_pointcloud::Bounds3::EMPTY;
+        for p in &pts {
+            b.add(p.x, p.y, p.z);
+        }
+        let slice = cadcraft_pointcloud::Slice { points: pts, total: 1000, in_band: 1000, bounds: b };
+        let c = cadcraft_pointcloud::Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, None, slice, 1_000_000, CloudColor::Rgb);
+        let (center, radius) = ([10.0, 0.0, 1.0], 5.0);
+        let n = visible_points(&c, &c.levels[0], center, radius);
+        assert!((90..=110).contains(&n), "a 10 m ball of a 0.1 m line: {n}");
+        let clouds = [c];
+        let picks = pick_levels(&clouds, 4000.0, center, radius);
+        assert_eq!(build_scene(&picks, center, radius).points.len(), n);
+    }
+
+    /// Orbiting changes no key input; zooming and panning do, in coarse steps.
+    #[test]
+    fn the_scene_key_follows_the_visible_ball_not_the_camera_angle() {
+        let k = scene_key(&[], [0.0; 3], 10.0);
+        assert_eq!(k, scene_key(&[], [0.0; 3], 10.0), "a drag re-uses the buffer");
+        assert_ne!(k, scene_key(&[], [5.0, 0.0, 0.0], 10.0), "panning far enough rebuilds");
+        assert_ne!(k, scene_key(&[], [0.0; 3], 4.0), "zooming rebuilds");
     }
 
     #[test]

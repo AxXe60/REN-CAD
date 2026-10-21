@@ -203,6 +203,7 @@ const METHODS: &[(&str, &str, &str)] = &[
     ("ui.pointer", "{x, y, space?, button?, action?}", "Click or move in the drawing area (world coordinates by default). Right button = Enter."),
     ("ui.click", "{x, y, button?, shift?, ctrl?}", "Real egui click in screen points."),
     ("ui.move", "{x, y}", "Real egui pointer move in screen points."),
+    ("ui.wheel", "{delta: number}", "Real mouse-wheel scroll (points) where the pointer is; zooms the 2D canvas and the 3D view."),
     ("ui.drag", "{x, y, to: [x, y], button?}", "Real press, move and release."),
     ("ui.key", "{key, cmd?, shift?, alt?}", "Synthetic key press."),
     ("ui.text", "{text}", "Synthetic text input."),
@@ -400,6 +401,17 @@ pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
                     app.synthetic.push(egui::Event::PointerMoved(pos));
                 }
             }
+            ok(Value::Null)
+        }
+        // Real wheel scroll at the pointer: the 2D canvas and the 3D view both read it.
+        "ui.wheel" => {
+            let delta = f("delta").unwrap_or(0.0);
+            app.synthetic.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, delta as f32),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            });
             ok(Value::Null)
         }
         // Press at (x, y), move in steps to `to`, release there: a real drag through egui.
