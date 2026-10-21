@@ -38,11 +38,15 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M6 | 3D camera (35° lens or true ortho, zoom anchored at the cursor, Top/Front/Iso); 3D drafting over the cloud, exported as DXF `LINE`s with Z | done |
 | M7 | Smart snapping (front layer only, `Exact`/`Smooth`), Z lock, axis ortho, per-stroke layers, closed polylines, `3DMEASURE` and the measure tool | done |
 | M9 | Front wall cut and depth cue in the vertex shader (clarity without a depth buffer); colour ramps over the 2%–98% window | done |
-| M10 | LAZ writing, COPC streaming and a classification filter (≈ 20–30 h) | planned |
+| M10a | The ground under the cloud: a morphological filter with a slope correction, classes beside the 16-byte vertex, `LASGROUND`, **Find ground** / **Ground only** | done |
+| M11a | Georeferencing: the CRS the file names (GeoTIFF keys or WKT), shown in the palette and `LASINFO`, written as a `.prj` sidecar next to an exported drawing | done |
+| M10b | A vertical section through the cloud: a plane cut, a profile polyline, exported as a drawing (≈ 6–10 h) | planned |
+| M10c | COPC on the octree (read only the levels and bounds in view) and LAZ writing (≈ 10–16 h) | planned |
+| M11b | Reprojection between CRSs, so a scan and a georeferenced drawing can share a frame (≈ 12–20 h) | planned |
 | M11 | The 3D strokes as real drawing entities — waits for the 3D kernel, so the upstream's own 3D milestone is the blocker | planned |
-| M12 | A section/height tool over the band: cut a vertical slice at a chosen Z, measure heights, export the section as a drawing | planned |
+| M12 | A height/DSM grid over the band, with contours (≈ 12–18 h) | planned |
 
-M10 is the next one that can land without the upstream's 3D kernel.
+M10b is the next one that can land without the upstream's 3D kernel.
 
 ## Alpha gate
 

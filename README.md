@@ -46,6 +46,8 @@ RENCAD reads LAS/LAZ scans and puts them where you can work with them: under the
 | **Fast, even on huge files** | A decimation pyramid (16 bytes per point) picks the level that matches the screen density: a 3.9-million-point apartment loads in about a second and draws in 2 ms, with one draw call. |
 | **Colour modes** | The file's RGB, elevation, intensity as a spectrum, or one colour. The ramps run over the 2%–98% window of the band, so a few outliers can't flatten the contrast. |
 | **Crop without re-reading** | Raise the Z to drop the floor, lower it to drop the ceiling, pull X and Y in to take the walls away. |
+| **The ground under the cloud** | **Find ground** separates the floor from the furniture with a morphological filter that follows a slope; **Ground only** then draws the floor plan and nothing else. |
+| **Where the scan is** | The coordinate system the file names (EPSG code and WKT) is read, shown in the palette and written next to an exported drawing as a `.prj` file. |
 | **3D view** | An orbit camera with a 35° lens or a true orthographic projection, zoom anchored at the cursor, Top/Front/Iso views, and only the points on screen are uploaded. |
 | **Clarity without a depth buffer** | A **front wall cut** drops the points between the camera and the target, so you can look into a room; a **depth cue** fades the far ones into the background and shrinks them, so the near geometry stands out. |
 | **3D drafting** | Click to place vertices that snap to the cloud, hold a plane with the **Z lock**, follow one axis with **Shift**, close the polyline with **C**, and export DXF `LINE`s with their Z — one layer per stroke. |

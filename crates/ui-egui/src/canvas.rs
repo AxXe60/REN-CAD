@@ -718,6 +718,7 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
         let start = list.verts.len() as u32;
         (c.name.as_str(), c.color.name(), c.points()).hash(&mut hasher);
         level.cell.to_bits().hash(&mut hasher);
+        c.ground_only.hash(&mut hasher);
         if let cadcraft_pointcloud::CloudColor::Single([r, g, b]) = c.color {
             (r, g, b).hash(&mut hasher);
         }
@@ -725,7 +726,11 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
             clip.min.map(f64::to_bits).hash(&mut hasher);
             clip.max.map(f64::to_bits).hash(&mut hasher);
         }
-        for v in &level.pts {
+        for (i, v) in level.pts.iter().enumerate() {
+            // With the ground filter on, only the points it found are drawn.
+            if c.ground_only && level.classes.get(i).is_none_or(|k| *k != cadcraft_pointcloud::CLASS_GROUND) {
+                continue;
+            }
             let x = f64::from(v.x) + c.origin[0];
             let y = f64::from(v.y) + c.origin[1];
             if c.clip.is_some_and(|clip| !clip.contains(x, y, f64::from(v.z))) {

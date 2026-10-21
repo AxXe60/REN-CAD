@@ -28,6 +28,8 @@ selecția, undo-ul și salvarea văd doar ce a desenat utilizatorul.
 | **Snap inteligent**: strat frontal (fără snap prin pereți) + mod Smooth/Exact | gata |
 | **Constrângeri 3D**: Z-lock (plan orizontal), Axis Ortho (Shift) | gata |
 | **Măsurare 3D**: lungime, dXY, dZ, pantă — live și ca comandă | gata |
+| **Teren sub nor**: filtru morfologic cu ajustare pe pantă (planul etajului) | gata |
+| **Georeferențiere**: CRS din fișier (GeoTIFF keys / WKT) + `.prj` la export | gata |
 | **Claritate 3D fără depth buffer**: front wall cut + depth cue | gata |
 | **Contrast robust**: rampele folosesc percentilele 2%–98% | gata |
 | Layere pe stroke (DXF per layer) + închidere polilinie | gata |
@@ -115,6 +117,23 @@ LAS ──► 3DLINE ──► Session.sketch ───────────�
   ecran rămâne segmentul albastru cu eticheta `8.184 m · dXY 7.731 · dZ 2.683`.
 - În timpul desenului, rubber-band-ul arată live lungimea, dXY și dZ segmentului curent.
 
+### 3.8 Terenul sub nor (M10a) — `pointcloud/src/ground.rs`
+- Filtrul morfologic, cu corecție de pantă: celula 0,5 m → cel mai jos punct ca sămânță → sămânțile
+  ce stau cu mult peste vecinii (masa, mașina) se aruncă → **planul** ajustat pe 3×3 celule → punctele
+  pe plan sunt teren (clasa 2), cele de sub el sunt zgomot (clasa 18).
+- Clasele stau **lângă** vârful de 16 bytes (în `CloudLevel.classes`), nu în el — GPU-ul nu le
+  are nevoie, iar layout-ul rămâne neatins.
+- `LASGROUND` (și butonul **Find ground** din paletă) clasifică; **Ground only** desenează doar
+  terenul — pe scanul real, planul etajului rămâne, mobila dispare (737.687 puncte de teren din
+  3.899.545).
+
+### 3.9 Georeferențiere (M11a) — `pointcloud/src/crs.rs`
+- CRS-ul se citește din fișier: cheile GeoTIFF (codul EPSG) sau WKT-ul OGC.
+- `LASINFO` și paleta spun ce sistem e (EPSG + nume); `LASEXPORT` scrie WKT-ul lângă desen ca
+  `out.prj` (convenția GIS).
+- Fork-ul **nu reproiectează**: desenul e 2D în unități locale, iar norul rămâne unde îl pune
+  fișierul. Un fișier fără CRS spune asta, nu inventează.
+
 Nu există depth buffer în pipeline-ul 3D (folosește doar stencil), deci liniile și punctele nu se
 ocludează reciproc. E o alegere conștientă: nu atingem pipeline-urile upstream. În schimb, snap-ul
 prioritizat pe adâncime compensează lipsa depth buffer-ului.
@@ -132,6 +151,7 @@ Toate sunt `CommandSpec`, deci merg din linia de comandă, CLI, control JSON și
 | `LASDECIMATE {cell,index?}` | re-citește la altă celulă; `0` = toate punctele |
 | `LASCLIP {min,max,index?}` / `{reset:true}` | crop box (tavan/pereți/podea) |
 | `LASVISIBLE {visible?,index?}` | arată/ascunde |
+| `LASGROUND {cell?,tolerance?,bump?,sigma?,show?}` | găsește terenul / desenează doar terenul |
 | `LASFRAME {index?}` | încadrează XY în 2D |
 | `LASCLOSE {index?,all?}` · `LASCLOUDS {}` | închide / listează |
 | `3DLINE {points:[[x,y,z],…], layer?, closed?}` | adaugă o polilinie 3D (implicit `3D_DRAFT`) |
@@ -182,6 +202,8 @@ Exemplu:
 | `crates/pointcloud/src/cloud.rs` | `Cloud`, `CloudLevel`, piramidă, culori, percentile 2%–98% |
 | `crates/pointcloud/src/sketch.rs` | `Sketch3d`, `Stroke3` (puncte, layer, closed) |
 | `crates/pointcloud/src/snap.rs` | strat frontal, centroid, Z-lock, axis-lock |
+| `crates/pointcloud/src/ground.rs` | filtrul de teren (morfologic + plan) și zgomotul |
+| `crates/pointcloud/src/crs.rs` | CRS-ul din fișier (GeoTIFF keys / WKT) |
 | `crates/pointcloud/src/measure.rs` | lungime, dXY, dZ, pantă |
 | `crates/pointcloud/src/dxf.rs` | export DXF puncte + linii 3D (per layer) |
 | `crates/engine/src/lib.rs` | `Session::clouds`, `Session::sketch`, `Session::snap3d` |
@@ -234,3 +256,9 @@ Control (JSON lines pe `127.0.0.1:47902`): `engine.execute`, `cmdline.input`, `u
   percentilele 2%–98%): implementat, teste unitare (uniformă `bytemuck`, shader WGSL validat cu
   naga, percentile pentru Z și intensitate) și verificat live (zoom 30 → 15 m, 1.134.102 puncte pe
   ecran, perechea față spate clar diferențiată, rampă elevation cu contrast plin).
+- M10a/M11a (filtru de teren cu ajustare pe pantă; CRS din fișier + `.prj` la export): implementat
+  fără dependențe noi, teste unitare (7 pentru CRS, 6 pentru filtrul de teren), verificat live pe
+  scanul real (737.687 puncte de teren, planul etajului extras, export cu `.prj` când fișierul
+  are CRS).
+- Următorul: M10b (secțiune verticală prin nor → polilinie exportabilă) și M10c (citire COPC pe
+  octree, cu query pe nivel + bounds — `las` are deja `CopcReader`).

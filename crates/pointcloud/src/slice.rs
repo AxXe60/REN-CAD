@@ -14,6 +14,8 @@ pub struct Pt {
     /// 8-bit RGB when the file carries colour.
     pub rgb: Option<[u8; 3]>,
     pub intensity: u16,
+    /// The LAS classification code the file gives the point (2 = ground, 1 = unclassified).
+    pub class: u8,
 }
 
 /// A slice and what it cost.
@@ -67,7 +69,7 @@ pub fn slice(path: &Path, z0: f64, z1: f64, decimate: Option<f64>) -> Result<Sli
             }
             let rgb = p.color.map(|c| [to_u8(c.red), to_u8(c.green), to_u8(c.blue)]);
             bounds.add(p.x, p.y, p.z);
-            points.push(Pt { x: p.x, y: p.y, z: p.z, rgb, intensity: p.intensity });
+            points.push(Pt { x: p.x, y: p.y, z: p.z, rgb, intensity: p.intensity, class: u8::from(p.classification) });
         }
     }
     if points.is_empty() {

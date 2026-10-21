@@ -1,6 +1,6 @@
 # Point clouds (LAS/LAZ) — RENCAD
 
-> **Last reviewed:** 2026-10-21 · **Status:** M9 — depth cue, front wall cut, robust colour ramps · **Fork addition**
+> **Last reviewed:** 2026-10-21 · **Status:** M11 — the ground filter and the scan's coordinate system · **Fork addition**
 
 RENCAD is the working name of this fork of CADCraft (the crates and the binary keep their upstream
 names so the weekly rebase stays a fast-forward). The fork adds point cloud support: M1 read a
@@ -28,8 +28,9 @@ and MCP without extra wiring.
 
 ### `LASINFO {path}`
 
-Reads the header only. Returns the point count, bounds, scale/offset, point format and whether the
-file carries colour.
+Reads the header only. Returns the point count, bounds, scale/offset, point format, whether the
+file carries colour and the coordinate reference system it names (`crs` is `null` when the file
+names none).
 
 ```bash
 cadcraft-cli run --cmd 'lasinfo {"path":"D:/LIdar/Ap 1.las"}'
@@ -37,14 +38,16 @@ cadcraft-cli run --cmd 'lasinfo {"path":"D:/LIdar/Ap 1.las"}'
 
 ```json
 {"points":3899546,"bounds":{"min":[-9.238,-9.742,-1.693],"max":[4.048,8.034,5.392]},
- "hasColor":true,"pointFormat":3,"scale":[0.0001,0.0001,0.0001]}
+ "hasColor":true,"pointFormat":3,"scale":[0.0001,0.0001,0.0001],"crs":null}
 ```
 
 ### `LASEXPORT {path, out, z0?, z1?, decimate?, layer?}`
 
 Streams the file, keeps `z0 <= z <= z1` and writes a DXF of POINT entities (R2000, ASCII) on
 `layer` (default `PC-SLICE`). `decimate` is a grid cell in metres — 0.01–0.05 m keeps wall outlines
-and drops scanner noise. Without `z0`/`z1` it uses the file bounds.
+and drops scanner noise. Without `z0`/`z1` it uses the file bounds. When the file names a
+coordinate reference system, its WKT is written next to the drawing as `<out>.prj`, so the slice
+keeps its place on the globe.
 
 ```bash
 cadcraft-cli run --cmd 'lasexport {"path":"D:/LIdar/Ap 1.las","out":"out/ap1_slice.dxf",
@@ -186,6 +189,10 @@ script cannot drift apart.
 - **Remove walls / ceiling** enables a crop box: one min/max pair per axis. Lower the Z maximum to
   drop the ceiling, raise the Z minimum for the floor, pull X and Y in for the walls; untick it to
   restore every point (the file is not re-read).
+- **Find ground** classifies the floor (see below) and **Ground only** draws just that.
+- The count line says whether the finest level is the source points, and the line under it names
+  the coordinate reference system the file carries (`CRS: EPSG:32610 · WGS 84 / UTM zone 10N`), or
+  says that the file names none.
 - When the 3D view is on, the camera controls appear: **Persp/Ortho**, **Fit**, **Top/Front/Iso**,
   the **Lens** slider and the point size.
 - Below them, the clarity controls: **Cut** (the front wall cut) and **Cue** (the depth cue).
@@ -253,7 +260,53 @@ points, so the ramp runs over the **2%–98% window** instead, computed at load 
 histogram (65 536 bins for Z, 256 for the intensity — no sorting of four million points). The
 values outside the window are clamped to its ends.
 
+### The ground under the cloud
 
+A survey scan is mostly furniture, vegetation and noise; the floor is what a drawing is measured
+from, and the LAS classification codes of the file are often missing or wrong. `LASGROUND` finds
+the ground the way every GIS tool does, with the slope correction a bare earth surface needs:
+
+1. the points are binned into 0.5 m cells and the lowest point of every cell seeds a surface;
+2. a seed far above its neighbours (a table, a car) is dropped, so it cannot drag the surface up;
+3. the surface of every cell is a **plane** fitted through the seeds of its 3 × 3 neighbourhood,
+   so a sloped floor stays a sloped floor instead of a staircase;
+4. a point on that plane is the ground (LAS class 2), a point under it is noise (class 18), and a
+   point far above its neighbours is noise too.
+
+Every level of the decimation pyramid is classified on its own, so the answer is as sharp as the
+level it belongs to. **Ground only** in the palette then draws just the floor — the apartment's
+floor plan, with the furniture gone — in both the 2D overlay and the 3D view.
+
+The classes live beside the 16-byte vertex, not inside it: the GPU never needs them.
+
+### Where the scan is
+
+A LAS file may name its coordinate reference system — the EPSG code in the GeoTIFF keys, or the
+full OGC WKT. RENCAD reads both, shows the system in the palette and in `LASINFO`, and writes the
+WKT next to an exported drawing as a `.prj` sidecar (the convention every GIS tool reads), so an
+exported slice keeps its place on the globe.
+
+The fork does not reproject: the drawing is 2D in local units, and a scan is placed where its file
+puts it. A file that names no system says so plainly instead of pretending.
+
+### `LASGROUND {cell?, tolerance?, bump?, sigma?, show?, index?}`
+
+`cell` is the size of the cells the surface is built on (0.5 m), `tolerance` how far above the
+surface a point may sit and still be the ground (0.15 m), `bump` how far above its neighbours a
+seed may sit before it is dropped (0.3 m), and `sigma` how many standard deviations above the
+local heights a point may sit before it is noise (3; 0 turns the cut off). `show` switches the
+drawing between everything and the ground alone.
+
+```json
+{"command":"lasground","params":{"cell":0.5,"show":true}}
+```
+
+```json
+{"message":"Ap 1: 737687 ground points, 43078 noise, 3118780 unclassified (showing the ground only)",
+ "ground":737687,"noise":43078,"unclassified":3118780,"groundOnly":true}
+```
+
+### 3D drafting
 
 The palette's **Draw 3D** turns the 3D view into a drafting surface (the `3DLINE` command is the
 same path for scripts):
@@ -376,10 +429,13 @@ buffer.
 - The CPU path (no GPU target) draws the same list as egui rectangles — slower, but clouds stay
   visible.
 
-## Limits (M9)
+## Limits (M11)
 
 - LAZ is read, not written; no COPC streaming yet — a file is opened in one pass.
-- No classification filter, no ortho PNG/GeoTIFF export, no intensity histogram.
+- No classification filter: the ground is found by the fork's own filter, but the file's own
+  class codes are not read back into the drawing.
+- No reprojection: a scan is placed where its file puts it, in local units.
+- No ortho PNG/GeoTIFF export, no intensity histogram.
 - The finest level is capped by `maxPoints`; above it the grid is coarsened silently (the returned
   `points` says so). Raise `maxPoints` for a dense survey workstation.
 - One mesh rebuild per zoom step costs ~20 ms at half a million points; panning within the built
@@ -394,6 +450,8 @@ buffer.
   when the surface detail matters.
 - The 2%–98% window clips the extreme values: a point far above the others takes the top colour
   instead of its own. That is the price of keeping the contrast of the rest.
+- The ground filter needs a floor it can see: a scan of nothing but furniture has no ground to
+  find, and a mezzanine is classified as ground.
 - 3D strokes live in the session: they survive closing the palette and switching to 2D, but not a
   restart. `3DEXPORT` is the way to keep them; the wrap-up into drawing entities waits for the 3D
   kernel.

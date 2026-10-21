@@ -11,7 +11,9 @@
 #![forbid(unsafe_code)]
 
 mod cloud;
+mod crs;
 mod dxf;
+mod ground;
 mod measure;
 mod read;
 mod sketch;
@@ -19,7 +21,9 @@ mod slice;
 mod snap;
 
 pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
+pub use crs::{Crs, epsg_from_wkt};
 pub use dxf::{SKETCH_RGB, write_points_dxf, write_strokes_dxf};
+pub use ground::{CLASS_GROUND, CLASS_NOISE, CLASS_UNCLASSIFIED, GroundOptions, GroundResult, classify, classify_with};
 pub use measure::{Measure, measure, readout};
 pub use read::{CloudInfo, read_info};
 pub use sketch::{DEFAULT_LAYER, Sketch3d, Stroke3};

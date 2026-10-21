@@ -53,7 +53,7 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
     let selected = app.session.clouds.len().saturating_sub(1);
     let selected = ui.data(|d| d.get_temp::<usize>(sel_id)).filter(|i| *i < app.session.clouds.len()).unwrap_or(selected);
     let cloud = &app.session.clouds[selected];
-    let (points, levels, in_band, color, cell_now, bounds, clip, imin, imax) = (
+    let (points, levels, in_band, color, cell_now, bounds, clip, imin, imax, crs) = (
         cloud.points(),
         cloud.levels.len(),
         cloud.full_points,
@@ -63,6 +63,7 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         cloud.clip,
         cloud.imin,
         cloud.imax,
+        cloud.crs.clone(),
     );
     let visible = app.session.clouds[selected].visible;
 
@@ -183,6 +184,22 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     }
 
+    // ---------- the ground under the cloud ----------
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        if ui
+            .button("Find ground")
+            .on_hover_text("Find the floor under the scan: the lowest point of every cell seeds a surface, and the points on it are the ground")
+            .clicked()
+        {
+            run(app, "lasground", json!({ "index": selected }));
+        }
+        let mut only = app.session.clouds[selected].ground_only;
+        if ui.checkbox(&mut only, "Ground only").on_hover_text("Draw only the points the ground filter found").changed() {
+            run(app, "lasground", json!({ "index": selected, "show": only }));
+        }
+    });
+
     // ---------- info ----------
     ui.add_space(8.0);
     let shown = if all { format!("{} points (all)", num(points)) } else { format!("{} of {} band points", num(points), num(in_band)) };
@@ -190,6 +207,19 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.label(egui::RichText::new(format!("{shown} · {levels} levels{intensity}")).color(t.text_dim).size(11.0));
+    });
+    // Where the scan says it is: the EPSG code and the system's name.
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let text = match &crs {
+            Some(crs) => match (crs.epsg, crs.name()) {
+                (Some(code), Some(name)) => format!("CRS: EPSG:{code} · {name}"),
+                (Some(code), None) => format!("CRS: EPSG:{code}"),
+                (None, _) => "CRS: the file names a system, but no EPSG code".to_string(),
+            },
+            None => "CRS: the file names none".to_string(),
+        };
+        ui.label(egui::RichText::new(text).color(t.text_dim).size(11.0));
     });
     if app.view3d.active {
         // ---------- 3D drafting (first: it is what the view is for) ----------

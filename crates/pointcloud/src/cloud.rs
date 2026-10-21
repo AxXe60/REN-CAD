@@ -91,6 +91,9 @@ impl Clip {
 pub struct CloudLevel {
     pub cell: f64,
     pub pts: Vec<CloudVtx>,
+    /// The LAS classification of every point, parallel to `pts` (2 = ground, 1 = unclassified).
+    /// The 16-byte vertex does not carry it: the GPU never needs the class.
+    pub classes: Vec<u8>,
 }
 
 /// A band of points kept in the session and drawn in the canvas (the `LASOPEN` overlay).
@@ -122,6 +125,10 @@ pub struct Cloud {
     pub color: CloudColor,
     /// Crop box: `None` draws every point of the band.
     pub clip: Option<Clip>,
+    /// Draw only the points the ground filter found.
+    pub ground_only: bool,
+    /// Where the file says it is (the EPSG code and the WKT), when it says anything.
+    pub crs: Option<crate::Crs>,
     /// Finest first.
     pub levels: Vec<CloudLevel>,
     /// Points the band held before the `maxPoints` cap.
@@ -169,20 +176,20 @@ impl Cloud {
         let asked = decimate.filter(|c| *c > 0.0);
         let mut cell = asked.unwrap_or(0.0);
         let cap = if max_points == 0 { ALL_POINTS_LIMIT } else { max_points.max(10_000) };
-        let mut base = grid(&slice.points, cell, origin, norm);
+        let (mut base, mut base_classes) = grid(&slice.points, cell, origin, norm);
         // Fit the cap, then keep coarsening: 1.6x cells make the next level ~2.5x lighter.
         while base.len() > cap && cell < 1e4 {
             cell = if cell > 0.0 { cell * 1.5 } else { 0.002 };
-            base = grid(&slice.points, cell, origin, norm);
+            (base, base_classes) = grid(&slice.points, cell, origin, norm);
         }
-        let mut levels = vec![CloudLevel { cell, pts: base }];
+        let mut levels = vec![CloudLevel { cell, pts: base, classes: base_classes }];
         while levels.last().is_some_and(|l| l.pts.len() > 20_000) && levels.len() < 16 {
             let c = if levels.last().is_some_and(|l| l.cell <= 0.0) { 0.005 } else { levels.last().map_or(0.01, |l| l.cell) * 1.6 };
-            let pts = grid(&slice.points, c, origin, norm);
+            let (pts, classes) = grid(&slice.points, c, origin, norm);
             if pts.len() >= levels.last().map_or(0, |l| l.pts.len()) {
                 break;
             }
-            levels.push(CloudLevel { cell: c, pts });
+            levels.push(CloudLevel { cell: c, pts, classes });
         }
         Self {
             name,
@@ -203,6 +210,8 @@ impl Cloud {
             visible: true,
             color,
             clip: None,
+            ground_only: false,
+            crs: None,
             levels,
             full_points: slice.in_band as usize,
         }
@@ -214,14 +223,21 @@ impl Cloud {
     /// the slice cannot hold a 100-million-point scan as 3.2 GB of `Pt`; the cap loop coarsens it
     /// further if needed. Smaller files are read whole, which is what "all points" means.
     pub fn open(path: &Path, name: String, z0: f64, z1: f64, decimate: Option<f64>, max_points: usize, color: CloudColor) -> Result<Self> {
+        let info = crate::read_info(path)?;
         let asked = decimate.filter(|c| *c > 0.0);
         let eff = match asked {
             Some(c) => Some(c),
-            None if crate::read_info(path)?.points > SLICE_ALL_LIMIT => Some(0.005),
+            None if info.points > SLICE_ALL_LIMIT => Some(0.005),
             None => None,
         };
         let slice = crate::slice(path, z0, z1, eff)?;
-        Ok(Self::from_slice(name, path.display().to_string(), z0, z1, eff, slice, max_points, color))
+        Ok(Self::from_slice(name, path.display().to_string(), z0, z1, eff, slice, max_points, color).with_crs(info.crs))
+    }
+
+    /// Attach the coordinate reference system the file named.
+    pub fn with_crs(mut self, crs: Option<crate::Crs>) -> Self {
+        self.crs = crs;
+        self
     }
 
     pub fn points(&self) -> usize {
@@ -244,6 +260,28 @@ impl Cloud {
             }
         }
         best
+    }
+
+    /// Find the ground under the cloud. Every level is classified on its own, so the answer is as
+    /// sharp as the level it belongs to: the fine levels see the furniture, the coarse ones the
+    /// shape of the ground. The counts are the finest level's, the one the user draws.
+    pub fn classify_ground(&mut self, options: &crate::ground::GroundOptions) -> crate::ground::GroundResult {
+        let mut finest = crate::ground::GroundResult::default();
+        for (i, level) in self.levels.iter_mut().enumerate() {
+            let (classes, result) = crate::ground::classify_with(&level.pts, options, |v| {
+                [f64::from(v.x) + self.origin[0], f64::from(v.y) + self.origin[1], f64::from(v.z)]
+            });
+            level.classes = classes;
+            if i == 0 {
+                finest = result;
+            }
+        }
+        finest
+    }
+
+    /// The number of points the ground filter found in the finest level.
+    pub fn ground_points(&self) -> usize {
+        self.levels.first().map_or(0, |l| l.classes.iter().filter(|c| **c == crate::ground::CLASS_GROUND).count())
     }
 
     /// The colour of one vertex under the cloud's colour mode.
@@ -352,8 +390,11 @@ impl Norm {
 ///
 /// The cube is three-dimensional on purpose: an XY-only grid keeps one point per column, so a
 /// vertical wall loses every point but one and the walls disappear from the 3D view.
-fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> Vec<CloudVtx> {
+///
+/// The classification of the point that was kept travels with it.
+fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> (Vec<CloudVtx>, Vec<u8>) {
     let mut out = Vec::with_capacity(points.len().min(4_000_000));
+    let mut classes = Vec::with_capacity(points.len().min(4_000_000));
     let mut vtx = |p: &crate::Pt| CloudVtx {
         x: (p.x - origin[0]) as f32,
         y: (p.y - origin[1]) as f32,
@@ -363,7 +404,8 @@ fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> Vec<Cl
     };
     if cell <= 0.0 || !cell.is_finite() {
         out.extend(points.iter().map(&mut vtx));
-        return out;
+        classes.extend(points.iter().map(|p| p.class));
+        return (out, classes);
     }
     let inv = 1.0 / cell;
     let mut seen: HashSet<(i64, i64, i64)> = HashSet::with_capacity(points.len().min(4_000_000));
@@ -373,8 +415,9 @@ fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> Vec<Cl
             continue;
         }
         out.push(vtx(p));
+        classes.push(p.class);
     }
-    out
+    (out, classes)
 }
 
 /// Blue → cyan → green → yellow → red, the drafting-friendly stand-in for a turbo ramp.
@@ -393,7 +436,7 @@ mod tests {
     use super::*;
 
     fn pt(x: f64, y: f64, z: f64) -> crate::Pt {
-        crate::Pt { x, y, z, rgb: Some([10, 20, 30]), intensity: 1000 }
+        crate::Pt { x, y, z, rgb: Some([10, 20, 30]), intensity: 1000, class: 1 }
     }
 
     fn slice_of(points: Vec<crate::Pt>) -> Slice {
@@ -452,7 +495,7 @@ mod tests {
 
     #[test]
     fn intensity_spans_the_band_as_a_spectrum() {
-        let mk = |x: f64, i: u16| crate::Pt { x, y: 0.0, z: 1.0, rgb: None, intensity: i };
+        let mk = |x: f64, i: u16| crate::Pt { x, y: 0.0, z: 1.0, rgb: None, intensity: i, class: 1 };
         let c = Cloud::from_slice(
             "t".into(),
             String::new(),
@@ -474,7 +517,7 @@ mod tests {
     /// flattened every one of them to 0, so the whole cloud took the span-zero colour.
     #[test]
     fn eight_bit_intensities_keep_their_contrast() {
-        let mk = |x: f64, i: u16| crate::Pt { x, y: 0.0, z: 1.0, rgb: None, intensity: i };
+        let mk = |x: f64, i: u16| crate::Pt { x, y: 0.0, z: 1.0, rgb: None, intensity: i, class: 1 };
         let c = Cloud::from_slice(
             "t".into(),
             String::new(),
@@ -529,7 +572,7 @@ mod tests {
     /// The same for the intensity: one hot return cannot flatten the wall behind it.
     #[test]
     fn outliers_do_not_flatten_the_intensity_ramp() {
-        let mk = |x: f64, i: u16| crate::Pt { x, y: 0.0, z: 1.0, rgb: None, intensity: i };
+        let mk = |x: f64, i: u16| crate::Pt { x, y: 0.0, z: 1.0, rgb: None, intensity: i, class: 1 };
         let mut pts: Vec<crate::Pt> = (0..100).map(|i| mk(f64::from(i) * 0.01, 1000 + (i as u16) * 5)).collect();
         pts.push(mk(5.0, 60000));
         let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.001), slice_of(pts), 100_000, CloudColor::Intensity);

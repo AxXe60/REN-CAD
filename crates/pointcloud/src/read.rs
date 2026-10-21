@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::{Bounds3, Error, Result};
+use crate::{Bounds3, Crs, Error, Result};
 
 /// What a point cloud file says about itself, before reading any point.
 #[derive(Clone, Debug)]
@@ -16,6 +16,8 @@ pub struct CloudInfo {
     pub point_format: u8,
     pub has_color: bool,
     pub has_intensity: bool,
+    /// Where the file says it is (the EPSG code and the WKT), when it says anything.
+    pub crs: Option<Crs>,
 }
 
 /// Read the header of `path`.
@@ -34,6 +36,7 @@ pub fn read_info(path: &Path) -> Result<CloudInfo> {
         point_format: format_id(h),
         has_color: format.has_color,
         has_intensity: true,
+        crs: Crs::from_header(h),
     })
 }
 

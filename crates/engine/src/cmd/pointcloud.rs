@@ -32,6 +32,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo(),
         CommandSpec::new("lasvisible", "Show Point Cloud", lasvisible).params("{visible?: bool, index?: int}").enabled(always).noundo(),
+        CommandSpec::new("lasground", "Find the Ground", lasground)
+            .params("{cell?: number, tolerance?: number, bump?: number, sigma?: number, show?: bool, index?: int}")
+            .enabled(always)
+            .noundo(),
         CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasclouds", "List Point Clouds", |s, _| lasclouds(s)).params("{}").enabled(always).noundo(),
@@ -79,7 +83,21 @@ fn lasinfo(p: &Value) -> Result<Value> {
         "pointFormat": info.point_format,
         "hasColor": info.has_color,
         "hasIntensity": info.has_intensity,
+        "crs": crs_json(&info.crs),
     }))
+}
+
+/// The CRS as the reports show it: the EPSG code, the name and whether it is geographic.
+fn crs_json(crs: &Option<cadcraft_pointcloud::Crs>) -> Value {
+    match crs {
+        Some(c) => json!({
+            "epsg": c.epsg,
+            "name": c.name(),
+            "geographic": c.is_geographic(),
+            "wkt": c.wkt.is_some(),
+        }),
+        None => Value::Null,
+    }
 }
 
 fn lasexport(p: &Value) -> Result<Value> {
@@ -93,6 +111,16 @@ fn lasexport(p: &Value) -> Result<Value> {
 
     let slice = cadcraft_pointcloud::slice(&path, z0, z1, decimate).map_err(oops)?;
     let written = cadcraft_pointcloud::write_points_dxf(&out, &slice.points, &layer).map_err(oops)?;
+    // The CRS of the scan goes next to the drawing as a `.prj` sidecar (the convention every
+    // GIS tool reads), so the exported slice keeps its place on the globe.
+    let crs = cadcraft_pointcloud::read_info(&path).map_err(oops)?.crs;
+    let prj = crs.as_ref().and_then(|c| c.prj()).map(|wkt| {
+        let sidecar = out.with_extension("prj");
+        if let Err(e) = std::fs::write(&sidecar, wkt) {
+            log::warn!("could not write the .prj sidecar: {e}");
+        }
+        sidecar.display().to_string()
+    });
     Ok(json!({
         "message": format!("{} of {} points in the band written to {}", written, slice.in_band, out.display()),
         "path": out.display().to_string(),
@@ -101,6 +129,8 @@ fn lasexport(p: &Value) -> Result<Value> {
         "inBand": slice.in_band,
         "filePoints": slice.total,
         "bounds": { "min": slice.bounds.min, "max": slice.bounds.max },
+        "crs": crs_json(&crs),
+        "prj": prj,
     }))
 }
 
@@ -134,6 +164,7 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
     let levels = cloud.levels.len();
     let full = cloud.full_points;
     let cell = cloud.levels.first().map_or(0.0, |l| l.cell);
+    let crs = cloud.crs.clone();
     // First cloud in an empty drawing: frame it, so LASOPEN is all it takes to see the scan.
     if s.doc().is_ok_and(|d| d.model.is_empty()) {
         let w = b.max[0] - b.min[0];
@@ -157,6 +188,7 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
         "filePoints": info.points,
         "color": color.name(),
         "bounds": { "min": b.min, "max": b.max },
+        "crs": crs_json(&crs),
         "open": s.clouds.len(),
     }))
 }
@@ -196,6 +228,9 @@ fn lasclouds(s: &mut Session) -> Result<Value> {
                 "inBand": c.full_points,
                 "color": c.color.name(),
                 "visible": c.visible,
+                "ground": c.ground_points(),
+                "groundOnly": c.ground_only,
+                "crs": crs_json(&c.crs),
                 "bounds": { "min": c.bounds.min, "max": c.bounds.max },
             })
         })
@@ -297,6 +332,47 @@ fn lasclip(s: &mut Session, p: &Value) -> Result<Value> {
         "message": if clip.is_some() { format!("{name}: cropped to the box") } else { format!("{name}: crop off") },
         "index": i,
         "clip": clip.map(|c| json!({ "min": c.min, "max": c.max })),
+    }))
+}
+
+/// Find the ground under a cloud, or show only the ground that was found.
+///
+/// The filter is the morphological one: the lowest point of every cell seeds a surface, a seed far
+/// above its neighbours is dropped, the surface of every cell is a plane through its 3 × 3
+/// neighbourhood, and a point on that plane is the ground. `show` switches the drawing between
+/// everything and the ground alone.
+fn lasground(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let defaults = cadcraft_pointcloud::GroundOptions::default();
+    let options = cadcraft_pointcloud::GroundOptions {
+        cell: number(p, "cell").filter(|v| *v > 0.0).unwrap_or(defaults.cell),
+        tolerance: number(p, "tolerance").filter(|v| *v >= 0.0).unwrap_or(defaults.tolerance),
+        bump: number(p, "bump").filter(|v| *v >= 0.0).unwrap_or(defaults.bump),
+        sigma: number(p, "sigma").filter(|v| *v >= 0.0).unwrap_or(defaults.sigma),
+    };
+    let show = p.get("show").and_then(Value::as_bool);
+    let name = s.clouds[i].name.clone();
+    let result = s.clouds[i].classify_ground(&options);
+    if let Some(show) = show {
+        s.clouds[i].ground_only = show;
+    }
+    let only = s.clouds[i].ground_only;
+    Ok(json!({
+        "message": format!(
+            "{name}: {} ground points, {} noise, {} unclassified{}",
+            result.ground,
+            result.noise,
+            result.unclassified,
+            if only { " (showing the ground only)" } else { "" }
+        ),
+        "index": i,
+        "name": name,
+        "ground": result.ground,
+        "noise": result.noise,
+        "unclassified": result.unclassified,
+        "groundOnly": only,
+        "cell": options.cell,
+        "tolerance": options.tolerance,
     }))
 }
 
@@ -509,7 +585,7 @@ mod tests {
         let mut b = Bounds3::EMPTY;
         b.add(0.0, 0.0, 0.0);
         b.add(2.0, 2.0, 3.0);
-        let pts = vec![Pt { x: 1.0, y: 1.0, z: 1.0, rgb: None, intensity: 0 }];
+        let pts = vec![Pt { x: 1.0, y: 1.0, z: 1.0, rgb: None, intensity: 0, class: 1 }];
         let slice = Slice { points: pts, total: 1, in_band: 1, bounds: b };
         let mut s = Session::new();
         s.clouds.push(Cloud::from_slice("t".into(), String::new(), 0.0, 3.0, None, slice, 1000, CloudColor::Rgb));

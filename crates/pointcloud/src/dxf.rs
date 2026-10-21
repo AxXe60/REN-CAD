@@ -188,7 +188,10 @@ mod tests {
         let dir = std::env::temp_dir().join("cadcraft-pc-test");
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("slice.dxf");
-        let pts = [Pt { x: 1.0, y: 2.0, z: 3.0, rgb: Some([10, 20, 30]), intensity: 0 }, Pt { x: -1.5, y: 0.25, z: 1.75, rgb: None, intensity: 0 }];
+        let pts = [
+            Pt { x: 1.0, y: 2.0, z: 3.0, rgb: Some([10, 20, 30]), intensity: 0, class: 1 },
+            Pt { x: -1.5, y: 0.25, z: 1.75, rgb: None, intensity: 0, class: 1 },
+        ];
         let n = write_points_dxf(&path, &pts, "PC-SLICE").unwrap_or(0);
         assert_eq!(n, 2);
         let text = std::fs::read_to_string(&path).unwrap_or_default();

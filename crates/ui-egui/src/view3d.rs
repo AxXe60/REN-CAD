@@ -443,6 +443,7 @@ fn scene_key(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudL
     for (c, level) in picks {
         c.name.hash(&mut hasher);
         c.color.name().hash(&mut hasher);
+        c.ground_only.hash(&mut hasher);
         if let CloudColor::Single([r, g, b]) = c.color {
             (r, g, b).hash(&mut hasher);
         }
@@ -468,7 +469,11 @@ fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::Clou
     let r2 = radius * radius;
     let mut scene = Scene3d { points: Vec::with_capacity(total.min(MAX_SCENE_POINTS)) };
     for (c, level) in picks {
-        for v in &level.pts {
+        for (i, v) in level.pts.iter().enumerate() {
+            // With the ground filter on, only the points it found are drawn.
+            if c.ground_only && level.classes.get(i).is_none_or(|k| *k != cadcraft_pointcloud::CLASS_GROUND) {
+                continue;
+            }
             let (x, y, z) = (f64::from(v.x) + c.origin[0], f64::from(v.y) + c.origin[1], f64::from(v.z));
             let (dx, dy, dz) = (x - center[0], y - center[1], z - center[2]);
             if dx * dx + dy * dy + dz * dz > r2 {
@@ -1075,7 +1080,8 @@ mod tests {
     /// what lets a zoomed-in view afford the full-resolution level.
     #[test]
     fn only_the_ball_around_the_target_is_counted_and_uploaded() {
-        let pts: Vec<_> = (0..1000).map(|i| cadcraft_pointcloud::Pt { x: f64::from(i) * 0.1, y: 0.0, z: 1.0, rgb: None, intensity: 0 }).collect();
+        let pts: Vec<_> =
+            (0..1000).map(|i| cadcraft_pointcloud::Pt { x: f64::from(i) * 0.1, y: 0.0, z: 1.0, rgb: None, intensity: 0, class: 1 }).collect();
         let mut b = cadcraft_pointcloud::Bounds3::EMPTY;
         for p in &pts {
             b.add(p.x, p.y, p.z);

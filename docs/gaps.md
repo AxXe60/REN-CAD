@@ -29,12 +29,13 @@ for. Detail: [pointcloud.md](pointcloud.md).
 | # | Gap | Evidence | User impact | Est. |
 |---|---|---|---|---|
 | P1 | **No LAZ writing and no COPC streaming**: LAS/LAZ are read in one pass; a file over 8 M points is thinned to a 5 mm cube while streaming, and the finest level is capped by `maxPoints` (the answer says when it happened) | `crates/pointcloud/src/read.rs` | High: a survey comes in as LAZ and must be converted outside | 8–12 |
-| P2 | **No classification filter**: ground, building and vegetation classes in the LAS header are read but not used, so the floor and the furniture can't be told apart by class | `crates/pointcloud/src/read.rs` | Medium-high: most surveys are classified | 4–6 |
+| P2 | **The file's own classification codes are not read back**: the fork finds the ground with its own filter (M10a), but the classes the file carries (ground, building, vegetation) are not turned into layers or a display filter | `crates/pointcloud/src/slice.rs` | Medium: a classified survey could be filtered by class | 4–6 |
 | P3 | **The 3D strokes are not drawing entities**: they live in the session and are kept by `3DEXPORT` as DXF `LINE`s; nothing else in the app can snap to them or dimension them | `crates/pointcloud/src/sketch.rs` | Medium: the trace can't become part of the drawing yet | blocked on the 3D kernel |
 | P4 | **No depth buffer in the 3D view**: the points don't occlude each other. The front wall cut and the depth cue make the picture readable, but they approximate a depth test | `crates/ui-egui/src/gpu3d.rs` | Medium: fine for translucent scans, wrong for solid surfaces | blocked on the 3D kernel |
 | P5 | **No section or height tool**: a vertical slice at a chosen Z, a height measurement from the floor or a level, and a section exported as a drawing are all missing | — | Medium: the daily question in a survey is "how high is this floor" | 12–18 |
 | P6 | **No point classification, no intensity histogram and no colour export** (the orthophoto-style PNG/GeoTIFF export of a coloured cloud) | — | Low-medium | 6–10 |
 | P7 | **The 2%–98% window clips the extreme values**: a point far above the rest takes the top colour instead of its own | `crates/pointcloud/src/cloud.rs` | Low: the price of the contrast | 0 (accepted) |
+| P8 | **No reprojection**: the CRS of a scan is read and reported, but the points are not moved between systems | `crates/pointcloud/src/crs.rs` | Medium: a georeferenced drawing and a scan cannot share a frame yet | 12–20 |
 
 ## Features
 
