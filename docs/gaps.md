@@ -1,6 +1,6 @@
 # Where CADCraft falls short of AutoCAD
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-16 · **Change:** minor (Command Aliases dialog for ALIASEDIT: U12 and E5 narrowed) · **Target:** Autodesk AutoCAD 2027
+> **Last reviewed:** 2026-10-21 · **Last updated:** 2026-10-21 · **Change:** minor (RENCAD fork: point-cloud gaps) · **Target:** Autodesk AutoCAD 2027
 
 Every known shortfall, one row each, ranked within each section by user impact. This is the work
 list: agents pick from here (top of a section first), and remove or update a row in the same PR
@@ -19,6 +19,22 @@ do them first.
 | 4 | **[alpha blocker]** **No dynamic blocks or REFEDIT; xrefs can't be edited in place or clipped** (xrefs, #525, groups, #417, and the Block Editor for static blocks landed) | Most production drawings use them | 55–90 | [features](#features) |
 | 5 | **No autosave in the web build** (the desktop app has SAVETIME autosave, Drawing Recovery, AUDIT and RECOVER since #406) | Browser users lose unsaved work when the tab or the browser goes down | 3–5 | [features](#features) |
 | 6 | **No CI runs the Rust tests on pull requests** (`cargo fmt` on main is fixed) | open PRs land without a gate; regressions go unseen | 2–3 | [stability](#stability) |
+
+## Point clouds (RENCAD fork)
+
+The fork's own shortfalls, ranked as in the sections above. These rows are not AutoCAD parity
+gaps (AutoCAD has no native point-cloud editor); they are what a survey office would still ask
+for. Detail: [pointcloud.md](pointcloud.md).
+
+| # | Gap | Evidence | User impact | Est. |
+|---|---|---|---|---|
+| P1 | **No LAZ writing and no COPC streaming**: LAS/LAZ are read in one pass; a file over 8 M points is thinned to a 5 mm cube while streaming, and the finest level is capped by `maxPoints` (the answer says when it happened) | `crates/pointcloud/src/read.rs` | High: a survey comes in as LAZ and must be converted outside | 8–12 |
+| P2 | **No classification filter**: ground, building and vegetation classes in the LAS header are read but not used, so the floor and the furniture can't be told apart by class | `crates/pointcloud/src/read.rs` | Medium-high: most surveys are classified | 4–6 |
+| P3 | **The 3D strokes are not drawing entities**: they live in the session and are kept by `3DEXPORT` as DXF `LINE`s; nothing else in the app can snap to them or dimension them | `crates/pointcloud/src/sketch.rs` | Medium: the trace can't become part of the drawing yet | blocked on the 3D kernel |
+| P4 | **No depth buffer in the 3D view**: the points don't occlude each other. The front wall cut and the depth cue make the picture readable, but they approximate a depth test | `crates/ui-egui/src/gpu3d.rs` | Medium: fine for translucent scans, wrong for solid surfaces | blocked on the 3D kernel |
+| P5 | **No section or height tool**: a vertical slice at a chosen Z, a height measurement from the floor or a level, and a section exported as a drawing are all missing | — | Medium: the daily question in a survey is "how high is this floor" | 12–18 |
+| P6 | **No point classification, no intensity histogram and no colour export** (the orthophoto-style PNG/GeoTIFF export of a coloured cloud) | — | Low-medium | 6–10 |
+| P7 | **The 2%–98% window clips the extreme values**: a point far above the rest takes the top colour instead of its own | `crates/pointcloud/src/cloud.rs` | Low: the price of the contrast | 0 (accepted) |
 
 ## Features
 

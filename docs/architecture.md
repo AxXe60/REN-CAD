@@ -1,6 +1,6 @@
 # CADCraft architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (first committed architecture doc, written from the code on main at bd2412f) · **Target:** Autodesk AutoCAD 2027
+> **Last reviewed:** 2026-10-21 · **Last updated:** 2026-10-21 · **Change:** minor (RENCAD fork: the pointcloud crate) · **Target:** Autodesk AutoCAD 2027
 
 How CADCraft is built today. This describes the code on `main`, not plans; plans live in
 [roadmap.md](roadmap.md). Agents: the rules that keep this shape (layering, never-crash,
@@ -21,6 +21,7 @@ About 57,000 lines of Rust in 12 library crates, 3 apps and `xtask` (counted 202
 | L2 | `constraints` | 2,504 | Own parametric solver: damped Gauss–Newton / Levenberg–Marquardt (`lm.rs`), 12 geometric and the dimensional constraints, expressions and parameters, AutoConstrain inference |
 | L3 | `io` | 5,124 | DXF ⇄ document mapping (`dxf_read.rs`, `dxf_write.rs`, CADCraft xdata in `dxf_ext.rs`), PDF plotting, SVG and PNG export |
 | L3 | `dwg` | 149 | DWG through a DXF bridge: the `acadrust` crate (MPL-2.0, unmodified) converts DWG ⇄ DXF bytes; nothing else sees its types. Native only |
+| L3 | `pointcloud` | 1,400 | **RENCAD fork.** LAS/LAZ reading (`read.rs`), the Z band and the decimation pyramid (`cloud.rs`), the colour ramps over the 2%–98% window, the 3D drafting sketch (`sketch.rs`), the snapping rules and drawing constraints (`snap.rs`), the 3D measurements (`measure.rs`) and the DXF writers (`dxf.rs`). No egui, no drawing model |
 | L4 | `engine` | 25,090 | `Session`, the command registry (`cmd/*`), command-line parser and prompt machines, object snaps and polar/ortho (`snap.rs`), selection (`select.rs`), grips (`grips.rs`), associativity (`assoc.rs`), system variables, units, undo, R-tree spatial index (`spatial.rs`) |
 | L5 | `ui-egui` | 9,849 | The swappable egui front end: GPU canvas (`gpu.rs`, wgpu), menus and shortcuts (`menus.rs`), command line, palettes, Layer Properties Manager and other dialogs, ViewCube, icons drawn in code, themes, the interface string catalog (`i18n/`, English, Ukrainian and German), JSON control channel (`control.rs`) |
 | L5 | `mcp` | 559 | MCP server (JSON-RPC 2.0 over stdio) on a headless session or bridged to a running app |
@@ -30,7 +31,8 @@ About 57,000 lines of Rust in 12 library crates, 3 apps and `xtask` (counted 202
 | tool | `xtask` | 1,064 | `ci`, `layers`, `assets`, `wasm`, `parity`, `version`, `stats`, icon generation |
 
 `cargo xtask layers` enforces the layering: nothing below L5 depends on egui, eframe, winit,
-wgpu or rfd.
+wgpu or rfd. The fork's `pointcloud` crate sits at L3 beside `io`: it may use `dxf` and `doc`, and
+the engine and the UI sit above it.
 
 ## Data model
 
@@ -44,6 +46,10 @@ wgpu or rfd.
   underlays in the model yet ([gaps.md](gaps.md)).
 - Entity collections are copy-on-write, so undo is a whole-drawing snapshot that costs little.
 - Coordinates are f64 world units. 2D work happens in the WCS; there is no UCS yet.
+- **RENCAD fork:** point clouds and the 3D strokes are *not* entities. `Session::clouds` holds the
+  scans and `Session::sketch` the 3D polylines, beside the drawing, so snaps, grips, undo and save
+  keep seeing only what the user drew. The drawing model is 2D, and pushing Z through every entity
+  would change the upstream's behaviour for a feature that has its own commands.
 
 ## Commands
 
@@ -91,4 +97,5 @@ allocations are capped (DXF tag counts, DWG size limits, hatch segment and islan
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-21 | minor | RENCAD fork: the `pointcloud` crate in the layering table, the clouds and the 3D sketch in the data model |
 | 2026-10-10 | major | First committed architecture doc, measured from the code (crate sizes, entity kinds, command counts) |

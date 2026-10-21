@@ -1,6 +1,6 @@
 # CADCraft roadmap detail
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (Block Editor for static blocks: "Use blocks" evidence updated) · **Target:** Autodesk AutoCAD 2027
+> **Last reviewed:** 2026-10-21 · **Last updated:** 2026-10-21 · **Change:** minor (RENCAD fork: point-cloud milestones) · **Target:** Autodesk AutoCAD 2027
 
 Forward-looking plan: milestones with status, the current focus, and what comes next with
 estimates. The summary is [ROADMAP.md](../ROADMAP.md); the work items behind every line are in
@@ -23,6 +23,26 @@ Opus 5.5 agent-hours.
    with a plot dialog and preview (F14). ≈ 50–80 h.
 
 Items 2–5 and 7 are the [alpha gate](#alpha-gate) rows.
+
+## Point clouds (RENCAD fork)
+
+The fork's own track, beside the upstream plan. AutoCAD has no native point-cloud editor, so the
+bar is the survey workflow: open the scan, cut it, look at it, trace it, export it. Detail in
+[pointcloud.md](pointcloud.md); the summary is in [ROADMAP.md](../ROADMAP.md).
+
+| Milestone | What it delivers | State |
+|---|---|---|
+| M1–M2 | Read LAS/LAZ, cut a Z band, write it as DXF `POINT`s, keep the band in the session and draw it in the canvas | done |
+| M3–M4 | Decimation pyramid and one GPU draw call, colour modes and live decimation; **Point Cloud** palette, **3D view** | done |
+| M5 | Full resolution, intensity as a spectrum, a 3D-cube grid (walls keep their height), crop box for the walls and the ceiling | done |
+| M6 | 3D camera (35° lens or true ortho, zoom anchored at the cursor, Top/Front/Iso); 3D drafting over the cloud, exported as DXF `LINE`s with Z | done |
+| M7 | Smart snapping (front layer only, `Exact`/`Smooth`), Z lock, axis ortho, per-stroke layers, closed polylines, `3DMEASURE` and the measure tool | done |
+| M9 | Front wall cut and depth cue in the vertex shader (clarity without a depth buffer); colour ramps over the 2%–98% window | done |
+| M10 | LAZ writing, COPC streaming and a classification filter (≈ 20–30 h) | planned |
+| M11 | The 3D strokes as real drawing entities — waits for the 3D kernel, so the upstream's own 3D milestone is the blocker | planned |
+| M12 | A section/height tool over the band: cut a vertical slice at a chosen Z, measure heights, export the section as a drawing | planned |
+
+M10 is the next one that can land without the upstream's 3D kernel.
 
 ## Alpha gate
 

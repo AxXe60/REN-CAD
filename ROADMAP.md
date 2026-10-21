@@ -19,7 +19,7 @@ is ≈ 600–930 h away.
 
 | Number | Value | Kind |
 |---|---|---|
-| Feature breadth (AutoCAD for Mac menu items with a live command) | **50%** (245 / 491; 2D menus only ≈ 65%) | measured ([parity-checklist.md](docs/parity-checklist.md) + UI-only commands) |
+| Feature breadth (AutoCAD for Mac menu items with a live command) | **58%** (287 / 491; 2D menus only ≈ 65%) | measured ([parity-checklist.md](docs/parity-checklist.md) + UI-only commands) |
 | Ready for real work | **≈ 38%** | estimated ([target-app-parity.md](docs/target-app-parity.md)) |
 | Mainstream practitioner (2D drafter) | **≈ 28%** (lower than the full number: file exchange, stability and interaction discounts multiply) | estimated ([target-app-parity.md](docs/target-app-parity.md#mainstream-practitioner)) |
 | Essentials user | **≈ 46%** | estimated ([target-app-parity.md](docs/target-app-parity.md#essentials-user)) |
@@ -78,6 +78,26 @@ Hours are Opus 5.5 agent wall-clock hours, calibrated on this repo's own build: 
 | 3D modelling and rendering | 2% | 300–450 | [gaps.md](docs/gaps.md#features) |
 | Collaboration and cloud | 5% | 40–70 | [gaps.md](docs/gaps.md#features) |
 
+## Point clouds (RENCAD fork)
+
+The fork adds a dimension the upstream has no parity number for: reading LAS/LAZ surveys and
+drafting over them. AutoCAD has no native point-cloud editor, so this is measured against the
+workflow a survey office actually does — open the scan, cut it, look at it, trace it, export it.
+
+| Milestone | What landed | State |
+|---|---|---|
+| M1–M2 | Read LAS/LAZ, cut a Z band, write it as DXF `POINT`s; keep the band in the session and draw it in the canvas | done |
+| M3–M4 | Decimation pyramid (16 bytes/point), one GPU draw call, colour modes, live decimation; **Point Cloud** palette and a **3D view** | done |
+| M5 | Full resolution (every point of the file), intensity as a spectrum, a 3D-cube grid so walls keep their height, crop box for the walls and the ceiling | done |
+| M6 | 3D camera: 35° lens or true orthographic projection, zoom anchored at the cursor, Top/Front/Iso; 3D drafting over the cloud, exported as DXF `LINE`s with Z | done |
+| M7 | Smart snapping (front layer only, so it never snaps through a wall; `Exact`/`Smooth`), Z lock, axis ortho, per-stroke layers, closed polylines, `3DMEASURE` | done |
+| M9 | Clarity without a depth buffer: front wall cut and depth cue in the vertex shader; colour ramps over the 2%–98% window so outliers can't flatten the contrast | done |
+| Next | LAZ writing, COPC streaming, classification filters, the 3D strokes as real drawing entities (waits for the 3D kernel), a height/section tool over the band | planned |
+
+The fork's own overview is [RENCAD.md](RENCAD.md); the detail is [docs/pointcloud.md](docs/pointcloud.md).
+These milestones do not change the AutoCAD parity numbers above: they add a capability the
+upstream has no row for.
+
 ## Languages
 
 AutoCAD 2027 for Mac ships 8 interface languages; CADCraft ships English plus partial
@@ -120,6 +140,7 @@ Ranked; detail and the full beta checklist in [docs/roadmap.md](docs/roadmap.md)
 | Date | Entry |
 |---|---|
 | 2026-10-21 | DXF save keeps each proxy object's and proxy entity's class: its class number (group 91) is renumbered to the rewritten CLASSES instead of naming another class, so AutoCAD's visual styles in an R14 file no longer come back as SCALE or MLEADERSTYLE (#1812) |
+| 2026-10-21 | RENCAD fork: LAS/LAZ point clouds, the Point Cloud palette, a 3D view with a perspective/orthographic camera, 3D drafting with smart snapping (front layer, `Exact`/`Smooth`), Z lock, axis ortho, per-stroke layers, closed polylines, 3D measuring, a front wall cut and a depth cue in the vertex shader, and colour ramps over the 2%–98% window. Upstream parity numbers unchanged. |
 | 2026-10-14 | HATCHEDIT adds boundaries from internal points or closed objects and removes selected loops in the dialog, command line and JSON command; associative links and undo are covered by tests. |
 | 2026-10-12 | TRIM: a pick after a closed polyline's last cut keeps only the complementary run instead of an extra circuit of the outline (#726) |
 | 2026-10-12 | HATCHEDIT refuses an explicit bad `scale` or `angle` before it edits anything, so a rejected request leaves the drawing, undo and redo as they were (#724) |
@@ -137,6 +158,7 @@ Ranked; detail and the full beta checklist in [docs/roadmap.md](docs/roadmap.md)
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-21 | trivial | Progress log: proxy objects keep their class through a save (#1812) |
+| 2026-10-21 | minor | RENCAD fork: point-cloud milestones section, progress-log entry; upstream parity numbers untouched; the menu-breadth checklist was regenerated (`cargo xtask parity`), so the headline breadth reads 287/491 |
 | 2026-10-14 | minor | Progress log: HATCHEDIT boundary add/remove |
 | 2026-10-12 | trivial | Progress log: closed-polyline TRIM (#726) |
 | 2026-10-12 | trivial | Progress log: HATCHEDIT numeric validation (#724) |

@@ -12,7 +12,7 @@ and the deep checklists are [geometry-parity.md](geometry-parity.md),
 
 | Number | Value | Kind |
 |---|---|---|
-| **Feature breadth** (AutoCAD for Mac menu items with a live command) | **245 / 491 = 50%** (233 = 47% counted by `cargo xtask parity`, which sees engine commands only; +12 UI-only items) | measured ([parity-checklist.md](parity-checklist.md), source scan) |
+| **Feature breadth** (AutoCAD for Mac menu items with a live command) | **287 / 491 = 58%** (287 counted by `cargo xtask parity`, which sees engine commands only; the UI-only items add the rest) | measured ([parity-checklist.md](parity-checklist.md), source scan) |
 | Feature breadth, 2D menus only (excluding 150 3D items) | **≈ 65%** (222 / 341 by `cargo xtask parity`'s rule) | measured (source scan, 2026-10-10) |
 | Feature depth, weighted by use (features dimension) | **≈ 41%** | estimated (table below) |
 | **Ready for real work** | **≈ 38%** | estimated (dimension table below; weighted 37.7%) |
@@ -214,6 +214,7 @@ DWG/DXF corpus (files from people who own them); black-box checks in AutoCAD of 
 
 | Date | Feature breadth | Weighted parity | Remaining | Note |
 |---|---|---|---|---|
+| 2026-10-21 | 287/491 (58%), engine-only 287/491 | unchanged (the fork's point-cloud commands are not AutoCAD menu items) | unchanged | the menu-breadth checklist was regenerated with `cargo xtask parity`; the RENCAD fork added the point-cloud commands and the 3D view, which are not part of the AutoCAD assessment |
 | 2026-10-10 (merge) | unchanged (233/491 re-scanned) | ready ≈ 38% (37.7%), mainstream ≈ 28%, essentials ≈ 46% | unchanged within rounding | main landed dynamic input pointer boxes (#60), the Ukrainian catalog (#36), WIPEOUT/gradient DXF fixes (#147, #162): UI/UX 40% → 43%, localization 3% → 5% |
 | 2026-10-10 (later) | unchanged | ready for real work ≈ 37% (unchanged: already built from the written dimension weights, no hidden judgement); mainstream practitioner ≈ 27%; essentials user ≈ 45% | unchanged | mainstream and essentials numbers added (craftrules standard) |
 | 2026-10-10 | 245/491 (50%), engine-only 233/491 | features ≈ 41%, ready for real work ≈ 37% | 1,300–2,100 h | full re-measure in this format (this file) |
@@ -224,6 +225,7 @@ DWG/DXF corpus (files from people who own them); black-box checks in AutoCAD of 
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-22 | minor | Draw row: RECTANG gained a centre construction mode (`Center` keyword, `center: true`) beside its corner mode (#1127); parity percentages and hours not re-measured |
+| 2026-10-21 | minor | RENCAD fork: the menu-breadth row follows the regenerated checklist (287/491); the weighted numbers are unchanged, the fork's point-cloud work is not part of the AutoCAD assessment |
 | 2026-10-12 | minor | Hatch row evidence: Hatch and Gradient / Hatch Edit dialogs; percentages and hours not re-measured |
 | 2026-10-12 | minor | Blocks row evidence: Block Editor for static blocks (BEDIT, BSAVE, BSAVEAS, BCLOSE); percentages and hours not re-measured |
 | 2026-10-11 | minor | Evidence text of the feature-area rows refreshed for merged work (#397, #406, #408, #417, #420, #433, #448, #451, #453, #459, #468, #507, #510, #525, #534, #546, #547, #558, #563, #564, #567, #571); parity percentages and hours not re-measured |
