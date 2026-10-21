@@ -1365,3 +1365,6 @@
 	Discard	Скасувати зміни
 	Customize	Налаштування інтерфейсу
 	Edit Command Aliases (PGP)...	Редагувати псевдоніми команд (PGP)...
+# Point clouds (fork addition: LASINFO, LASEXPORT).
+	Point Cloud Information	Інформація про хмару точок
+	Export Point Cloud Slice	Експорт зрізу хмари точок
