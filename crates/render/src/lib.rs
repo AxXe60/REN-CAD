@@ -56,6 +56,8 @@ pub enum Kind {
     Mask,
     /// A single point marker at `verts[start]`.
     Point,
+    /// A point cloud: `verts[start..start+len]` with a colour each, in [`DisplayList::colors`].
+    Cloud,
     /// An infinite line or ray: `verts[start]` = base, `verts[start+1]` = unit direction.
     Infinite { ray: bool },
 }
@@ -81,6 +83,8 @@ pub struct DPrim {
 pub struct DisplayList {
     pub prims: Vec<DPrim>,
     pub verts: Vec<Vec2>,
+    /// Per-point colours for [`Kind::Cloud`], parallel to `verts`; empty for other lists.
+    pub colors: Vec<Rgb>,
     pub tris: Vec<Vec2>,
     /// Plots ([`build_plot`]): for each primitive, the index in [`Drawing::layers`] of the layer
     /// it is drawn on (block contents on layer 0: the block reference's; [`NO_LAYER`] when the
@@ -598,6 +602,14 @@ fn append(dst: &mut DisplayList, src: DisplayList) {
     }));
     dst.verts.extend(src.verts);
     dst.tris.extend(src.tris);
+    if src.colors.is_empty() {
+        if !dst.colors.is_empty() {
+            dst.colors.resize(dst.verts.len(), Rgb(255, 255, 255));
+        }
+    } else {
+        dst.colors.resize(verts as usize, Rgb(255, 255, 255));
+        dst.colors.extend(src.colors);
+    }
     dst.prim_layers.extend(src.prim_layers);
     dst.texts.extend(src.texts.into_iter().map(|mut t| {
         if t.prim < PlotText::CLIPPED {
@@ -856,6 +868,9 @@ fn append_clipped(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
                     push_raw(dst, p, Kind::Point, &[*q]);
                 }
             }
+            // Session content, never plotted or clipped: its colours are indexed alongside the
+            // vertices and pushing a subset would misalign them.
+            (Kind::Cloud, _) => {}
             (Kind::Infinite { ray }, Clip::Rect(rect)) => {
                 if let (Some(base), Some(dir)) = (pts.first(), pts.get(1))
                     && let Some((a, c)) = clip::clip_infinite(*base, *dir, ray, rect)

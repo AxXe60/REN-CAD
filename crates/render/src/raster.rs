@@ -136,6 +136,15 @@ pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixm
                     }
                 }
             }
+            // Plots do not carry clouds (session content); draw them like points if one ever does.
+            Kind::Cloud => {
+                for q in pts {
+                    let (x, y) = view.to_screen(*q);
+                    if let Some(r) = tiny_skia::Rect::from_xywh(x - 0.5, y - 0.5, 1.5, 1.5) {
+                        pm.fill_path(&PathBuilder::from_rect(r), &paint, FillRule::Winding, Transform::identity(), None);
+                    }
+                }
+            }
             Kind::Infinite { ray } => {
                 let (Some(base), Some(dir)) = (pts.first(), pts.get(1)) else { continue };
                 let far = (vis.width() + vis.height()) * 2.0 + base.dist(vis.center());

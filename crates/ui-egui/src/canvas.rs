@@ -65,6 +65,10 @@ pub struct CanvasState {
     mesh_key: Option<u64>,
     mesh_slot: crate::gpu::MeshSlot,
     mesh_origin: Vec2,
+    /// Point cloud mesh, level and area (see [`draw_clouds`]).
+    cloud_key: Option<u64>,
+    cloud_slot: crate::gpu::MeshSlot,
+    cloud_origin: Vec2,
     /// The dragged objects of a MOVE/COPY/ROTATE/SCALE preview, uploaded once per drag (see
     /// [`draw_drag_gpu`]).
     drag_key: Option<u64>,
@@ -694,38 +698,93 @@ fn adaptive(unit: f64, scale: f64, min_px: f64) -> f64 {
 
 /// Point clouds opened with LASOPEN, drawn under the drawing so they can be traced over.
 ///
-/// Points are flat squares: egui tessellates rectangles cheaply, while a circle per point would
-/// cost a fan each. Anything denser than a quarter of a million points is sampled by stride —
-/// the slice is already decimated, so this only matters when the user asks for every point.
-fn draw_clouds(app: &CadApp, p: &egui::Painter, xf: &Xf, rect: Rect) {
+/// The display list is a level of the cloud's decimation pyramid — the one whose grid spacing is
+/// about two screen pixels — clipped to the view plus half a screen of margin. It goes through the
+/// same GPU quad pipeline as the drawing (one instance per point, own colour), so a hundred
+/// thousand points cost one draw call. When the view moves into new ground or the zoom changes by
+/// a step, the level is chosen and the buffer rebuilt; otherwise panning only moves it.
+fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
+    use std::hash::{Hash, Hasher};
     if app.session.clouds.is_empty() {
         return;
     }
-    let vis = xf.world_bounds();
-    let mut shapes: Vec<Shape> = Vec::new();
-    for cloud in app.session.clouds.iter().filter(|c| c.visible) {
-        let b = &cloud.bounds;
-        if b.max[0] < vis.min.x || b.min[0] > vis.max.x || b.max[1] < vis.min.y || b.min[1] > vis.max.y {
-            continue;
+    let area = xf.world_bounds();
+    let span = area.width().max(area.height()).max(1e-6);
+    let far = area.expand(span * 0.5);
+    let mut list = DisplayList::default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for c in app.session.clouds.iter().filter(|c| c.visible) {
+        let level = c.level_for(xf.scale);
+        let start = list.verts.len() as u32;
+        (c.name.as_str(), c.color.name(), c.points()).hash(&mut hasher);
+        level.cell.to_bits().hash(&mut hasher);
+        if let cadcraft_pointcloud::CloudColor::Single([r, g, b]) = c.color {
+            (r, g, b).hash(&mut hasher);
         }
-        let step = (cloud.points.len() / 250_000).max(1);
-        for pt in cloud.points.iter().step_by(step) {
-            if pt.x < vis.min.x || pt.x > vis.max.x || pt.y < vis.min.y || pt.y > vis.max.y {
+        for v in &level.pts {
+            let x = f64::from(v.x) + c.origin[0];
+            let y = f64::from(v.y) + c.origin[1];
+            if x < far.min.x || x > far.max.x || y < far.min.y || y > far.max.y {
                 continue;
             }
-            let at = xf.to_screen(Vec2::new(pt.x, pt.y));
-            if !rect.contains(at) {
-                continue;
-            }
-            let color = match pt.rgb {
-                Some([r, g, b]) => Color32::from_rgb(r, g, b),
-                None => Color32::from_gray(190),
-            };
-            shapes.push(Shape::rect_filled(Rect::from_center_size(at, vec2(2.0, 2.0)), 0.0, color));
+            list.verts.push(Vec2::new(x, y));
+            let [r, g, b] = c.color_of(v);
+            list.colors.push(Rgb(r, g, b));
+        }
+        let len = list.verts.len() as u32 - start;
+        if len > 0 {
+            list.prims.push(cadcraft_render::DPrim {
+                handle: Handle(0),
+                color: Rgb(255, 255, 255),
+                aci7: false,
+                lw: 0.0,
+                transparency: 0,
+                kind: Kind::Cloud,
+                start,
+                len,
+            });
         }
     }
-    if !shapes.is_empty() {
-        p.extend(shapes);
+    if list.verts.is_empty() {
+        return;
+    }
+    list.bounds = Bounds2::from_points(list.verts.iter().copied());
+    // Which ground the buffer covers: rebuild after panning half a screen or zooming a step.
+    ((xf.center.x / (span * 0.5)).round() as i64).hash(&mut hasher);
+    ((xf.center.y / (span * 0.5)).round() as i64).hash(&mut hasher);
+    ((xf.scale.log2() * 4.0).round() as i64).hash(&mut hasher);
+    let key = hasher.finish();
+
+    if app.canvas.gpu.is_some() {
+        let origin = list.bounds.center();
+        if app.canvas.cloud_key != Some(key) {
+            let t0 = crate::now_ms();
+            let mesh = crate::gpu::build_mesh(&list, origin, bg, false);
+            log::info!("cloud mesh: {} points -> {} instances in {:.1} ms", list.verts.len(), list.prims.len(), crate::now_ms() - t0);
+            if let Ok(mut slot) = app.canvas.cloud_slot.lock() {
+                *slot = Some(mesh);
+            }
+            app.canvas.cloud_key = Some(key);
+            app.canvas.cloud_origin = origin;
+        }
+        let center = xf.rect.center();
+        let offset = [(app.canvas.cloud_origin.x - xf.center.x) as f32, (app.canvas.cloud_origin.y - xf.center.y) as f32];
+        p.add(egui_wgpu::Callback::new_paint_callback(
+            xf.rect,
+            crate::gpu::CanvasCallback {
+                key,
+                slot: app.canvas.cloud_slot.clone(),
+                offset,
+                scale: xf.scale as f32,
+                center: [center.x, center.y],
+                layer: crate::gpu::LAYER_CLOUD,
+                xform: crate::gpu::IDENTITY_XFORM,
+                dash: 0.0,
+                stencil: crate::gpu::Stencil::Off,
+            },
+        ));
+    } else {
+        draw_list(p, xf, &list, bg, false);
     }
 }
 
@@ -858,6 +917,20 @@ pub(crate) fn draw_list(p: &egui::Painter, xf: &Xf, list: &DisplayList, bg: Rgb,
                     && vis.contains(*q)
                 {
                     shapes.push(Shape::rect_filled(Rect::from_center_size(xf.to_screen(*q), vec2(1.5, 1.5)), 0.0, col));
+                }
+            }
+            Kind::Cloud => {
+                let bb = Bounds2::from_points(pts.iter().copied());
+                if !bb.intersects(&vis) {
+                    continue;
+                }
+                let size = vec2(1.5, 1.5);
+                for (i, q) in pts.iter().enumerate() {
+                    if !vis.contains(*q) {
+                        continue;
+                    }
+                    let c = list.colors.get(prim.start as usize + i).map_or(col, |c| color32(*c));
+                    shapes.push(Shape::rect_filled(Rect::from_center_size(xf.to_screen(*q), size), 0.0, c));
                 }
             }
             Kind::Infinite { ray } => {
@@ -1093,6 +1166,8 @@ pub(crate) fn draw_highlight(p: &egui::Painter, xf: &Xf, list: &DisplayList, pri
                     shapes.push(Shape::circle_stroke(xf.to_screen(*q), 3.0, Stroke::new(1.0, color)));
                 }
             }
+            // Clouds are not selectable; nothing to highlight.
+            Kind::Cloud => {}
             Kind::Tris if !look.dashed => {
                 for q in pts.as_chunks::<3>().0.iter().flatten() {
                     let i = fill.vertices.len() as u32;
@@ -1842,8 +1917,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         None => {
             blockedit::wash(app, &painter, rect);
             draw_grid(app, &painter, &xf);
-            draw_clouds(app, &painter, &xf, rect);
-            (Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b()), None)
+            let bg = Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b());
+            draw_clouds(app, &painter, &xf, bg);
+            (bg, None)
         }
     };
     let sel = app.session.selection();

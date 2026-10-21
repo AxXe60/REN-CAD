@@ -33,6 +33,9 @@ const INSTANCE_SIZE: usize = 28;
 const CHUNK: usize = 4_194_300;
 /// Point markers are 1.5 × 1.5 points (as on the CPU path).
 const POINT_SIZE: f32 = 1.5;
+/// Cloud points sit about two pixels apart (the LOD picks the level for that), so a two-pixel
+/// square fills the gap without overdrawing its neighbours.
+const CLOUD_SIZE: f32 = 1.0;
 
 /// How the native window presents frames (`NativeOptions::wgpu_options.surface`).
 ///
@@ -232,6 +235,14 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
                     push_instance(&mut m.quads, p, p, col, POINT_SIZE, 0.0);
                 }
             }
+            // One quad per point, its own colour: the instance buffer already carries RGB.
+            Kind::Cloud => {
+                for (i, q) in pts.iter().enumerate() {
+                    let c = list.colors.get(prim.start as usize + i).map_or(col, |c| premultiplied(*c, prim.alpha()));
+                    let p = rel(*q, origin);
+                    push_instance(&mut m.quads, p, p, c, CLOUD_SIZE, 0.0);
+                }
+            }
             // Drawn on the CPU each frame (clipped to the view).
             Kind::Infinite { .. } => {}
         }
@@ -263,6 +274,8 @@ pub fn build_highlight_mesh(list: &DisplayList, prims: &[usize], origin: Vec2, c
                     push_instance(&mut m.quads, p, p, color, 3.0, 0.0);
                 }
             }
+            // Clouds are session content, never selected.
+            Kind::Cloud => {}
             Kind::Tris if !dashed => {
                 let fill = translucent(color, HIGHLIGHT_FILL_ALPHA);
                 for t in pts.as_chunks::<3>().0 {
@@ -352,6 +365,8 @@ pub const LAYER_HIGHLIGHT: usize = 2;
 pub const LAYER_VIEWPORT: usize = 3;
 /// The outline of the active viewport when it is clipped (stencil only, see [`Stencil`]).
 pub const LAYER_MASK: usize = 4;
+/// Point clouds (`LASOPEN`), drawn under the drawing.
+pub const LAYER_CLOUD: usize = 5;
 
 /// Opacity of filled areas in the selection and hover highlight: see-through, so the lines and
 /// text on (and under) a highlighted hatch stay visible, as the reference app's dot pattern does.
@@ -593,7 +608,7 @@ impl Resources {
                 quad: pipeline("cad_clip_quads", "vs_quad", TriangleList, instance_layout(), Stencil::Inside),
             }),
             linear_out: target.format.is_srgb(),
-            layers: (0..=LAYER_MASK).map(|_| layer()).collect(),
+            layers: (0..=LAYER_CLOUD).map(|_| layer()).collect(),
         }
     }
 }

@@ -101,6 +101,12 @@ pub fn export_list(list: &cadcraft_render::DisplayList, window: Option<Bounds2>)
                     let _ = write!(s, r#"<circle cx="{:.dp$}" cy="{:.dp$}" r="{:.dp$}" fill="{c}"{op}/>"#, tx(q.x), ty(q.y), stroke);
                 }
             }
+            // Session content, not part of a plot; draw a dot per point if one gets here.
+            Kind::Cloud => {
+                for q in pts {
+                    let _ = write!(s, r#"<circle cx="{:.dp$}" cy="{:.dp$}" r="{:.dp$}" fill="{c}"{op}/>"#, tx(q.x), ty(q.y), stroke);
+                }
+            }
             Kind::Infinite { ray } => {
                 if let (Some(bp), Some(dir)) = (pts.first(), pts.get(1)) {
                     // A window can lie far from the base point: reach past it.

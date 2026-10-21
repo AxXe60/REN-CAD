@@ -751,6 +751,26 @@ fn content_stream(
                 num(&mut c, half * 2.0);
                 c.push_str(" re f\n");
             }
+            // Plots carry the drawing, not the session's clouds; draw them if one ever gets here.
+            Kind::Cloud => {
+                if raw.is_empty() {
+                    continue;
+                }
+                flush(&mut c, &mut pending);
+                if fill != Some(rgb) {
+                    color(&mut c, rgb, "rg");
+                    fill = Some(rgb);
+                }
+                let half = (w.max(0.5)) / 2.0;
+                for q in raw {
+                    pt(&mut c, map.pt(*q) - Vec2::new(half, half));
+                    c.push(' ');
+                    num(&mut c, half * 2.0);
+                    c.push(' ');
+                    num(&mut c, half * 2.0);
+                    c.push_str(" re f\n");
+                }
+            }
         }
     }
     flush(&mut c, &mut pending);

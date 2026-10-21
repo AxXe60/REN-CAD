@@ -19,9 +19,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo(),
         CommandSpec::new("lasopen", "Open Point Cloud", lasopen)
-            .params("{path: string, z0?: number, z1?: number, decimate?: number, name?: string}")
+            .params("{path: string, z0?: number, z1?: number, decimate?: number, maxPoints?: int, color?: string, name?: string}")
             .enabled(always)
             .noundo(),
+        CommandSpec::new("lascolor", "Colour Point Cloud", lascolor).params("{mode: string, index?: int}").enabled(always).noundo(),
+        CommandSpec::new("lasdecimate", "Decimate Point Cloud", lasdecimate).params("{cell: number, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasclouds", "List Point Clouds", |s, _| lasclouds(s)).params("{}").enabled(always).noundo(),
     ]
@@ -77,22 +79,30 @@ fn lasexport(p: &Value) -> Result<Value> {
 }
 
 /// Keep a band in the session for the canvas. The default 2 cm grid is the drafting setting that
-/// keeps walls readable and the frame rate honest; pass `decimate: 0.005` (or 0) for everything.
+/// keeps walls readable; `maxPoints` caps memory and `color` picks the shading.
 fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(text(p, "path")?);
     let info = cadcraft_pointcloud::read_info(&path).map_err(oops)?;
     let z0 = number(p, "z0").unwrap_or(info.bounds.min[2]);
     let z1 = number(p, "z1").unwrap_or(info.bounds.max[2]);
     let decimate = number(p, "decimate").filter(|v| *v > 0.0).or(Some(0.02));
-    let slice = cadcraft_pointcloud::slice(&path, z0, z1, decimate).map_err(oops)?;
+    let max_points =
+        p.get("maxPoints").and_then(Value::as_u64).map_or(cadcraft_pointcloud::DEFAULT_MAX_POINTS, |v| v as usize).clamp(10_000, 50_000_000);
+    let color = match p.get("color").and_then(Value::as_str) {
+        Some(text) => cadcraft_pointcloud::CloudColor::parse(text).ok_or_else(|| EngineError::Other(format!("unknown colour mode `{text}`")))?,
+        None => cadcraft_pointcloud::CloudColor::Rgb,
+    };
     let name = p
         .get("name")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("Point cloud").to_string());
-    let b = slice.bounds;
-    let count = slice.points.len();
+    let cloud = cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, decimate, max_points, color).map_err(oops)?;
+    let b = cloud.bounds;
+    let count = cloud.points();
+    let levels = cloud.levels.len();
+    let full = cloud.full_points;
     // First cloud in an empty drawing: frame it, so LASOPEN is all it takes to see the scan.
     if s.doc().is_ok_and(|d| d.model.is_empty()) {
         let w = b.max[0] - b.min[0];
@@ -102,19 +112,15 @@ fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
             st.set_view(View { center, height: w.max(h).max(1.0) * 1.2 });
         }
     }
-    s.clouds.push(cadcraft_pointcloud::Cloud {
-        name: name.clone(),
-        path: path.display().to_string(),
-        points: slice.points,
-        bounds: b,
-        visible: true,
-    });
+    s.clouds.push(cloud);
     Ok(json!({
-        "message": format!("{name}: {count} of {} points in the band", slice.in_band),
+        "message": format!("{name}: {count} points drawn from {full} in the band ({levels} levels)"),
         "name": name,
         "points": count,
-        "inBand": slice.in_band,
-        "filePoints": slice.total,
+        "levels": levels,
+        "inBand": full,
+        "filePoints": info.points,
+        "color": color.name(),
         "bounds": { "min": b.min, "max": b.max },
         "open": s.clouds.len(),
     }))
@@ -150,13 +156,67 @@ fn lasclouds(s: &mut Session) -> Result<Value> {
                 "index": i,
                 "name": c.name,
                 "path": c.path,
-                "points": c.points.len(),
+                "points": c.points(),
+                "levels": c.levels.len(),
+                "inBand": c.full_points,
+                "color": c.color.name(),
                 "visible": c.visible,
                 "bounds": { "min": c.bounds.min, "max": c.bounds.max },
             })
         })
         .collect();
     Ok(json!({ "count": list.len(), "clouds": list }))
+}
+
+/// The cloud a command means: `index`, or the last one opened.
+fn cloud_index(s: &Session, p: &Value) -> Result<usize> {
+    let i = p.get("index").and_then(Value::as_u64).map(|i| i as usize).unwrap_or(s.clouds.len().saturating_sub(1));
+    if i >= s.clouds.len() {
+        return Err(EngineError::Other(format!("no point cloud {i}; {} open", s.clouds.len())));
+    }
+    Ok(i)
+}
+
+fn lascolor(s: &mut Session, p: &Value) -> Result<Value> {
+    let text = text(p, "mode")?;
+    let mode = cadcraft_pointcloud::CloudColor::parse(text)
+        .ok_or_else(|| EngineError::Other(format!("unknown colour mode `{text}`: rgb, elevation, intensity, single:#rrggbb")))?;
+    let i = cloud_index(s, p)?;
+    let name = {
+        let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+        c.color = mode;
+        c.name.clone()
+    };
+    Ok(json!({
+        "message": format!("{name}: colour {}{}", mode.name(), match mode {
+            cadcraft_pointcloud::CloudColor::Single([r, g, b]) => format!(" #{r:02x}{g:02x}{b:02x}"),
+            _ => String::new(),
+        }),
+        "index": i,
+        "color": mode.name(),
+    }))
+}
+
+/// Re-read the file with a new grid cell, keeping the band, the name and the colour mode.
+fn lasdecimate(s: &mut Session, p: &Value) -> Result<Value> {
+    let cell = number(p, "cell").filter(|c| *c > 0.0).ok_or_else(|| EngineError::Other("`cell` must be a positive number of metres".into()))?;
+    let i = cloud_index(s, p)?;
+    let (path, name, z0, z1, color) = {
+        let c = s.clouds.get(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+        (PathBuf::from(&c.path), c.name.clone(), c.z0, c.z1, c.color)
+    };
+    let cloud =
+        cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, Some(cell), cadcraft_pointcloud::DEFAULT_MAX_POINTS, color).map_err(oops)?;
+    let points = cloud.points();
+    let levels = cloud.levels.len();
+    s.clouds[i] = cloud;
+    Ok(json!({
+        "message": format!("{name}: {points} points on a {cell} m grid ({levels} levels)"),
+        "index": i,
+        "cell": cell,
+        "points": points,
+        "levels": levels,
+    }))
 }
 
 #[cfg(test)]
