@@ -4,7 +4,7 @@
 //! session ([`Session::clouds`]) so the canvas draws it under the drawing and the user traces
 //! over it without a second file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -33,6 +33,12 @@ pub fn specs() -> Vec<CommandSpec> {
 
 fn text<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
     p.get(key).and_then(Value::as_str).filter(|s| !s.trim().is_empty()).ok_or_else(|| EngineError::Other(format!("`{key}` is required")))
+}
+
+/// Whether the name is a point cloud, which OPEN hands to LASOPEN instead of reading it as a
+/// drawing: people type `OPEN scan.las` and expect the cloud, not "unsupported file type".
+pub(super) fn is_cloud_path(name: &str) -> bool {
+    matches!(Path::new(name).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref(), Some("las" | "laz"))
 }
 
 fn number(p: &Value, key: &str) -> Option<f64> {
@@ -82,7 +88,7 @@ fn lasexport(p: &Value) -> Result<Value> {
 
 /// Keep a band in the session for the canvas. The default 2 cm grid is the drafting setting that
 /// keeps walls readable; `maxPoints` caps memory and `color` picks the shading.
-fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(text(p, "path")?);
     let info = cadcraft_pointcloud::read_info(&path).map_err(oops)?;
     let z0 = number(p, "z0").unwrap_or(info.bounds.min[2]);
@@ -273,5 +279,26 @@ mod tests {
         let mut s = Session::new();
         let r = lasclouds(&mut s).ok();
         assert_eq!(r.and_then(|v| v["count"].as_u64()), Some(0));
+    }
+
+    #[test]
+    fn only_las_and_laz_are_cloud_paths() {
+        assert!(is_cloud_path("scan.las"));
+        assert!(is_cloud_path("scan.LAZ"));
+        assert!(!is_cloud_path("scan.dxf"));
+        assert!(!is_cloud_path("scan"));
+    }
+
+    /// Typing `OPEN scan.las` used to end in IO's "unsupported file type": it must reach LASOPEN,
+    /// whose own error names the file it could not read.
+    #[test]
+    fn open_hands_las_and_laz_to_lasopen() {
+        for name in ["no-such-cloud.las", "no-such-cloud.LAZ"] {
+            let mut s = Session::new();
+            let error = s.execute("open", &json!({ "path": name })).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(error.contains(name), "{error}");
+            assert!(!error.contains("unsupported file type"), "{error}");
+            assert!(s.clouds.is_empty());
+        }
     }
 }

@@ -459,6 +459,14 @@ impl CadApp {
             }
             return;
         }
+        // A point cloud (picked, dropped or typed as OPEN): the cloud open, not a drawing read.
+        if is_cloud_file(path) {
+            if let Err(error) = self.run("lasopen", json!({ "path": path })) {
+                self.session.echo(error.clone());
+                self.set_status(error);
+            }
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.opening.start(path);
@@ -786,6 +794,11 @@ fn is_lisp_file(name: &str) -> bool {
     std::path::Path::new(name).extension().is_some_and(|e| e.eq_ignore_ascii_case("lsp"))
 }
 
+/// LAS and LAZ are point clouds the canvas draws under the drawing, not drawings to replace it.
+fn is_cloud_file(name: &str) -> bool {
+    std::path::Path::new(name).extension().is_some_and(|e| e.eq_ignore_ascii_case("las") || e.eq_ignore_ascii_case("laz"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +813,16 @@ mod tests {
         let raw = egui::RawInput { system_theme: system, ..Default::default() };
         let mut out = ctx.run_ui(raw, |ui| app.logic(ui.ctx()));
         out.textures_delta.clear();
+    }
+
+    /// OPEN's file picker and drag-and-drop go through `open_path`: a .las/.laz file must reach
+    /// LASOPEN, not the drawing reader (which reports "unsupported file type `las`").
+    #[test]
+    fn open_path_hands_las_to_lasopen_instead_of_the_drawing_reader() {
+        let mut a = app();
+        a.open_path("no-such-scan.las");
+        assert!(!a.opening.busy(), "a point cloud is not read as a drawing");
+        assert!(a.session.log.iter().any(|l| l.contains("no-such-scan.las")), "{:?}", a.session.log);
     }
 
     #[test]

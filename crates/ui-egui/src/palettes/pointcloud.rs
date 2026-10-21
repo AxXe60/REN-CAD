@@ -165,6 +165,7 @@ fn open(app: &mut CadApp, path: &str, cell: f64) {
 
 fn run(app: &mut CadApp, command: &str, params: serde_json::Value) {
     if let Err(error) = app.run(command, params) {
-        app.set_status(error.to_string());
+        app.session.echo(error.clone());
+        app.set_status(error);
     }
 }

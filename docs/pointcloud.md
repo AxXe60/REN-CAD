@@ -61,6 +61,12 @@ the drawing — trace over it and save the trace as one DXF.
 
 The first cloud in an empty drawing is framed automatically.
 
+`OPEN` on a `.las` or `.laz` path runs `LASOPEN` instead of failing with "unsupported file type",
+so **File ▸ Open** (the *Point clouds (LAS, LAZ)* filter), dropping the file on the window and the
+palette's Open all keep the current drawing and add the cloud. Scripts, the CLI and MCP reach the
+same command with `open {"path":"scan.las"}`; a path with spaces goes through the palette field,
+the dialog or drag-and-drop, because the command line splits its input on spaces.
+
 ```bash
 cadcraft-cli run --cmd 'lasopen {"path":"D:/LIdar/Ap 1.las","z0":1.535,"z1":1.695,
   "decimate":0.005,"color":"elevation"}'
