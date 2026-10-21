@@ -36,6 +36,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{cell?: number, tolerance?: number, bump?: number, sigma?: number, show?: bool, index?: int}")
             .enabled(always)
             .noundo(),
+        CommandSpec::new("lasclass", "Classify Point Cloud", lasclass)
+            .params("{mode?: string, cell?: number, radius?: number, sample?: int, index?: int}")
+            .enabled(always)
+            .noundo(),
         CommandSpec::new("lasorigin", "Set the Site Origin", lasorigin)
             .params("{x?: number, y?: number, z?: number, reset?: bool}")
             .enabled(always)
@@ -422,6 +426,49 @@ fn lasground(s: &mut Session, p: &Value) -> Result<Value> {
         "groundOnly": only,
         "cell": options.cell,
         "tolerance": options.tolerance,
+    }))
+}
+
+/// Classify the cloud: the ground, the vegetation, the walls, the noise.
+///
+/// The heights are measured from the ground the filter found, so the ground filter runs first if
+/// it has not run yet. The report says how many points each class holds.
+fn lasclass(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let defaults = cadcraft_pointcloud::ClassifyOptions::default();
+    let mode = match text(p, "mode").ok() {
+        Some(t) => {
+            cadcraft_pointcloud::ClassifyMode::parse(t).ok_or_else(|| EngineError::Other(format!("unknown mode `{t}`: auto, height, shape")))?
+        }
+        None => cadcraft_pointcloud::ClassifyMode::Auto,
+    };
+    let options = cadcraft_pointcloud::ClassifyOptions {
+        cell: number(p, "cell").filter(|v| *v > 0.0).unwrap_or(defaults.cell),
+        radius: number(p, "radius").filter(|v| *v > 0.0).unwrap_or(defaults.radius),
+        sample: p.get("sample").and_then(Value::as_u64).map(|v| v.clamp(1000, 2_000_000) as usize).unwrap_or(defaults.sample),
+        bands: defaults.bands,
+        mode,
+    };
+    let name = s.clouds[i].name.clone();
+    // The ground filter's word is the base of the classification.
+    if !s.clouds[i].has_classes() {
+        s.clouds[i].classify_ground(&cadcraft_pointcloud::GroundOptions::default());
+    }
+    let result = s.clouds[i].classify(&options);
+    let mut counts = serde_json::Map::new();
+    for code in cadcraft_pointcloud::ALL_CLASSES {
+        let n = result.counts[code as usize];
+        if n > 0 {
+            counts.insert(cadcraft_pointcloud::class_name(code).to_string(), json!(n));
+        }
+    }
+    Ok(json!({
+        "message": format!("{name} ({}): {}", mode.name(), result.summary()),
+        "index": i,
+        "name": name,
+        "mode": mode.name(),
+        "points": result.points,
+        "classes": counts,
     }))
 }
 
@@ -842,6 +889,38 @@ mod tests {
         let before = s.clouds[0].spectrum;
         assert!(lpectrum(&mut s, &json!({ "spectrum": "nope" })).is_err());
         assert_eq!(s.clouds[0].spectrum, before);
+    }
+
+    #[test]
+    fn the_cloud_is_classified_and_the_report_counts_the_classes() {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let mut b = Bounds3::EMPTY;
+        b.add(0.0, 0.0, 0.0);
+        b.add(2.0, 2.0, 4.0);
+        // A floor and a wall above it.
+        let mut pts: Vec<Pt> = Vec::new();
+        for i in 0..30 {
+            for j in 0..30 {
+                pts.push(Pt { x: i as f64 * 0.1, y: j as f64 * 0.1, z: 0.0, rgb: None, intensity: 100, class: 1 });
+            }
+        }
+        for i in 0..30 {
+            for k in 0..20 {
+                pts.push(Pt { x: i as f64 * 0.1, y: 0.0, z: 2.5 + k as f64 * 0.1, rgb: None, intensity: 100, class: 1 });
+            }
+        }
+        let n = pts.len() as u64;
+        let slice = Slice { points: pts, total: n, in_band: n, bounds: b };
+        let mut s = Session::new();
+        s.clouds.push(Cloud::from_slice("t".into(), String::new(), 0.0, 4.0, Some(0.05), slice, 1000, CloudColor::Rgb));
+        let r = lasclass(&mut s, &json!({ "mode": "auto" })).ok();
+        let classes = r.as_ref().and_then(|v| v["classes"].as_object()).cloned();
+        assert!(classes.is_some(), "the report counts the classes: {r:?}");
+        let classes = classes.unwrap_or_default();
+        assert!(classes.contains_key("ground"), "the floor is the ground: {classes:?}");
+        assert!(classes.contains_key("building"), "the wall is a building: {classes:?}");
+        // An unknown mode is an error, not a panic.
+        assert!(lasclass(&mut s, &json!({ "mode": "nope" })).is_err());
     }
 
     #[test]

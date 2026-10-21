@@ -168,8 +168,31 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     });
 
-    // ---------- crop: walls and ceiling ----------
+    // ---------- what the cloud is made of ----------
     ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Classify").color(t.text_dim).size(12.0));
+        for (mode, label, tip) in [
+            ("auto", "Full", "The height bands and the shape: the ground, the vegetation, the walls"),
+            ("height", "By height", "Only the height above the ground: the three bands of the vegetation"),
+            ("shape", "By shape", "Only the shape of the surface: the walls and the flat surfaces"),
+        ] {
+            if ui.button(label).on_hover_text(tip).clicked() {
+                run(app, "lasclass", json!({"index": selected, "mode": mode}));
+            }
+        }
+        if app.session.clouds[selected].has_classes()
+            && ui
+                .selectable_label(color == cadcraft_pointcloud::CloudColor::Class, "Class colours")
+                .on_hover_text("The ground brown, the vegetation green, the walls red")
+                .clicked()
+        {
+            run(app, "lascolor", json!({"index": selected, "mode": "class"}));
+        }
+    });
+
+    // ---------- crop: walls and ceiling ----------    ui.add_space(6.0);
     let mut enabled = clip.is_some();
     let mut min = clip.map_or(bounds.min, |c| c.min);
     let mut max = clip.map_or(bounds.max, |c| c.max);

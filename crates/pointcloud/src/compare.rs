@@ -8,7 +8,7 @@
 //! **denser** than the tested cloud, and it must cover it — a point outside the reference has no
 //! distance, and the report says so instead of inventing one.
 
-use std::collections::HashMap;
+use crate::grid::Grid;
 
 /// The statistics of a set of distances, in metres.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -55,54 +55,19 @@ pub fn distances(tested: &[[f64; 3]], reference: &[[f64; 3]], cell: f64) -> Vec<
         return out;
     }
     let cell = if cell > 0.0 && cell.is_finite() { cell } else { 1.0 };
-    let inv = 1.0 / cell;
-    // The cell of a point, mixed into one hash key.
-    let key = |cx: i64, cy: i64, cz: i64| -> u64 {
-        (cx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (cy as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-            ^ (cz as u64).wrapping_mul(0x1656_67B1_9E37_79F9)
-    };
-    // The reference in a grid: every cell gets its own run in one flat array, so a million cells
-    // cost one allocation and not a million small ones.
-    let mut grid: HashMap<u64, (u32, u32)> = HashMap::with_capacity(reference.len().min(1 << 21));
-    for p in reference {
-        let k = key((p[0] * inv).floor() as i64, (p[1] * inv).floor() as i64, (p[2] * inv).floor() as i64);
-        grid.entry(k).or_insert((0, 0)).1 += 1;
-    }
-    // The runs are laid out back to back: the first number of a cell is where its run ends, the
-    // second how long it is.
-    let mut total = 0u32;
-    for v in grid.values_mut() {
-        v.0 = total + v.1;
-        total += v.1;
-    }
-    let mut buckets = vec![0u32; reference.len()];
-    for (i, p) in reference.iter().enumerate() {
-        let k = key((p[0] * inv).floor() as i64, (p[1] * inv).floor() as i64, (p[2] * inv).floor() as i64);
-        if let Some(v) = grid.get_mut(&k) {
-            v.0 = v.0.saturating_sub(1);
-            buckets[v.0 as usize] = i as u32;
-        }
-    }
+    // The reference in a grid: every cell owns a run of one flat array, so a million cells cost
+    // one allocation and not a million small ones.
+    let grid = Grid::new(reference, cell);
+    let mut near = Vec::new();
     for (i, p) in tested.iter().enumerate() {
-        let cx = (p[0] * inv).floor() as i64;
-        let cy = (p[1] * inv).floor() as i64;
-        let cz = (p[2] * inv).floor() as i64;
-        let mut best = f64::INFINITY;
         // The 3x3x3 neighbourhood: with a cell of a few point spacings, the nearest point is in it.
-        for dx in -1i64..=1 {
-            for dy in -1i64..=1 {
-                for dz in -1i64..=1 {
-                    let k = key(cx + dx, cy + dy, cz + dz);
-                    let Some(&(start, count)) = grid.get(&k) else { continue };
-                    for &j in &buckets[start as usize..(start + count) as usize] {
-                        let q = reference[j as usize];
-                        let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
-                        if d < best {
-                            best = d;
-                        }
-                    }
-                }
+        grid.around(*p, &mut near);
+        let mut best = f64::INFINITY;
+        for &j in near.iter() {
+            let q = reference[j as usize];
+            let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
+            if d < best {
+                best = d;
             }
         }
         if best.is_finite() {

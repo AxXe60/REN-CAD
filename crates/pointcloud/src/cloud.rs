@@ -25,6 +25,8 @@ pub enum CloudColor {
     Single([u8; 3]),
     /// The distance to a reference cloud, on a blue-to-red scale.
     Deviation,
+    /// The classification of every point: the ground brown, the vegetation green, the walls red.
+    Class,
 }
 
 impl CloudColor {
@@ -37,6 +39,7 @@ impl CloudColor {
             "intensity" | "grey" | "gray" => Some(Self::Intensity),
             "single" | "flat" => Some(Self::Single([200, 200, 200])),
             "deviation" | "dev" | "compare" => Some(Self::Deviation),
+            "class" | "classes" | "classification" => Some(Self::Class),
             _ => {
                 let hex = t.strip_prefix("single:").or_else(|| t.strip_prefix('#'))?;
                 parse_hex(hex).map(Self::Single)
@@ -51,6 +54,7 @@ impl CloudColor {
             Self::Intensity => "intensity",
             Self::Single(_) => "single",
             Self::Deviation => "deviation",
+            Self::Class => "class",
         }
     }
 }
@@ -316,11 +320,34 @@ impl Cloud {
         self.levels.first().map_or(0, |l| l.classes.iter().filter(|c| **c == crate::ground::CLASS_GROUND).count())
     }
 
+    /// Whether the cloud has been classified at all: the ground filter's word, or nothing.
+    pub fn has_classes(&self) -> bool {
+        self.levels.iter().any(|l| l.classes.iter().any(|c| *c != crate::classify::CLASS_UNCLASSIFIED))
+    }
+
+    /// Classify the cloud: the ground, the vegetation, the walls, the noise.
+    ///
+    /// The ground filter's word is the base: the heights are measured from the ground it found.
+    pub fn classify(&mut self, options: &crate::classify::ClassifyOptions) -> crate::classify::ClassifyResult {
+        let mut finest = crate::classify::ClassifyResult::default();
+        for (i, level) in self.levels.iter_mut().enumerate() {
+            let points: Vec<[f64; 3]> =
+                level.pts.iter().map(|v| [f64::from(v.x) + self.origin[0], f64::from(v.y) + self.origin[1], f64::from(v.z)]).collect();
+            let (classes, result) = crate::classify::classify_level(&points, &level.classes, options);
+            level.classes = classes;
+            if i == 0 {
+                finest = result;
+            }
+        }
+        finest
+    }
+
     /// The colour of one vertex under the cloud's colour mode.
     ///
     /// `deviation` is the point's distance to the reference cloud, when the cloud was compared with
-    /// one and the colour mode asks for the deviation scale.
-    pub fn color_of(&self, v: &CloudVtx, deviation: Option<f32>) -> [u8; 3] {
+    /// one and the colour mode asks for the deviation scale. `class` is the point's classification,
+    /// when the colour mode asks for the class colours.
+    pub fn color_of(&self, v: &CloudVtx, deviation: Option<f32>, class: Option<u8>) -> [u8; 3] {
         match self.color {
             CloudColor::Rgb => v.rgb,
             // A spectrum, not grey: the band's darkest return reads blue and its brightest red,
@@ -336,6 +363,7 @@ impl Cloud {
                 Some(d) => crate::compare::deviation_color(d, self.dev_scale),
                 None => [120, 120, 120],
             },
+            CloudColor::Class => crate::classify::class_color(class.unwrap_or(crate::classify::CLASS_UNCLASSIFIED)),
             CloudColor::Elevation => {
                 let span = self.zp98 - self.zp02;
                 let t = if span > 0.0 { (f64::from(v.z) - self.zp02) / span } else { 0.5 };
@@ -582,12 +610,12 @@ mod tests {
             100_000,
             CloudColor::Elevation,
         );
-        let lo = c.color_of(&c.levels[0].pts[0], None);
-        let hi = c.color_of(&c.levels[0].pts[1], None);
+        let lo = c.color_of(&c.levels[0].pts[0], None, None);
+        let hi = c.color_of(&c.levels[0].pts[1], None, None);
         assert_ne!(lo, hi, "the ramp spans the band");
         let mut s = c.clone();
         s.color = CloudColor::Single([1, 2, 3]);
-        assert_eq!(s.color_of(&s.levels[0].pts[0], None), [1, 2, 3]);
+        assert_eq!(s.color_of(&s.levels[0].pts[0], None, None), [1, 2, 3]);
         assert_eq!(CloudColor::parse("#00ff00"), Some(CloudColor::Single([0, 255, 0])));
         assert_eq!(CloudColor::parse("rgb"), Some(CloudColor::Rgb));
     }
@@ -605,8 +633,8 @@ mod tests {
             1000,
             CloudColor::Intensity,
         );
-        let lo = c.color_of(&c.levels[0].pts[0], None);
-        let hi = c.color_of(&c.levels[0].pts[1], None);
+        let lo = c.color_of(&c.levels[0].pts[0], None, None);
+        let hi = c.color_of(&c.levels[0].pts[1], None, None);
         assert_ne!(lo, hi, "the ramp spans the band");
         assert!(lo[2] > lo[0], "the darkest return reads blue: {lo:?}");
         assert!(hi[0] > hi[2], "the brightest reads red: {hi:?}");
@@ -663,7 +691,7 @@ mod tests {
         let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2000.0, Some(0.001), slice_of(pts), 100_000, CloudColor::Elevation);
         assert!((c.zp02 - 2.0).abs() < 0.05, "the window starts at the wall: {}", c.zp02);
         assert!((c.zp98 - 2.5).abs() < 0.05, "and ends at its top: {}", c.zp98);
-        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p, None)).collect();
+        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p, None, None)).collect();
         assert_ne!(colors[0], colors[99], "the wall still shows its gradient");
         assert_eq!(colors[100], colors[99], "the spike takes the top colour");
     }
@@ -675,7 +703,7 @@ mod tests {
         let mut pts: Vec<crate::Pt> = (0..100).map(|i| mk(f64::from(i) * 0.01, 1000 + (i as u16) * 5)).collect();
         pts.push(mk(5.0, 60000));
         let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.001), slice_of(pts), 100_000, CloudColor::Intensity);
-        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p, None)).collect();
+        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p, None, None)).collect();
         assert_ne!(colors[0], colors[99], "the wall keeps its gradient");
         assert_eq!(colors[100], colors[99], "the hot return takes the top colour");
     }
@@ -703,11 +731,11 @@ mod tests {
             100_000,
             CloudColor::Intensity,
         );
-        let default = c.color_of(&c.levels[0].pts[0], None);
+        let default = c.color_of(&c.levels[0].pts[0], None, None);
         c.spectrum = crate::spectrum::Spectrum::Grey;
-        let as_grey = c.color_of(&c.levels[0].pts[0], None);
+        let as_grey = c.color_of(&c.levels[0].pts[0], None, None);
         c.spectrum = crate::spectrum::Spectrum::Viridis;
-        let as_viridis = c.color_of(&c.levels[0].pts[0], None);
+        let as_viridis = c.color_of(&c.levels[0].pts[0], None, None);
         assert_ne!(as_grey, as_viridis, "the scale changes the colour");
         assert_eq!(as_grey[0], as_grey[1], "the grey scale has no hue");
         assert_eq!(as_grey[1], as_grey[2]);
@@ -718,7 +746,7 @@ mod tests {
     fn a_flat_band_does_not_panic() {
         let pts: Vec<crate::Pt> = (0..10).map(|i| pt(f64::from(i) * 0.01, 0.0, 1.0)).collect();
         let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.001), slice_of(pts), 1000, CloudColor::Elevation);
-        let color = c.color_of(&c.levels[0].pts[0], None);
+        let color = c.color_of(&c.levels[0].pts[0], None, None);
         assert!(color.iter().all(|v| *v < 255), "the mid ramp: {color:?}");
     }
 }

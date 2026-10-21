@@ -54,8 +54,10 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M18 | **A rotated crop**: the crop box turns with a wall (`Align Crop to Line`), so a facade at 37° can be cut (≈ 6–10 h) | planned |
 | M19 | **Romanian** in the interface catalog (`ro`), the fifteenth language (≈ 4–6 h) | planned |
 | M20 | **Compare two clouds (C2C)**: the distance from every point to the nearest point of a reference, the survey statistics (mean, σ, RMS, p95) and the deviation scale (done) | done |
-| M21 | The comparison grown up: a coarse-to-fine registration (ICP) before the comparison, and the least-square local plane instead of the plain nearest point — the two refinements the comparison literature measures (≈ 8–14 h) | planned |
-| M22 | The scan-to-BIM parts that need no learning: the walls detected from the vertical surfaces, the rooms from the wall surfaces, and the openings in them (the geometry route the open Scan-to-BIM tools take) (≈ 20–30 h) | planned |
+| M21 | **Classify the cloud**: the height above the ground in the three vegetation bands, the shape of the surface (the walls), the noise — `LASCLASS` with the class colours (done) | done |
+| M22 | **The classification with learning**: the features of every point (the height, the roughness, the planarity, the intensity) clustered without supervision, the clusters named by the user — the human in the loop (≈ 8–12 h) | planned |
+| M23 | The comparison grown up: a coarse-to-fine registration (ICP) before the comparison, and the least-square local plane instead of the plain nearest point — the two refinements the comparison literature measures (≈ 8–14 h) | planned |
+| M24 | The scan-to-BIM parts that need no learning: the walls detected from the vertical surfaces, the rooms from the wall surfaces, and the openings in them (the geometry route the open Scan-to-BIM tools take) (≈ 20–30 h) | planned |
 | M11 | The 3D strokes as real drawing entities — waits for the 3D kernel, so the upstream's own 3D milestone is the blocker | planned |
 | M13 | A height/DSM grid over the band, with contours (≈ 12–18 h) | planned |
 | M14 | A local cache of the decimated pyramid next to the scan, so a 1.8 GB survey opens in a second the second time (≈ 6–10 h) | planned |

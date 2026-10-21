@@ -426,8 +426,49 @@ drawing between everything and the ground alone.
  "ground":737687,"noise":43078,"unclassified":3118780,"groundOnly":true}
 ```
 
-### The site frame
+### `LASCLASS {mode?, cell?, radius?, sample?, index?}`
 
+Classifies the cloud the way a report does: the ground, the vegetation in three bands, the walls,
+the noise. The heights are measured from the ground the filter found, so the ground filter runs
+first if it has not run yet.
+
+| Mode | What it reads |
+|---|---|
+| `auto` (the default) | the height bands and the shape |
+| `height` | only the height above the ground |
+| `shape` | only the shape of the surface: the walls and the flat surfaces |
+
+The rules, all of them explainable in a report:
+
+* under **20 cm** above the ground: the ground;
+* **50 cm**, **2 m** and **5 m**: the three bands of the vegetation — low, medium, high;
+* above **5 m**: a building (a yard, a courtyard, a facade);
+* a surface that **stands up** (its normal is horizontal) above the vegetation: a facade, so a
+  building;
+* a point with **no neighbours** at all: noise.
+
+The features are read on a sample (60 000 points by default, `sample` changes it) and given to the
+whole level through the nearest neighbour, so a four-million-point scan classifies in seconds.
+
+```json
+{"command":"lasclass","params":{"mode":"auto"}}
+```
+
+Measured on the Ap 1 scan (3 899 545 points, 14.7 s including the reading of the file):
+
+```json
+{"message":"Ap 1 (auto): 1096838 ground, 261829 low vegetation, 1359446 medium vegetation, 137387 high vegetation, 1043592 building",
+ "classes":{"ground":1096838,"low vegetation":261829,"medium vegetation":1359446,"high vegetation":137387,"building":1043592}}
+```
+
+What the rules cannot tell: a piece of furniture at a metre's height is called *medium vegetation*,
+because height and shape alone do not separate a chair from a bush. The clustering below is the way
+out — the user names the classes.
+
+The class colours are the ones the LAS viewers use: the ground brown, the vegetation green, the
+buildings red — `LASCOLOR {"mode":"class"}` or the palette's **Class colours** button.
+
+### The site frame
 A registered survey sits hundreds of kilometres from the drawing's origin — the factory at
 E 498 162, N 290 290 is 500 km from (0, 0) — so a scan in a projected system and a drawing in
 local metres have to meet somewhere. The **site origin** is that meeting point: the world point

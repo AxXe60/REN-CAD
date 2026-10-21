@@ -495,7 +495,7 @@ fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::Clou
             if c.clip.is_some_and(|clip| !clip.contains(x, y, z)) {
                 continue;
             }
-            let [r, g, b] = c.color_of(v, level.dev.get(i).copied());
+            let [r, g, b] = c.color_of(v, level.dev.get(i).copied(), level.classes.get(i).copied());
             scene.points.push(Point3d { pos: [x as f32, y as f32, z as f32], color: [r, g, b, 255] });
         }
     }
@@ -986,7 +986,7 @@ fn draw_cpu_fallback(
                 continue;
             }
             if let Some(at) = screen.project([x, y, z]) {
-                let [r, g, b] = c.color_of(v, level.dev.get(i).copied());
+                let [r, g, b] = c.color_of(v, level.dev.get(i).copied(), level.classes.get(i).copied());
                 shapes.push(egui::Shape::rect_filled(
                     Rect::from_center_size(at, vec2(view.point_size, view.point_size)),
                     0.0,

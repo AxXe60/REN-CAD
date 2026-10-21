@@ -16,10 +16,7 @@
 use std::collections::HashMap;
 
 /// The LAS classification codes the fork writes.
-pub const CLASS_UNCLASSIFIED: u8 = 1;
-pub const CLASS_GROUND: u8 = 2;
-/// The LAS "high noise" code.
-pub const CLASS_NOISE: u8 = 18;
+pub use crate::classify::{CLASS_GROUND, CLASS_NOISE, CLASS_UNCLASSIFIED};
 
 /// How the ground is found.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -742,7 +742,7 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
                 continue;
             }
             list.verts.push(Vec2::new(x, y));
-            let [r, g, b] = c.color_of(v, level.dev.get(i).copied());
+            let [r, g, b] = c.color_of(v, level.dev.get(i).copied(), level.classes.get(i).copied());
             list.colors.push(Rgb(r, g, b));
         }
         let len = list.verts.len() as u32 - start;

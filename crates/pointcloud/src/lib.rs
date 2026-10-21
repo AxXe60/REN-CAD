@@ -10,11 +10,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod classify;
 mod cloud;
 mod compare;
 mod crs;
 mod dxf;
 mod geo;
+mod grid;
 mod ground;
 mod measure;
 mod read;
@@ -23,6 +25,10 @@ mod slice;
 mod snap;
 mod spectrum;
 
+pub use classify::{
+    ALL_CLASSES, CLASS_BUILDING, CLASS_HIGH_VEG, CLASS_LOW_POINT, CLASS_LOW_VEG, CLASS_MED_VEG, ClassifyMode, ClassifyOptions, ClassifyResult, Shape,
+    class_color, class_from_name, class_name, classify_level, heights_above_ground, shape_of,
+};
 pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
 pub use compare::{DeviationStats, deviation_color, distances, stats};
 pub use crs::{Crs, epsg_from_wkt};
