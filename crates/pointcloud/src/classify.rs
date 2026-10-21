@@ -416,6 +416,60 @@ pub fn class_of(height: f32, shape: &Shape, ground_class: u8, options: &Classify
     CLASS_BUILDING
 }
 
+/// A sample of a level and the features read on it.
+///
+/// The features of a scan are too many to read on every point: the sample is a few tens of
+/// thousands, spread over the level, and the rest of the level takes the word of its nearest
+/// sampled point.
+pub struct Sample {
+    /// The points of the level the sample was taken from.
+    pub indices: Vec<usize>,
+    /// The sampled points.
+    pub points: Vec<[f64; 3]>,
+    /// The height above the ground of every sampled point.
+    pub heights: Vec<f32>,
+    /// The shape of the surface around every sampled point.
+    pub shapes: Vec<Shape>,
+}
+
+impl Sample {
+    /// The number of sampled points.
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    /// Whether the sample is empty.
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+}
+
+/// Read the features of a sample of a level: the height above the ground and the shape.
+pub fn sample_level(points: &[[f64; 3]], ground: &[u8], options: &ClassifyOptions) -> Sample {
+    let heights = heights_above_ground(points, ground, options.cell);
+    let step = (points.len() / options.sample.max(1)).max(1);
+    let indices: Vec<usize> = (0..points.len()).step_by(step).collect();
+    let sampled: Vec<[f64; 3]> = indices.iter().map(|&i| points[i]).collect();
+    let grid = Grid::new(&sampled, options.radius.max(options.cell * 0.5));
+    let mut near = Vec::new();
+    let mut shapes = Vec::with_capacity(sampled.len());
+    for p in sampled.iter() {
+        grid.around(*p, &mut near);
+        let r2 = options.radius * options.radius;
+        let mut neighbours: Vec<[f64; 3]> = Vec::with_capacity(near.len());
+        for &j in near.iter() {
+            let q = sampled[j as usize];
+            let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
+            if d <= r2 {
+                neighbours.push(q);
+            }
+        }
+        shapes.push(shape_of(&neighbours, *p));
+    }
+    let sample_heights = indices.iter().map(|&i| heights[i]).collect();
+    Sample { indices, points: sampled, heights: sample_heights, shapes }
+}
+
 /// Classify the points of one level.
 ///
 /// `ground` holds the class the ground filter gave every point; the classifier reads the ground
@@ -425,34 +479,14 @@ pub fn classify_level(points: &[[f64; 3]], ground: &[u8], options: &ClassifyOpti
     if points.is_empty() {
         return (Vec::new(), result);
     }
-    let heights = heights_above_ground(points, ground, options.cell);
-    // The sample: the features are read on these points and given to the rest.
-    let step = (points.len() / options.sample.max(1)).max(1);
-    let sample: Vec<usize> = (0..points.len()).step_by(step).collect();
-    let sample_points: Vec<[f64; 3]> = sample.iter().map(|&i| points[i]).collect();
-    let grid = Grid::new(&sample_points, options.radius.max(options.cell * 0.5));
-    let mut near = Vec::new();
+    let sample = sample_level(points, ground, options);
     let mut sample_classes = Vec::with_capacity(sample.len());
-    let mut sample_shapes = Vec::with_capacity(sample.len());
-    for (n, &i) in sample.iter().enumerate() {
-        let p = sample_points[n];
-        grid.around(p, &mut near);
-        let r2 = options.radius * options.radius;
-        let mut neighbours: Vec<[f64; 3]> = Vec::with_capacity(near.len());
-        for &j in near.iter() {
-            let q = sample_points[j as usize];
-            let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
-            if d <= r2 {
-                neighbours.push(q);
-            }
-        }
-        let shape = shape_of(&neighbours, p);
-        let class = class_of(heights[i], &shape, ground.get(i).copied().unwrap_or(CLASS_UNCLASSIFIED), options);
+    for (n, &i) in sample.indices.iter().enumerate() {
+        let class = class_of(sample.heights[n], &sample.shapes[n], ground.get(i).copied().unwrap_or(CLASS_UNCLASSIFIED), options);
         sample_classes.push(class);
-        sample_shapes.push(shape);
     }
     // The whole level takes the class of its nearest sampled point.
-    let class_grid = Grid::new(&sample_points, options.radius.max(options.cell * 0.5));
+    let class_grid = Grid::new(&sample.points, options.radius.max(options.cell * 0.5));
     let mut out = vec![CLASS_UNCLASSIFIED; points.len()];
     let mut near = Vec::new();
     for (i, p) in points.iter().enumerate() {
@@ -460,7 +494,7 @@ pub fn classify_level(points: &[[f64; 3]], ground: &[u8], options: &ClassifyOpti
         let mut best = f64::INFINITY;
         let mut best_at = 0usize;
         for &j in near.iter() {
-            let q = sample_points[j as usize];
+            let q = sample.points[j as usize];
             let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
             if d < best {
                 best = d;

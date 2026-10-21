@@ -468,6 +468,51 @@ out — the user names the classes.
 The class colours are the ones the LAS viewers use: the ground brown, the vegetation green, the
 buildings red — `LASCOLOR {"mode":"class"}` or the palette's **Class colours** button.
 
+### `LASCLUSTER {k?, cluster?, class?, index?}`
+
+The classification with learning: the points are described by four things — the height above the
+ground, the intensity of the return, the roughness of the surface, how much it stands up — and the
+ones that look alike are **grouped** together. The groups come back with a class proposed for each
+one; the user names them, and the classes are given again.
+
+The grouping is the k-means of the features with a fixed seed, so the same scan always gives the
+same groups and a report can be repeated. Nothing is downloaded, no model is trained, no weight
+file is shipped — it is a few hundred lines of arithmetic.
+
+```json
+{"command":"lascluster","params":{"k":5}}
+```
+
+Measured on the Ap 1 scan (3 899 545 points, 15.7 s including the reading of the file), the groups
+and the class proposed for each one:
+
+```json
+{"message":"Ap 1: 5 groups, named by the rules — rename one with `cluster` and `class`",
+ "groups":[
+  {"index":0,"count":11086,"class":"ground","centre":{"height":-0.32,"intensity":0.22,"roughness":0.021,"verticality":0.03}},
+  {"index":1,"count":14878,"class":"building","centre":{"height":0.85,"intensity":0.19,"roughness":0.055,"verticality":0.83}},
+  {"index":2,"count":14644,"class":"building","centre":{"height":0.96,"intensity":0.70,"roughness":0.017,"verticality":0.96}},
+  {"index":3,"count":11079,"class":"high vegetation","centre":{"height":2.05,"intensity":0.67,"roughness":0.062,"verticality":0.31}},
+  {"index":4,"count":9244,"class":"building","centre":{"height":2.28,"intensity":0.56,"roughness":0.009,"verticality":0.02}}]}
+```
+
+The reading of an apartment scan: the floor, two walls (one of them much brighter — a window or a
+lamp), the clutter and the ceiling. The rules propose those classes; the user is the one who
+decides, and one click renames a group.
+
+The user in the loop:
+
+```json
+{"command":"lascluster","params":{"cluster":1,"class":"building"}}
+```
+
+```json
+{"message":"Ap 1: group 1 is now building","cluster":1,"class":"building"}
+```
+
+The palette's **AI** button runs the grouping; every group gets a row with a list of the classes,
+and choosing one names the group.
+
 ### The site frame
 A registered survey sits hundreds of kilometres from the drawing's origin — the factory at
 E 498 162, N 290 290 is 500 km from (0, 0) — so a scan in a projected system and a drawing in

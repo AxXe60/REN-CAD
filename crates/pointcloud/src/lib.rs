@@ -12,6 +12,7 @@
 
 mod classify;
 mod cloud;
+mod cluster;
 mod compare;
 mod crs;
 mod dxf;
@@ -27,14 +28,15 @@ mod spectrum;
 
 pub use classify::{
     ALL_CLASSES, CLASS_BUILDING, CLASS_HIGH_VEG, CLASS_LOW_POINT, CLASS_LOW_VEG, CLASS_MED_VEG, ClassifyMode, ClassifyOptions, ClassifyResult, Shape,
-    class_color, class_from_name, class_name, classify_level, heights_above_ground, shape_of,
+    class_color, class_from_name, class_name, classify_level, heights_above_ground, sample_level, shape_of,
 };
 pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
+pub use cluster::{Cluster, clusters_of, feature_name, features_of, kmeans, suggest};
 pub use compare::{DeviationStats, deviation_color, distances, stats};
 pub use crs::{Crs, epsg_from_wkt};
 pub use dxf::{SKETCH_RGB, write_points_dxf, write_strokes_dxf};
 pub use geo::{LatLon, grid_from_lat_lon};
-pub use ground::{CLASS_GROUND, CLASS_NOISE, CLASS_UNCLASSIFIED, GroundOptions, GroundResult, classify, classify_with};
+pub use ground::{CLASS_GROUND, CLASS_NOISE, CLASS_UNCLASSIFIED, GroundOptions, GroundResult, classify_with};
 pub use measure::{Measure, measure, readout};
 pub use read::{CloudInfo, read_info};
 pub use sketch::{DEFAULT_LAYER, Sketch3d, Stroke3};

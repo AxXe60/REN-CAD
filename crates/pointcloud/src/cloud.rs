@@ -103,6 +103,8 @@ pub struct CloudLevel {
     /// The LAS classification of every point, parallel to `pts` (2 = ground, 1 = unclassified).
     /// The 16-byte vertex does not carry it: the GPU never needs the class.
     pub classes: Vec<u8>,
+    /// The group of every point, parallel to `pts`: the number of the group, from 0.
+    pub clusters: Vec<u8>,
     /// The distance to a reference cloud, in metres, parallel to `pts`; `NaN` where the reference
     /// had no point nearby.
     pub dev: Vec<f32>,
@@ -146,6 +148,11 @@ pub struct Cloud {
     pub dev_scale: f32,
     /// The statistics of the last comparison, when the cloud was compared with a reference.
     pub dev_stats: Option<crate::compare::DeviationStats>,
+    /// The groups of the last clustering: their centres, their counts and the class each one was
+    /// given.
+    pub cluster_info: Vec<crate::cluster::Cluster>,
+    /// The points the groups were read on: the nearest of them gives a point its group.
+    pub cluster_sample: Vec<[f64; 3]>,
     /// The colour scale the intensity and the elevation bands are read on.
     pub spectrum: crate::spectrum::Spectrum,
     /// The band's heights in 64 bins, so the palette can draw the scan's profile and the user can
@@ -206,14 +213,14 @@ impl Cloud {
             cell = if cell > 0.0 { cell * 1.5 } else { 0.002 };
             (base, base_classes) = grid(&slice.points, cell, origin, norm);
         }
-        let mut levels = vec![CloudLevel { cell, pts: base, classes: base_classes, dev: Vec::new() }];
+        let mut levels = vec![CloudLevel { cell, pts: base, classes: base_classes, clusters: Vec::new(), dev: Vec::new() }];
         while levels.last().is_some_and(|l| l.pts.len() > 20_000) && levels.len() < 16 {
             let c = if levels.last().is_some_and(|l| l.cell <= 0.0) { 0.005 } else { levels.last().map_or(0.01, |l| l.cell) * 1.6 };
             let (pts, classes) = grid(&slice.points, c, origin, norm);
             if pts.len() >= levels.last().map_or(0, |l| l.pts.len()) {
                 break;
             }
-            levels.push(CloudLevel { cell: c, pts, classes, dev: Vec::new() });
+            levels.push(CloudLevel { cell: c, pts, classes, clusters: Vec::new(), dev: Vec::new() });
         }
         Self {
             name,
@@ -238,6 +245,8 @@ impl Cloud {
             opacity: 1.0,
             dev_scale: 1.0,
             dev_stats: None,
+            cluster_info: Vec::new(),
+            cluster_sample: Vec::new(),
             spectrum: crate::spectrum::Spectrum::BlueRed,
             zhisto: heights(&slice.points, zmin, zmax),
             crs: None,
@@ -340,6 +349,60 @@ impl Cloud {
             }
         }
         finest
+    }
+
+    /// Group the cloud's points by what they are: the height above the ground, the intensity, the
+    /// roughness of the surface and how much it stands up.
+    ///
+    /// The groups come back with a class proposed for each one; the user names them afterwards.
+    pub fn cluster(&mut self, k: usize, options: &crate::classify::ClassifyOptions) -> Vec<crate::cluster::Cluster> {
+        let Some(level) = self.levels.first() else { return Vec::new() };
+        let points: Vec<[f64; 3]> =
+            level.pts.iter().map(|v| [f64::from(v.x) + self.origin[0], f64::from(v.y) + self.origin[1], f64::from(v.z)]).collect();
+        let intensities: Vec<u8> = level.pts.iter().map(|v| v.intensity).collect();
+        let sample = crate::classify::sample_level(&points, &level.classes, options);
+        let features = crate::cluster::features_of(&sample, &intensities);
+        let (labels, clusters) = crate::cluster::clusters_of(&features, k);
+        // The group of every point: the group of its nearest sampled point.
+        let grid = crate::grid::Grid::new(&sample.points, options.radius.max(options.cell * 0.5));
+        let mut near = Vec::new();
+        for (i, level) in self.levels.iter_mut().enumerate() {
+            let level_points: Vec<[f64; 3]> =
+                level.pts.iter().map(|v| [f64::from(v.x) + self.origin[0], f64::from(v.y) + self.origin[1], f64::from(v.z)]).collect();
+            let mut out = vec![0u8; level_points.len()];
+            for (n, p) in level_points.iter().enumerate() {
+                grid.around(*p, &mut near);
+                let mut best = f64::INFINITY;
+                let mut best_at = 0usize;
+                for &j in near.iter() {
+                    let q = sample.points[j as usize];
+                    let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
+                    if d < best {
+                        best = d;
+                        best_at = j as usize;
+                    }
+                }
+                if best.is_finite() {
+                    out[n] = labels[best_at] as u8;
+                }
+            }
+            let _ = i;
+            level.clusters = out;
+        }
+        self.cluster_sample = sample.points;
+        self.cluster_info = clusters;
+        self.cluster_info.clone()
+    }
+
+    /// Give the groups their classes, after the user named one of them.
+    pub fn apply_clusters(&mut self) {
+        let classes: Vec<u8> = self.cluster_info.iter().map(|c| c.class).collect();
+        for level in self.levels.iter_mut() {
+            for (i, c) in level.classes.iter_mut().enumerate() {
+                let label = level.clusters.get(i).copied().unwrap_or(0) as usize;
+                *c = classes.get(label).copied().unwrap_or(crate::classify::CLASS_UNCLASSIFIED);
+            }
+        }
     }
 
     /// The colour of one vertex under the cloud's colour mode.

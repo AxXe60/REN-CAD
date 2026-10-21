@@ -190,7 +190,38 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         {
             run(app, "lascolor", json!({"index": selected, "mode": "class"}));
         }
+        if ui
+            .button("AI")
+            .on_hover_text(
+                "Group the points by what they are — the height above the ground, the intensity, the roughness, the shape — and name the groups",
+            )
+            .clicked()
+        {
+            run(app, "lascluster", json!({"index": selected}));
+        }
     });
+
+    // ---------- the groups the clustering found: the user names them ----------
+    for cluster in app.session.clouds[selected].cluster_info.clone() {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(format!("#{} · {} pts", cluster.index, cluster.count)).size(11.0));
+            let mut chosen = cluster.class;
+            egui::ComboBox::from_id_salt(("cluster", cluster.index)).selected_text(cadcraft_pointcloud::class_name(chosen)).width(140.0).show_ui(
+                ui,
+                |ui| {
+                    for code in cadcraft_pointcloud::ALL_CLASSES {
+                        if ui.selectable_label(chosen == code, cadcraft_pointcloud::class_name(code)).clicked() {
+                            chosen = code;
+                        }
+                    }
+                },
+            );
+            if chosen != cluster.class {
+                run(app, "lascluster", json!({"index": selected, "cluster": cluster.index, "class": cadcraft_pointcloud::class_name(chosen)}));
+            }
+        });
+    }
 
     // ---------- crop: walls and ceiling ----------    ui.add_space(6.0);
     let mut enabled = clip.is_some();

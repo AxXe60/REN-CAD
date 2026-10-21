@@ -52,6 +52,7 @@ pub struct GroundResult {
 ///
 /// The points are `[x, y, z]` in world metres; the result is one LAS classification code per
 /// point, in the same order.
+#[cfg(test)]
 pub fn classify(points: &[[f64; 3]], options: &GroundOptions) -> (Vec<u8>, GroundResult) {
     classify_with(points, options, |p| *p)
 }

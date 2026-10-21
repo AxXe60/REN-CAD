@@ -40,6 +40,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{mode?: string, cell?: number, radius?: number, sample?: int, index?: int}")
             .enabled(always)
             .noundo(),
+        CommandSpec::new("lascluster", "Cluster the Cloud", lascluster)
+            .params("{k?: int, cluster?: int, class?: string, index?: int}")
+            .enabled(always)
+            .noundo(),
         CommandSpec::new("lasorigin", "Set the Site Origin", lasorigin)
             .params("{x?: number, y?: number, z?: number, reset?: bool}")
             .enabled(always)
@@ -468,6 +472,79 @@ fn lasclass(s: &mut Session, p: &Value) -> Result<Value> {
         "name": name,
         "mode": mode.name(),
         "points": result.points,
+        "classes": counts,
+    }))
+}
+
+/// Group the cloud's points by what they are, and name the groups.
+///
+/// The points are described by four things — the height above the ground, the intensity of the
+/// return, the roughness of the surface and how much it stands up — and the ones that look alike
+/// are grouped together (the k-means, with a fixed seed, so the same scan always gives the same
+/// groups). The groups come back with a class proposed for each one; `cluster` and `class` let
+/// the user name a group and the classes are given again.
+fn lascluster(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let name = s.clouds[i].name.clone();
+    let mut counts = serde_json::Map::new();
+    // The user names one of the groups: the classes are given again, without recomputing.
+    if let (Some(cluster), Some(class)) = (p.get("cluster").and_then(Value::as_u64), text(p, "class").ok()) {
+        let cluster = cluster as usize;
+        let class = cadcraft_pointcloud::class_from_name(class).ok_or_else(|| EngineError::Other(format!("unknown class `{class}`")))?;
+        if cluster >= s.clouds[i].cluster_info.len() {
+            return Err(EngineError::Other(format!("no group {cluster}: the last run found {} groups", s.clouds[i].cluster_info.len())));
+        }
+        s.clouds[i].cluster_info[cluster].class = class;
+        s.clouds[i].apply_clusters();
+        for c in cadcraft_pointcloud::ALL_CLASSES {
+            let n = s.clouds[i].levels.first().map_or(0, |l| l.classes.iter().filter(|k| **k == c).count());
+            if n > 0 {
+                counts.insert(cadcraft_pointcloud::class_name(c).to_string(), json!(n));
+            }
+        }
+        return Ok(json!({
+            "message": format!("{name}: group {cluster} is now {}", cadcraft_pointcloud::class_name(class)),
+            "index": i,
+            "cluster": cluster,
+            "class": cadcraft_pointcloud::class_name(class),
+            "classes": counts,
+        }));
+    }
+    // The groups themselves.
+    let k = p.get("k").and_then(Value::as_u64).map(|v| v.clamp(2, 16) as usize).unwrap_or(5);
+    let options = cadcraft_pointcloud::ClassifyOptions::default();
+    if !s.clouds[i].has_classes() {
+        s.clouds[i].classify_ground(&cadcraft_pointcloud::GroundOptions::default());
+    }
+    let clusters = s.clouds[i].cluster(k, &options);
+    s.clouds[i].apply_clusters();
+    for c in cadcraft_pointcloud::ALL_CLASSES {
+        let n = s.clouds[i].levels.first().map_or(0, |l| l.classes.iter().filter(|k| **k == c).count());
+        if n > 0 {
+            counts.insert(cadcraft_pointcloud::class_name(c).to_string(), json!(n));
+        }
+    }
+    let groups: Vec<Value> = clusters
+        .iter()
+        .map(|c| {
+            let mut centre = serde_json::Map::new();
+            for (k, value) in c.centre.iter().enumerate() {
+                centre.insert(cadcraft_pointcloud::feature_name(k).to_string(), json!(value));
+            }
+            json!({
+                "index": c.index,
+                "count": c.count,
+                "class": cadcraft_pointcloud::class_name(c.class),
+                "centre": centre,
+                "summary": c.summary(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "message": format!("{name}: {} groups, named by the rules — rename one with `cluster` and `class`", clusters.len()),
+        "index": i,
+        "k": clusters.len(),
+        "groups": groups,
         "classes": counts,
     }))
 }
@@ -921,6 +998,42 @@ mod tests {
         assert!(classes.contains_key("building"), "the wall is a building: {classes:?}");
         // An unknown mode is an error, not a panic.
         assert!(lasclass(&mut s, &json!({ "mode": "nope" })).is_err());
+    }
+
+    #[test]
+    fn the_groups_are_named_by_the_user() {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let mut b = Bounds3::EMPTY;
+        b.add(0.0, 0.0, 0.0);
+        b.add(2.0, 2.0, 4.0);
+        // A floor and a wall above it.
+        let mut pts: Vec<Pt> = Vec::new();
+        for i in 0..30 {
+            for j in 0..30 {
+                pts.push(Pt { x: i as f64 * 0.1, y: j as f64 * 0.1, z: 0.0, rgb: None, intensity: 100, class: 1 });
+            }
+        }
+        for i in 0..30 {
+            for k in 0..20 {
+                pts.push(Pt { x: i as f64 * 0.1, y: 0.0, z: 2.5 + k as f64 * 0.1, rgb: None, intensity: 200, class: 1 });
+            }
+        }
+        let n = pts.len() as u64;
+        let slice = Slice { points: pts, total: n, in_band: n, bounds: b };
+        let mut s = Session::new();
+        s.clouds.push(Cloud::from_slice("t".into(), String::new(), 0.0, 4.0, Some(0.05), slice, 1000, CloudColor::Rgb));
+        let r = lascluster(&mut s, &json!({ "k": 3 })).ok();
+        let groups = r.as_ref().and_then(|v| v["groups"].as_array()).cloned();
+        assert!(groups.as_ref().is_some_and(|g| !g.is_empty()), "the groups come back: {r:?}");
+        let groups = groups.unwrap_or_default();
+        assert_eq!(groups.len(), 3);
+        // The user names one of the groups: the classes are given again.
+        let named = lascluster(&mut s, &json!({ "cluster": 0, "class": "building" })).ok();
+        assert_eq!(named.as_ref().and_then(|v| v["class"].as_str()), Some("building"));
+        assert_eq!(s.clouds[0].cluster_info[0].class, cadcraft_pointcloud::CLASS_BUILDING);
+        // A group that is not there is an error, not a panic.
+        assert!(lascluster(&mut s, &json!({ "cluster": 99, "class": "building" })).is_err());
+        assert!(lascluster(&mut s, &json!({ "cluster": 0, "class": "nonsense" })).is_err());
     }
 
     #[test]
