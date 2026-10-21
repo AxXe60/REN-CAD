@@ -1394,3 +1394,4 @@
 	Open: {name} is {:.1} MB, larger than the {} MB RENCAD opens in the browser	Відкриття: {name} має розмір {:.1} МБ, більший за {} МБ, які RENCAD відкриває у браузері
 	RENCAD draws in the World Coordinate System; user coordinate systems aren't available yet.	RENCAD малює в Світовій системі координат; користувацькі системи координат ще недоступні.
 	Tie the Project to the Map	Прив'язати проєкт до мапи
+	Compare Two Clouds	Порівняти дві хмари

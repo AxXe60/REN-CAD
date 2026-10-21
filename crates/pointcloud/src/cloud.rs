@@ -23,6 +23,8 @@ pub enum CloudColor {
     Intensity,
     /// One colour for every point.
     Single([u8; 3]),
+    /// The distance to a reference cloud, on a blue-to-red scale.
+    Deviation,
 }
 
 impl CloudColor {
@@ -33,6 +35,8 @@ impl CloudColor {
             "rgb" | "truecolor" | "true-colour" => Some(Self::Rgb),
             "elevation" | "z" | "height" => Some(Self::Elevation),
             "intensity" | "grey" | "gray" => Some(Self::Intensity),
+            "single" | "flat" => Some(Self::Single([200, 200, 200])),
+            "deviation" | "dev" | "compare" => Some(Self::Deviation),
             _ => {
                 let hex = t.strip_prefix("single:").or_else(|| t.strip_prefix('#'))?;
                 parse_hex(hex).map(Self::Single)
@@ -46,6 +50,7 @@ impl CloudColor {
             Self::Elevation => "elevation",
             Self::Intensity => "intensity",
             Self::Single(_) => "single",
+            Self::Deviation => "deviation",
         }
     }
 }
@@ -94,6 +99,9 @@ pub struct CloudLevel {
     /// The LAS classification of every point, parallel to `pts` (2 = ground, 1 = unclassified).
     /// The 16-byte vertex does not carry it: the GPU never needs the class.
     pub classes: Vec<u8>,
+    /// The distance to a reference cloud, in metres, parallel to `pts`; `NaN` where the reference
+    /// had no point nearby.
+    pub dev: Vec<f32>,
 }
 
 /// A band of points kept in the session and drawn in the canvas (the `LASOPEN` overlay).
@@ -130,6 +138,10 @@ pub struct Cloud {
     /// How opaque the cloud is drawn (0.05..=1.0). Below 1 the 3D view thins the points by a
     /// deterministic mask, so the drawing under the cloud stays readable.
     pub opacity: f32,
+    /// The scale of the deviation colours, in metres (the 95th percentile of the comparison).
+    pub dev_scale: f32,
+    /// The statistics of the last comparison, when the cloud was compared with a reference.
+    pub dev_stats: Option<crate::compare::DeviationStats>,
     /// The band's heights in 64 bins, so the palette can draw the scan's profile and the user can
     /// see where the floor and the ceiling are.
     pub zhisto: [u32; 64],
@@ -188,14 +200,14 @@ impl Cloud {
             cell = if cell > 0.0 { cell * 1.5 } else { 0.002 };
             (base, base_classes) = grid(&slice.points, cell, origin, norm);
         }
-        let mut levels = vec![CloudLevel { cell, pts: base, classes: base_classes }];
+        let mut levels = vec![CloudLevel { cell, pts: base, classes: base_classes, dev: Vec::new() }];
         while levels.last().is_some_and(|l| l.pts.len() > 20_000) && levels.len() < 16 {
             let c = if levels.last().is_some_and(|l| l.cell <= 0.0) { 0.005 } else { levels.last().map_or(0.01, |l| l.cell) * 1.6 };
             let (pts, classes) = grid(&slice.points, c, origin, norm);
             if pts.len() >= levels.last().map_or(0, |l| l.pts.len()) {
                 break;
             }
-            levels.push(CloudLevel { cell: c, pts, classes });
+            levels.push(CloudLevel { cell: c, pts, classes, dev: Vec::new() });
         }
         Self {
             name,
@@ -218,6 +230,8 @@ impl Cloud {
             clip: None,
             ground_only: false,
             opacity: 1.0,
+            dev_scale: 1.0,
+            dev_stats: None,
             zhisto: heights(&slice.points, zmin, zmax),
             crs: None,
             levels,
@@ -300,7 +314,10 @@ impl Cloud {
     }
 
     /// The colour of one vertex under the cloud's colour mode.
-    pub fn color_of(&self, v: &CloudVtx) -> [u8; 3] {
+    ///
+    /// `deviation` is the point's distance to the reference cloud, when the cloud was compared with
+    /// one and the colour mode asks for the deviation scale.
+    pub fn color_of(&self, v: &CloudVtx, deviation: Option<f32>) -> [u8; 3] {
         match self.color {
             CloudColor::Rgb => v.rgb,
             // A spectrum, not grey: the band's darkest return reads blue and its brightest red,
@@ -312,12 +329,52 @@ impl Cloud {
                 ramp(t.clamp(0.0, 1.0))
             }
             CloudColor::Single(c) => c,
+            CloudColor::Deviation => match deviation {
+                Some(d) => crate::compare::deviation_color(d, self.dev_scale),
+                None => [120, 120, 120],
+            },
             CloudColor::Elevation => {
                 let span = self.zp98 - self.zp02;
                 let t = if span > 0.0 { (f64::from(v.z) - self.zp02) / span } else { 0.5 };
                 ramp(t.clamp(0.0, 1.0) as f32)
             }
         }
+    }
+
+    /// Compare the cloud with a reference: every point gets its distance to the nearest point of
+    /// the reference, and the statistics of those distances come back.
+    ///
+    /// The reference must be denser than this cloud and must cover it; the points that find no
+    /// neighbour are counted, not given a distance.
+    pub fn compare_with(&mut self, reference: &Cloud, cell: f64) -> crate::compare::DeviationStats {
+        let reference_points = reference.world_points();
+        // The search cell: a few times the spacing of the reference's points, so the nearest
+        // neighbour is in the neighbourhood that is looked at.
+        let cell = match reference.levels.first() {
+            Some(level) if level.cell > 0.0 => level.cell * 2.0,
+            _ => cell,
+        };
+        let mut stats = crate::compare::DeviationStats::default();
+        for level in &mut self.levels {
+            let tested: Vec<[f64; 3]> =
+                level.pts.iter().map(|v| [f64::from(v.x) + self.origin[0], f64::from(v.y) + self.origin[1], f64::from(v.z)]).collect();
+            level.dev = crate::compare::distances(&tested, &reference_points, cell);
+        }
+        if let Some(finest) = self.levels.first() {
+            stats = crate::compare::stats(&finest.dev);
+        }
+        // The colour scale reaches the 95th percentile, so a single spike does not wash the map out.
+        self.dev_scale = if stats.p95 > 0.0 { stats.p95 as f32 } else { 1.0 };
+        self.dev_stats = Some(stats);
+        stats
+    }
+
+    /// The cloud's points in world coordinates, its finest level: the reference for a comparison.
+    pub fn world_points(&self) -> Vec<[f64; 3]> {
+        self.levels
+            .first()
+            .map(|level| level.pts.iter().map(|v| [f64::from(v.x) + self.origin[0], f64::from(v.y) + self.origin[1], f64::from(v.z)]).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -513,12 +570,12 @@ mod tests {
             100_000,
             CloudColor::Elevation,
         );
-        let lo = c.color_of(&c.levels[0].pts[0]);
-        let hi = c.color_of(&c.levels[0].pts[1]);
+        let lo = c.color_of(&c.levels[0].pts[0], None);
+        let hi = c.color_of(&c.levels[0].pts[1], None);
         assert_ne!(lo, hi, "the ramp spans the band");
         let mut s = c.clone();
         s.color = CloudColor::Single([1, 2, 3]);
-        assert_eq!(s.color_of(&s.levels[0].pts[0]), [1, 2, 3]);
+        assert_eq!(s.color_of(&s.levels[0].pts[0], None), [1, 2, 3]);
         assert_eq!(CloudColor::parse("#00ff00"), Some(CloudColor::Single([0, 255, 0])));
         assert_eq!(CloudColor::parse("rgb"), Some(CloudColor::Rgb));
     }
@@ -536,8 +593,8 @@ mod tests {
             1000,
             CloudColor::Intensity,
         );
-        let lo = c.color_of(&c.levels[0].pts[0]);
-        let hi = c.color_of(&c.levels[0].pts[1]);
+        let lo = c.color_of(&c.levels[0].pts[0], None);
+        let hi = c.color_of(&c.levels[0].pts[1], None);
         assert_ne!(lo, hi, "the ramp spans the band");
         assert!(lo[2] > lo[0], "the darkest return reads blue: {lo:?}");
         assert!(hi[0] > hi[2], "the brightest reads red: {hi:?}");
@@ -594,7 +651,7 @@ mod tests {
         let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2000.0, Some(0.001), slice_of(pts), 100_000, CloudColor::Elevation);
         assert!((c.zp02 - 2.0).abs() < 0.05, "the window starts at the wall: {}", c.zp02);
         assert!((c.zp98 - 2.5).abs() < 0.05, "and ends at its top: {}", c.zp98);
-        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p)).collect();
+        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p, None)).collect();
         assert_ne!(colors[0], colors[99], "the wall still shows its gradient");
         assert_eq!(colors[100], colors[99], "the spike takes the top colour");
     }
@@ -606,7 +663,7 @@ mod tests {
         let mut pts: Vec<crate::Pt> = (0..100).map(|i| mk(f64::from(i) * 0.01, 1000 + (i as u16) * 5)).collect();
         pts.push(mk(5.0, 60000));
         let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.001), slice_of(pts), 100_000, CloudColor::Intensity);
-        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p)).collect();
+        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p, None)).collect();
         assert_ne!(colors[0], colors[99], "the wall keeps its gradient");
         assert_eq!(colors[100], colors[99], "the hot return takes the top colour");
     }
@@ -626,7 +683,7 @@ mod tests {
     fn a_flat_band_does_not_panic() {
         let pts: Vec<crate::Pt> = (0..10).map(|i| pt(f64::from(i) * 0.01, 0.0, 1.0)).collect();
         let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.001), slice_of(pts), 1000, CloudColor::Elevation);
-        let color = c.color_of(&c.levels[0].pts[0]);
+        let color = c.color_of(&c.levels[0].pts[0], None);
         assert!(color.iter().all(|v| *v < 255), "the mid ramp: {color:?}");
     }
 }

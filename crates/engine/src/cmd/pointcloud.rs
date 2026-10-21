@@ -42,6 +42,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .noundo(),
         CommandSpec::new("lascrs", "Set the Project CRS", lascrs).params("{epsg?: int, name?: string, reset?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasgeo", "Tie the Project to the Map", lasgeo).params("{lat: number, lon: number}").enabled(always).noundo(),
+        CommandSpec::new("lascmp", "Compare Two Clouds", lascmp).params("{index?: int, reference?: int, cell?: number}").enabled(always).noundo(),
         CommandSpec::new("lasopacity", "Set the Cloud Opacity", lasopacity).params("{opacity?: number, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
@@ -524,6 +525,46 @@ fn lasgeo(s: &mut Session, p: &Value) -> Result<Value> {
         "reference": reference,
         "origin": s.local_origin,
         "crs": crs_json(&Some(crs)),
+    }))
+}
+
+/// Compare two clouds: the distance from every point of one to the nearest point of the other.
+///
+/// The comparison a survey office makes after a second visit: the tested cloud against a
+/// reference, with the statistics of the distances (the mean, the standard deviation, the RMS, the
+/// extremes and the 95th percentile) and the cloud drawn on a blue-to-red deviation scale.
+fn lascmp(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let reference = p.get("reference").and_then(Value::as_u64).map(|v| v as usize).unwrap_or_else(|| {
+        // Without a reference, the other cloud: the last one that is not the tested one.
+        s.clouds.iter().enumerate().rev().find(|(j, _)| *j != i).map(|(j, _)| j).unwrap_or(i)
+    });
+    if reference >= s.clouds.len() {
+        return Err(EngineError::Other(format!("no reference cloud {reference}; {} open", s.clouds.len())));
+    }
+    if reference == i {
+        return Err(EngineError::Other("the reference must be another cloud".into()));
+    }
+    let cell = number(p, "cell").unwrap_or(0.0);
+    let reference_cloud = s.clouds[reference].clone();
+    let stats = s.clouds[i].compare_with(&reference_cloud, cell);
+    s.clouds[i].color = cadcraft_pointcloud::CloudColor::Deviation;
+    let name = s.clouds[i].name.clone();
+    let reference_name = s.clouds[reference].name.clone();
+    Ok(json!({
+        "message": format!("{name} against {reference_name}: {}", stats.summary()),
+        "index": i,
+        "reference": reference,
+        "referenceName": reference_name,
+        "count": stats.count,
+        "missing": stats.missing,
+        "mean": stats.mean,
+        "std": stats.std,
+        "rms": stats.rms,
+        "min": stats.min,
+        "max": stats.max,
+        "p95": stats.p95,
+        "scale": s.clouds[i].dev_scale,
     }))
 }
 

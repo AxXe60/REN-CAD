@@ -495,7 +495,7 @@ fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::Clou
             if c.clip.is_some_and(|clip| !clip.contains(x, y, z)) {
                 continue;
             }
-            let [r, g, b] = c.color_of(v);
+            let [r, g, b] = c.color_of(v, level.dev.get(i).copied());
             scene.points.push(Point3d { pos: [x as f32, y as f32, z as f32], color: [r, g, b, 255] });
         }
     }
@@ -976,7 +976,7 @@ fn draw_cpu_fallback(
     for c in clouds.iter().filter(|c| c.visible) {
         let level = c.level_for(px_per_m);
         let step = (level.pts.len() / 50_000).max(1);
-        for v in level.pts.iter().step_by(step) {
+        for (i, v) in level.pts.iter().enumerate().step_by(step) {
             let (x, y, z) = (f64::from(v.x) + c.origin[0], f64::from(v.y) + c.origin[1], f64::from(v.z));
             let (dx, dy, dz) = (x - center[0], y - center[1], z - center[2]);
             if dx * dx + dy * dy + dz * dz > r2 {
@@ -986,7 +986,7 @@ fn draw_cpu_fallback(
                 continue;
             }
             if let Some(at) = screen.project([x, y, z]) {
-                let [r, g, b] = c.color_of(v);
+                let [r, g, b] = c.color_of(v, level.dev.get(i).copied());
                 shapes.push(egui::Shape::rect_filled(
                     Rect::from_center_size(at, vec2(view.point_size, view.point_size)),
                     0.0,

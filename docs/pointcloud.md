@@ -234,6 +234,30 @@ perspective view of the visible clouds in the same rectangle; `{"on": false}` re
 - Without a wgpu render state (a wasm build without a GPU) the view projects a sampled 50k points
   on the CPU with egui shapes, so it still shows something.
 
+### Comparing two clouds (C2C)
+
+The measurement a survey office makes after a second visit: how far is the new scan from the
+reference? `LASCMP {index?, reference?, cell?}` measures the distance from every point of the tested
+cloud to the nearest point of the reference and reports the statistics of those distances — the
+mean, the standard deviation, the **RMS** (the number a survey report quotes), the extremes and the
+95th percentile — and draws the cloud on a blue-to-red scale.
+
+Two rules of the practice (Zhang et al. 2015; the cloud-to-cloud comparison every survey tool
+does): the **reference must be denser** than the tested cloud, and it must **cover** it. A point that
+finds no neighbour is counted as missing and stays grey — the report says how many, instead of
+inventing a distance.
+
+```json
+{"command":"lascmp","params":{"index":0,"reference":1}}
+```
+
+```json
+{"message":"Ap 1 against Curte ulei: 3899545 points: mean 0.0121 m, σ 0.0090 m, RMS 0.0150 m, min 0.0000, max 0.2130, p95 0.0243 m"}
+```
+
+The search is a uniform grid over the reference (the cell is twice the reference's point spacing),
+so a comparison of two four-million-point scans takes seconds, not minutes.
+
 ### The viewport HUD and the Z band
 
 The 3D view carries its own bar, over the canvas, below the app's menus: **2D / 3D**, the standard

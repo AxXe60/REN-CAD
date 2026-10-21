@@ -123,6 +123,15 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             let mode = format!("single:#{:02x}{:02x}{:02x}", single[0], single[1], single[2]);
             run(app, "lascolor", json!({"index": selected, "mode": mode}));
         }
+        // The deviation scale, once the cloud was compared with a reference.
+        if app.session.clouds[selected].dev_stats.is_some()
+            && ui
+                .selectable_label(color == cadcraft_pointcloud::CloudColor::Deviation, "Deviation")
+                .on_hover_text("The distance to the reference cloud, on a blue-to-red scale")
+                .clicked()
+        {
+            run(app, "lascolor", json!({"index": selected, "mode": "deviation"}));
+        }
     });
 
     // ---------- resolution ----------
@@ -199,6 +208,22 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             run(app, "lasground", json!({ "index": selected, "show": only }));
         }
     });
+    // ---------- compare with another cloud ----------
+    if app.session.clouds.len() > 1 {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if ui
+                .button("Compare")
+                .on_hover_text("Measure the distance from every point of this cloud to the nearest point of the other one: the cloud-to-cloud comparison of the survey practice")
+                .clicked()
+            {
+                run(app, "lascmp", json!({ "index": selected }));
+            }
+            if let Some(stats) = app.session.clouds[selected].dev_stats {
+                ui.label(egui::RichText::new(stats.summary()).color(t.text_dim).size(11.0));
+            }
+        });
+    }
     // How opaque the cloud is: below 1 the 3D view thins the points (the x-ray), so the drawing
     // under the cloud stays readable.
     ui.horizontal(|ui| {

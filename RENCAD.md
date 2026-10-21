@@ -33,6 +33,7 @@ selecția, undo-ul și salvarea văd doar ce a desenat utilizatorul.
 | **Cadrul de șantier**: `LASORIGIN` (punctul din lume de la 0,0,0) + `LASCRS` | gata |
 | **Nori de 50–100M puncte**: citire cu plafon, fără să țină fișierul în memorie | gata |
 | **Claritate 3D fără depth buffer**: front wall cut + depth cue | gata |
+| **Comparație nor–nor (C2C)**: distanțe, RMS/mean/σ/p95, scară deviații | gata |
 | **Transparență / x-ray**: `LASOPACITY` + mască deterministă în shader | gata |
 | **Contrast robust**: rampele folosesc percentilele 2%–98% | gata |
 | Layere pe stroke (DXF per layer) + închidere polilinie | gata |
@@ -174,6 +175,7 @@ Toate sunt `CommandSpec`, deci merg din linia de comandă, CLI, control JSON și
 | `LASVISIBLE {visible?,index?}` | arată/ascunde |
 | `LASGROUND {cell?,tolerance?,bump?,sigma?,show?}` | găsește terenul / desenează doar terenul |
 | `LASOPACITY {opacity?,index?}` | cât de opac e norul (x-ray: punctele se rarează) |
+| `LASCMP {index?,reference?,cell?}` | compară două nori: distanțe, RMS/mean/σ/p95, scară deviații |
 | `LASORIGIN {x?,y?,z?,reset?}` | cadrul de șantier: punctul din lume de la (0,0,0) |
 | `LASCRS {epsg?,name?,reset?}` | sistemul proiectului, pentru fișierele care nu-l spun |
 | `LASFRAME {index?}` | încadrează XY în 2D |
