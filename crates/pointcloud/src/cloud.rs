@@ -130,6 +130,9 @@ pub struct Cloud {
     /// How opaque the cloud is drawn (0.05..=1.0). Below 1 the 3D view thins the points by a
     /// deterministic mask, so the drawing under the cloud stays readable.
     pub opacity: f32,
+    /// The band's heights in 64 bins, so the palette can draw the scan's profile and the user can
+    /// see where the floor and the ceiling are.
+    pub zhisto: [u32; 64],
     /// Where the file says it is (the EPSG code and the WKT), when it says anything.
     pub crs: Option<crate::Crs>,
     /// Finest first.
@@ -215,6 +218,7 @@ impl Cloud {
             clip: None,
             ground_only: false,
             opacity: 1.0,
+            zhisto: heights(&slice.points, zmin, zmax),
             crs: None,
             levels,
             full_points: slice.in_band as usize,
@@ -395,6 +399,21 @@ impl Norm {
         // A band with one intensity value (`span` 0) sits mid-ramp: visible, no fake contrast.
         scaled.checked_div(self.span).map_or(128, |t| t.min(255) as u8)
     }
+}
+
+/// The band's heights in 64 bins, so the palette can draw the scan's profile: the floor and the
+/// ceiling show up as two wide humps, a wall as a thin one.
+fn heights(points: &[crate::Pt], zmin: f64, zmax: f64) -> [u32; 64] {
+    let mut bins = [0u32; 64];
+    let span = zmax - zmin;
+    if span <= 0.0 || !span.is_finite() {
+        return bins;
+    }
+    for p in points {
+        let i = (((p.z - zmin) / span) * 63.0).round().clamp(0.0, 63.0) as usize;
+        bins[i] = bins[i].saturating_add(1);
+    }
+    bins
 }
 
 /// One point per `cell`-metre cube, keeping the first in file order; `cell` 0 keeps every point.

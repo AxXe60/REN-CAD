@@ -45,6 +45,7 @@ pub mod options;
 pub mod palettes;
 pub mod parametric;
 pub mod plotstyles;
+pub mod pointcloud_hud;
 pub mod quick;
 pub mod shortcut_menus;
 pub mod theme;

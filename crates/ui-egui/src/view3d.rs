@@ -299,6 +299,11 @@ impl View3d {
         self.preset(-std::f64::consts::FRAC_PI_2, 0.0);
     }
 
+    /// Look along +X: Y right, Z up.
+    pub fn right(&mut self) {
+        self.preset(std::f64::consts::PI, 0.0);
+    }
+
     /// The default three-quarter view.
     pub fn iso(&mut self) {
         self.preset(-2.2, 0.55);
@@ -839,6 +844,50 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
         info.push_str(&format!("\n3D sketch: {} strokes, {} segments", app.session.sketch.count(), app.session.sketch.segments()));
     }
     painter.text(rect.left_top() + vec2(10.0, 8.0), egui::Align2::LEFT_TOP, info, egui::FontId::proportional(12.0), t.text_dim);
+
+    // ---------- the floating camera bar ----------
+    if let Some(cloud) = app.session.clouds.first() {
+        let mut hud = crate::pointcloud_hud::PointCloudHudState {
+            is_3d_active: app.view3d.active,
+            is_ortho: app.view3d.projection == Projection::Ortho,
+            opacity: app.session.clouds.iter().filter(|c| c.visible).map(|c| c.opacity).fold(1.0f32, f32::min),
+            bounds_z_min: cloud.bounds.min[2],
+            bounds_z_max: cloud.bounds.max[2],
+            clip_z_min: cloud.clip.map_or(cloud.bounds.min[2], |c| c.min[2]),
+            clip_z_max: cloud.clip.map_or(cloud.bounds.max[2], |c| c.max[2]),
+            lock_slice_thickness: false,
+            jog_step_m: 0.15,
+            z_histogram: cloud.zhisto,
+        };
+        let mut actions = Vec::new();
+        crate::pointcloud_hud::draw_viewport_floating_hud(ui.ctx(), ui.max_rect(), &mut hud, &mut actions);
+        for action in actions {
+            match action {
+                crate::pointcloud_hud::PointCloudUiAction::Set3DView(on) => {
+                    app.view3d.active = on;
+                    if on {
+                        app.view3d.fitted = false;
+                    }
+                }
+                crate::pointcloud_hud::PointCloudUiAction::SetViewPreset(preset) => match preset {
+                    crate::pointcloud_hud::ViewPreset::Top => app.view3d.top(),
+                    crate::pointcloud_hud::ViewPreset::Front => app.view3d.front(),
+                    crate::pointcloud_hud::ViewPreset::Right => app.view3d.right(),
+                    crate::pointcloud_hud::ViewPreset::Iso => app.view3d.iso(),
+                },
+                crate::pointcloud_hud::PointCloudUiAction::SetOrtho(ortho) => {
+                    app.view3d.projection = if ortho { Projection::Ortho } else { Projection::Perspective };
+                }
+                crate::pointcloud_hud::PointCloudUiAction::SetOpacity(opacity) => {
+                    for c in app.session.clouds.iter_mut().filter(|c| c.visible) {
+                        c.set_opacity(opacity);
+                    }
+                }
+                crate::pointcloud_hud::PointCloudUiAction::FitFrame => app.view3d.fitted = false,
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Paint the committed strokes and the stroke being drawn over the points.

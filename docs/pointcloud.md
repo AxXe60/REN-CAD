@@ -234,6 +234,16 @@ perspective view of the visible clouds in the same rectangle; `{"on": false}` re
 - Without a wgpu render state (a wasm build without a GPU) the view projects a sampled 50k points
   on the CPU with egui shapes, so it still shows something.
 
+### The viewport HUD and the Z band
+
+The 3D view carries its own bar, over the canvas, below the app's menus: **2D / 3D**, the standard
+views (**Top**, **Front**, **Right**, **Iso**), **Perspective / Orthographic**, **Fit** and the cloud's
+**opacity**. Every button is a command or a view change — the bar is thin, it owns no state.
+
+The palette's **Z Band** panel draws the scan's height profile (64 bins, computed when the file is
+read) with the cut marked on it, and the band can be walked up and down with the jog buttons while
+its thickness stays locked — the way a floor slab is found in a storey scan.
+
 ### Clarity without a depth buffer
 
 The 3D pipeline has no depth attachment (the 2D canvas owns the pass), so the near and the far

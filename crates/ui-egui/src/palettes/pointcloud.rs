@@ -214,6 +214,35 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     });
 
+    // ---------- the Z band: the scan's profile and the band jogger ----------
+    let mut hud = crate::pointcloud_hud::PointCloudHudState {
+        is_3d_active: app.view3d.active,
+        is_ortho: app.view3d.projection == crate::view3d::Projection::Ortho,
+        opacity: app.session.clouds[selected].opacity,
+        bounds_z_min: bounds.min[2],
+        bounds_z_max: bounds.max[2],
+        clip_z_min: clip.map_or(bounds.min[2], |c| c.min[2]),
+        clip_z_max: clip.map_or(bounds.max[2], |c| c.max[2]),
+        lock_slice_thickness: false,
+        jog_step_m: 0.15,
+        z_histogram: app.session.clouds[selected].zhisto,
+    };
+    let mut actions = Vec::new();
+    crate::pointcloud_hud::draw_z_slice_and_histogram_panel(ui, &mut hud, &mut actions);
+    for action in actions {
+        match action {
+            crate::pointcloud_hud::PointCloudUiAction::SetZClip { z_min, z_max } => {
+                let min = [bounds.min[0], bounds.min[1], z_min];
+                let max = [bounds.max[0], bounds.max[1], z_max];
+                run(app, "lasclip", json!({ "index": selected, "min": min, "max": max }));
+            }
+            crate::pointcloud_hud::PointCloudUiAction::ResetZClip => {
+                run(app, "lasclip", json!({ "index": selected, "reset": true }));
+            }
+            _ => {}
+        }
+    }
+
     // ---------- info ----------
     ui.add_space(8.0);
     let shown = if all { format!("{} points (all)", num(points)) } else { format!("{} of {} band points", num(points), num(in_band)) };
