@@ -15,7 +15,7 @@ mod dxf;
 mod read;
 mod slice;
 
-pub use cloud::{Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
+pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
 pub use dxf::write_points_dxf;
 pub use read::{CloudInfo, read_info};
 pub use slice::{Pt, Slice, slice};

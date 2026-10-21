@@ -23,7 +23,14 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo(),
         CommandSpec::new("lascolor", "Colour Point Cloud", lascolor).params("{mode: string, index?: int}").enabled(always).noundo(),
-        CommandSpec::new("lasdecimate", "Decimate Point Cloud", lasdecimate).params("{cell: number, index?: int}").enabled(always).noundo(),
+        CommandSpec::new("lasdecimate", "Decimate Point Cloud", lasdecimate)
+            .params("{cell: number, index?: int} (0 = every point of the band)")
+            .enabled(always)
+            .noundo(),
+        CommandSpec::new("lasclip", "Crop Point Cloud", lasclip)
+            .params("{min: [x,y,z], max: [x,y,z], index?: int} | {reset: true}")
+            .enabled(always)
+            .noundo(),
         CommandSpec::new("lasvisible", "Show Point Cloud", lasvisible).params("{visible?: bool, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
@@ -86,16 +93,20 @@ fn lasexport(p: &Value) -> Result<Value> {
     }))
 }
 
-/// Keep a band in the session for the canvas. The default 2 cm grid is the drafting setting that
-/// keeps walls readable; `maxPoints` caps memory and `color` picks the shading.
+/// Keep a band in the session for the canvas. Without `decimate` the finest level holds every
+/// point of the band (up to `maxPoints`); `maxPoints: 0` means the whole band. `color` picks the
+/// shading.
 pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(text(p, "path")?);
     let info = cadcraft_pointcloud::read_info(&path).map_err(oops)?;
     let z0 = number(p, "z0").unwrap_or(info.bounds.min[2]);
     let z1 = number(p, "z1").unwrap_or(info.bounds.max[2]);
-    let decimate = number(p, "decimate").filter(|v| *v > 0.0).or(Some(0.02));
-    let max_points =
-        p.get("maxPoints").and_then(Value::as_u64).map_or(cadcraft_pointcloud::DEFAULT_MAX_POINTS, |v| v as usize).clamp(10_000, 50_000_000);
+    let decimate = number(p, "decimate").filter(|v| *v > 0.0);
+    let max_points = match p.get("maxPoints").and_then(Value::as_u64) {
+        None => cadcraft_pointcloud::DEFAULT_MAX_POINTS,
+        Some(0) => 0,
+        Some(v) => (v as usize).clamp(10_000, cadcraft_pointcloud::ALL_POINTS_LIMIT),
+    };
     let color = match p.get("color").and_then(Value::as_str) {
         Some(text) => cadcraft_pointcloud::CloudColor::parse(text).ok_or_else(|| EngineError::Other(format!("unknown colour mode `{text}`")))?,
         None => cadcraft_pointcloud::CloudColor::Rgb,
@@ -111,6 +122,7 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
     let count = cloud.points();
     let levels = cloud.levels.len();
     let full = cloud.full_points;
+    let cell = cloud.levels.first().map_or(0.0, |l| l.cell);
     // First cloud in an empty drawing: frame it, so LASOPEN is all it takes to see the scan.
     if s.doc().is_ok_and(|d| d.model.is_empty()) {
         let w = b.max[0] - b.min[0];
@@ -122,10 +134,14 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.clouds.push(cloud);
     Ok(json!({
-        "message": format!("{name}: {count} points drawn from {full} in the band ({levels} levels)"),
+        "message": format!(
+            "{name}: {count} points{} from {full} in the band ({levels} levels)",
+            if cell > 0.0 { format!(" on a {cell} m grid") } else { " (all band points)".into() }
+        ),
         "name": name,
         "points": count,
         "levels": levels,
+        "cell": cell,
         "inBand": full,
         "filePoints": info.points,
         "color": color.name(),
@@ -205,25 +221,71 @@ fn lascolor(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
-/// Re-read the file with a new grid cell, keeping the band, the name and the colour mode.
+/// Re-read the file with a new grid cell, keeping the band, the name, the colour and the crop.
+/// `cell: 0` drops the grid and keeps every point of the band (`maxPoints: 0` semantics).
 fn lasdecimate(s: &mut Session, p: &Value) -> Result<Value> {
-    let cell = number(p, "cell").filter(|c| *c > 0.0).ok_or_else(|| EngineError::Other("`cell` must be a positive number of metres".into()))?;
+    let cell = number(p, "cell")
+        .filter(|c| *c >= 0.0)
+        .ok_or_else(|| EngineError::Other("`cell` must be 0 (every point) or a positive number of metres".into()))?;
     let i = cloud_index(s, p)?;
-    let (path, name, z0, z1, color) = {
+    let (path, name, z0, z1, color, clip) = {
         let c = s.clouds.get(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
-        (PathBuf::from(&c.path), c.name.clone(), c.z0, c.z1, c.color)
+        (PathBuf::from(&c.path), c.name.clone(), c.z0, c.z1, c.color, c.clip)
     };
-    let cloud =
-        cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, Some(cell), cadcraft_pointcloud::DEFAULT_MAX_POINTS, color).map_err(oops)?;
+    let decimate = (cell > 0.0).then_some(cell);
+    let max_points = if decimate.is_some() { cadcraft_pointcloud::DEFAULT_MAX_POINTS } else { 0 };
+    let mut cloud = cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, decimate, max_points, color).map_err(oops)?;
+    cloud.clip = clip;
     let points = cloud.points();
     let levels = cloud.levels.len();
+    let shown = cloud.levels.first().map_or(0.0, |l| l.cell);
     s.clouds[i] = cloud;
     Ok(json!({
-        "message": format!("{name}: {points} points on a {cell} m grid ({levels} levels)"),
+        "message": if shown > 0.0 {
+            format!("{name}: {points} points on a {shown} m grid ({levels} levels)")
+        } else {
+            format!("{name}: all {points} band points ({levels} levels)")
+        },
         "index": i,
-        "cell": cell,
+        "cell": shown,
         "points": points,
         "levels": levels,
+    }))
+}
+
+fn xyz(p: &Value, key: &str) -> Result<[f64; 3]> {
+    let a = p.get(key).and_then(Value::as_array).filter(|a| a.len() == 3).ok_or_else(|| EngineError::Other(format!("`{key}` must be [x, y, z]")))?;
+    let mut v = [0.0; 3];
+    for (i, s) in a.iter().enumerate() {
+        v[i] = s.as_f64().filter(|f| f.is_finite()).ok_or_else(|| EngineError::Other(format!("`{key}` must be [x, y, z]")))?;
+    }
+    Ok(v)
+}
+
+/// Crop the cloud to a box without re-reading the file, so the ceiling (`max` Z) or the walls
+/// (`min`/`max` X and Y) can be cut away and put back while the scan stays loaded.
+fn lasclip(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let reset = p.get("reset").and_then(Value::as_bool).unwrap_or(false);
+    let clip = if reset {
+        None
+    } else {
+        let min = xyz(p, "min")?;
+        let max = xyz(p, "max")?;
+        if (0..3).any(|k| max[k] < min[k]) {
+            return Err(EngineError::Other("`max` must not be below `min` on any axis".into()));
+        }
+        Some(cadcraft_pointcloud::Clip { min, max })
+    };
+    let name = {
+        let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+        c.clip = clip;
+        c.name.clone()
+    };
+    Ok(json!({
+        "message": if clip.is_some() { format!("{name}: cropped to the box") } else { format!("{name}: crop off") },
+        "index": i,
+        "clip": clip.map(|c| json!({ "min": c.min, "max": c.max })),
     }))
 }
 
@@ -279,6 +341,23 @@ mod tests {
         let mut s = Session::new();
         let r = lasclouds(&mut s).ok();
         assert_eq!(r.and_then(|v| v["count"].as_u64()), Some(0));
+    }
+
+    #[test]
+    fn clip_sets_a_box_and_resets() {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let mut b = Bounds3::EMPTY;
+        b.add(0.0, 0.0, 0.0);
+        b.add(2.0, 2.0, 3.0);
+        let pts = vec![Pt { x: 1.0, y: 1.0, z: 1.0, rgb: None, intensity: 0 }];
+        let slice = Slice { points: pts, total: 1, in_band: 1, bounds: b };
+        let mut s = Session::new();
+        s.clouds.push(Cloud::from_slice("t".into(), String::new(), 0.0, 3.0, None, slice, 1000, CloudColor::Rgb));
+        assert!(lasclip(&mut s, &json!({"min": [0.0, 0.0, 0.0], "max": [2.0, 2.0, 1.5]})).is_ok());
+        assert_eq!(s.clouds[0].clip.map(|c| c.max[2]), Some(1.5), "the ceiling is cut at Z 1.5");
+        assert!(lasclip(&mut s, &json!({"min": [0.0, 0.0, 2.0], "max": [1.0, 1.0, 1.0]})).is_err(), "a box with max below min is refused");
+        assert!(lasclip(&mut s, &json!({"reset": true})).is_ok());
+        assert!(s.clouds[0].clip.is_none());
     }
 
     #[test]

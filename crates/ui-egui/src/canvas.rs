@@ -721,9 +721,16 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
         if let cadcraft_pointcloud::CloudColor::Single([r, g, b]) = c.color {
             (r, g, b).hash(&mut hasher);
         }
+        if let Some(clip) = &c.clip {
+            clip.min.map(f64::to_bits).hash(&mut hasher);
+            clip.max.map(f64::to_bits).hash(&mut hasher);
+        }
         for v in &level.pts {
             let x = f64::from(v.x) + c.origin[0];
             let y = f64::from(v.y) + c.origin[1];
+            if c.clip.is_some_and(|clip| !clip.contains(x, y, f64::from(v.z))) {
+                continue;
+            }
             if x < far.min.x || x > far.max.x || y < far.min.y || y > far.max.y {
                 continue;
             }
@@ -746,6 +753,14 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
         }
     }
     if list.verts.is_empty() {
+        // Nothing to draw: no cloud, every cloud hidden, or the crop removed every point. Drop
+        // the old buffer, or the last frame stays on the GPU.
+        if app.canvas.cloud_key.is_some() {
+            if let Ok(mut slot) = app.canvas.cloud_slot.lock() {
+                *slot = None;
+            }
+            app.canvas.cloud_key = None;
+        }
         return;
     }
     list.bounds = Bounds2::from_points(list.verts.iter().copied());

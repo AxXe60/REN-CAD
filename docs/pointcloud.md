@@ -1,13 +1,15 @@
 # Point clouds (LAS/LAZ) — RENCAD
 
-> **Last reviewed:** 2026-10-21 · **Status:** M4 — palette and 3D view · **Fork addition**
+> **Last reviewed:** 2026-10-21 · **Status:** M5 — full resolution, intensity spectrum, crop · **Fork addition**
 
 RENCAD is the working name of this fork of CADCraft (the crates and the binary keep their upstream
 names so the weekly rebase stays a fast-forward). The fork adds point cloud support: M1 read a
 LAS/LAZ file, kept the points inside a Z band and wrote them as ordinary DXF POINT entities; M2
 kept the band in the session and drew it in the canvas; M3 made that overlay fast and controllable
 (a decimation pyramid, one GPU draw call, colour modes and live decimation); M4 adds the **Point
-Cloud** palette and a **3D view** with an orbit camera over the same pyramid.
+Cloud** palette and a **3D view** with an orbit camera over the same pyramid; M5 makes it practical
+on real scans: the finest level can be every point of the file, intensity is a colour spectrum, the
+grid is a 3D cube so walls keep their height, and a crop box removes the ceiling or the walls.
 
 ## Commands
 
@@ -53,11 +55,16 @@ walls from furniture.
 Cuts the band, builds the display pyramid and keeps it in the session, drawn in the canvas under
 the drawing — trace over it and save the trace as one DXF.
 
-- `decimate` — grid cell in metres for the finest level, default 0.02 (2 cm). Pass `0.002` for a
-  scan whose walls you want to measure.
+- `decimate` — optional grid cell in metres for the finest level. Without it the finest level is
+  the source points themselves: every point of the band (up to `maxPoints`). `0.02` is the drafting
+  setting for tracing, `0.002` for measuring walls. The grid is a 3D cube, so a wall keeps its
+  points up its height instead of collapsing to one point per column.
 - `maxPoints` — memory cap on the finest level, default 6,000,000. If the band is bigger the grid
-  is coarsened until it fits, so a 100-million-point file cannot exhaust RAM.
-- `color` — `rgb` (default), `elevation`, `intensity`, `single:#rrggbb`.
+  is coarsened until it fits, so a 100-million-point file cannot exhaust RAM. `0` keeps every band
+  point, up to a 20,000,000 safety ceiling. Files over 8,000,000 points are also thinned to a 5 mm
+  cube while reading (before the cap applies), so the first read cannot hold 3 GB of points.
+- `color` — `rgb` (default), `elevation`, `intensity`, `single:#rrggbb`. `intensity` is a spectrum
+  across the band's returns (blue = darkest, red = brightest), not a flat grey.
 
 The first cloud in an empty drawing is framed automatically.
 
@@ -77,12 +84,19 @@ cadcraft-cli run --cmd 'lasopen {"path":"D:/LIdar/Ap 1.las","z0":1.535,"z1":1.69
  "color":"elevation","open":1}
 ```
 
+With no `decimate` the same call reports every band point:
+
+```json
+{"name":"Ap 1","points":3899545,"levels":10,"cell":0,"inBand":3899545,
+ "message":"Ap 1: 3899545 points (all band points) from 3899545 in the band (10 levels)"}
+```
+
 ### `LASCOLOR {mode, index?}`
 
 Recolours an open cloud without re-reading the file. `rgb` is the scanner's true colour,
-`elevation` a blue→cyan→green→yellow→red ramp across the band's Z, `intensity` a greyscale
-normalised to the band's own return range (dim indoor returns would otherwise be black), and
-`single:#rrggbb` (or just `#rrggbb`) one flat colour.
+`elevation` a blue→cyan→green→yellow→red ramp across the band's Z, `intensity` the same kind of
+spectrum across the band's own return range (blue = the dimmest return, red = the brightest),
+and `single:#rrggbb` (or just `#rrggbb`) one flat colour.
 
 ```json
 {"index":0,"color":"intensity","message":"Ap 1: colour intensity"}
@@ -90,12 +104,33 @@ normalised to the band's own return range (dim indoor returns would otherwise be
 
 ### `LASDECIMATE {cell, index?}`
 
-Re-reads the file at a new grid cell, keeping the band, the name and the colour mode — no need to
-`LASCLOSE`/`LASOPEN`.
+Re-reads the file at a new grid cell, keeping the band, the name, the colour mode and the crop —
+no need to `LASCLOSE`/`LASOPEN`. `cell: 0` drops the grid and keeps every point of the band (the
+palette's **All** button), so the finest level is the LAS itself.
 
 ```json
 {"cell":0.01,"points":15488,"levels":1,
  "message":"Ap 1: 15488 points on a 0.01 m grid (1 levels)"}
+```
+
+```json
+{"cell":0,"points":3899545,"levels":10,
+ "message":"Ap 1: all 3899545 band points (10 levels)"}
+```
+
+### `LASCLIP {min, max, index?}` · `LASCLIP {reset: true, index?}`
+
+Crops the cloud to a box in world metres without re-reading the file. Lower `max[2]` to remove the
+ceiling, raise `min[2]` to remove the floor, and pull the X/Y bounds in to cut the four walls; the
+points stay in memory, so the box can be moved or reset at any time.
+
+```json
+{"index":0,"clip":{"min":[-9.24,-9.75,-1.66],"max":[4.05,8.04,1.2]},
+ "message":"Ap 1: cropped to the box"}
+```
+
+```json
+{"index":0,"clip":null,"message":"Ap 1: crop off"}
 ```
 
 ### `LASCLOSE {index?, all?}` · `LASCLOUDS {}`
@@ -130,10 +165,17 @@ script cannot drift apart.
 
 - The cloud list shows each cloud's points and level count; click a row to choose which cloud the
   controls act on.
+- **Open** (the path field at the top, when no cloud is open) reads the file at full resolution —
+  every point of the band — and the **Grid** slider thins it afterwards.
 - **Fit** frames it in 2D, **3D** switches the canvas to the 3D view (**2D** switches back),
   **Close** drops the cloud and **Show** hides it without closing.
 - **Colour**: RGB, Elevation, Intensity, or the colour picker for a flat colour (`single:#rrggbb`).
-- **Grid** and **Apply** re-read the file at a new decimation cell.
+  Intensity shows the band's return range next to the point count.
+- **Grid** and **Apply** re-read the file at a new decimation cell; **All** keeps every point of
+  the LAS band (no grid). The count line says whether the finest level is the source points.
+- **Remove walls / ceiling** enables a crop box: one min/max pair per axis. Lower the Z maximum to
+  drop the ceiling, raise the Z minimum for the floor, pull X and Y in for the walls; untick it to
+  restore every point (the file is not re-read).
 - When the 3D view is on, a point-size slider and **Fit 3D** appear, plus the number of points the
   3D scene drew.
 

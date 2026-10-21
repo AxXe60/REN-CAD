@@ -42,8 +42,8 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             ui.add_space(8.0);
             let edit = egui::TextEdit::singleline(&mut path).hint_text("path to .las / .laz").desired_width(ui.available_width() - 70.0);
             ui.add(edit);
-            if ui.button("Open").clicked() {
-                open(app, &path, 0.02);
+            if ui.button("Open").on_hover_text("Open at full resolution; the Grid slider thins it").clicked() {
+                open(app, &path);
             }
         });
         ui.data_mut(|d| d.insert_temp(path_id, path));
@@ -53,8 +53,17 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
     let selected = app.session.clouds.len().saturating_sub(1);
     let selected = ui.data(|d| d.get_temp::<usize>(sel_id)).filter(|i| *i < app.session.clouds.len()).unwrap_or(selected);
     let cloud = &app.session.clouds[selected];
-    let (points, levels, in_band, color, decimate) =
-        (cloud.points(), cloud.levels.len(), cloud.full_points, cloud.color, cloud.decimate.unwrap_or(0.02));
+    let (points, levels, in_band, color, cell_now, bounds, clip, imin, imax) = (
+        cloud.points(),
+        cloud.levels.len(),
+        cloud.full_points,
+        cloud.color,
+        cloud.levels.first().map_or(0.0, |l| l.cell),
+        cloud.bounds,
+        cloud.clip,
+        cloud.imin,
+        cloud.imax,
+    );
     let visible = app.session.clouds[selected].visible;
 
     // ---------- actions ----------
@@ -115,9 +124,10 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     });
 
-    // ---------- decimation ----------
+    // ---------- resolution ----------
     ui.add_space(6.0);
-    let mut cell = ui.data(|d| d.get_temp::<f32>(cell_id)).unwrap_or(decimate as f32);
+    let all = cell_now <= 0.0;
+    let mut cell = ui.data(|d| d.get_temp::<f32>(cell_id)).unwrap_or(if all { 0.005 } else { cell_now as f32 });
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.label(egui::RichText::new("Grid").color(t.text_dim).size(12.0));
@@ -128,13 +138,58 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         if ui.button("Apply").on_hover_text("Re-read the file at this grid cell").clicked() {
             run(app, "lasdecimate", json!({"index": selected, "cell": cell}));
         }
+        if ui.selectable_label(all, "All").on_hover_text("Every point in the LAS band, no grid").clicked() {
+            run(app, "lasdecimate", json!({"index": selected, "cell": 0.0}));
+        }
     });
+
+    // ---------- crop: walls and ceiling ----------
+    ui.add_space(6.0);
+    let mut enabled = clip.is_some();
+    let mut min = clip.map_or(bounds.min, |c| c.min);
+    let mut max = clip.map_or(bounds.max, |c| c.max);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let box_on = ui
+            .checkbox(&mut enabled, "Remove walls / ceiling")
+            .on_hover_text(
+                "Crop box: raise the lower Z to drop the floor, lower the upper Z to drop the ceiling, pull X and Y in to remove the walls",
+            )
+            .changed();
+        if box_on {
+            if enabled {
+                run(app, "lasclip", json!({"index": selected, "min": min, "max": max}));
+            } else {
+                run(app, "lasclip", json!({"index": selected, "reset": true}));
+            }
+        }
+    });
+    if enabled {
+        let mut changed = false;
+        for (axis, k) in [("X", 0usize), ("Y", 1), ("Z", 2)] {
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new(axis).color(t.text_dim).size(11.0));
+                changed |= ui.add(egui::DragValue::new(&mut min[k]).speed(0.01).range(bounds.min[k]..=bounds.max[k]).max_decimals(3)).changed();
+                ui.label("..");
+                changed |= ui.add(egui::DragValue::new(&mut max[k]).speed(0.01).range(bounds.min[k]..=bounds.max[k]).max_decimals(3)).changed();
+            });
+        }
+        if changed {
+            for k in 0..3 {
+                min[k] = min[k].min(max[k]);
+            }
+            run(app, "lasclip", json!({"index": selected, "min": min, "max": max}));
+        }
+    }
 
     // ---------- info ----------
     ui.add_space(8.0);
+    let shown = if all { format!("{} points (all)", num(points)) } else { format!("{} of {} band points", num(points), num(in_band)) };
+    let intensity = if color == cadcraft_pointcloud::CloudColor::Intensity { format!(" · intensity {imin}–{imax}") } else { String::new() };
     ui.horizontal(|ui| {
         ui.add_space(8.0);
-        ui.label(egui::RichText::new(format!("{} of {} band points · {} levels", num(points), num(in_band), levels)).color(t.text_dim).size(11.0));
+        ui.label(egui::RichText::new(format!("{shown} · {levels} levels{intensity}")).color(t.text_dim).size(11.0));
     });
     if app.view3d.active {
         ui.horizontal(|ui| {
@@ -155,12 +210,14 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
     }
 }
 
-fn open(app: &mut CadApp, path: &str, cell: f64) {
+fn open(app: &mut CadApp, path: &str) {
     let path = path.trim();
     if path.is_empty() {
         return;
     }
-    run(app, "lasopen", json!({"path": path, "decimate": cell}));
+    // No `decimate`: the finest level is the file's own points (LASOPEN thin it only if the band
+    // is over the 8-million read cap).
+    run(app, "lasopen", json!({"path": path}));
 }
 
 fn run(app: &mut CadApp, command: &str, params: serde_json::Value) {

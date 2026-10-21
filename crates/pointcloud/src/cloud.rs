@@ -66,7 +66,24 @@ pub struct CloudVtx {
     pub y: f32,
     pub z: f32,
     pub rgb: [u8; 3],
+    /// Intensity normalised to the band, `0` = the band's darkest, `255` = its brightest. Stored
+    /// after that stretch because scanners write anything from 8-bit values in a 16-bit field to
+    /// a narrow dark band; `value / 257` would flatten the first case to one colour.
     pub intensity: u8,
+}
+
+/// A crop box in world metres: points outside it are not drawn, so a ceiling or the four walls
+/// can be cut away without re-reading the file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Clip {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
+impl Clip {
+    pub fn contains(&self, x: f64, y: f64, z: f64) -> bool {
+        x >= self.min[0] && x <= self.max[0] && y >= self.min[1] && y <= self.max[1] && z >= self.min[2] && z <= self.max[2]
+    }
 }
 
 /// One decimation level: points on a grid of `cell` metres (`0` = the source points).
@@ -89,13 +106,15 @@ pub struct Cloud {
     pub origin: [f64; 2],
     pub zmin: f64,
     pub zmax: f64,
-    /// The band's intensity range, so the greyscale uses what the scanner recorded instead of the
+    /// The band's intensity range, so the ramp uses what the scanner recorded instead of the
     /// nominal 0–65535 (a typical indoor slice sits in a narrow dark band and would look black).
-    pub imin: u8,
-    pub imax: u8,
+    pub imin: u16,
+    pub imax: u16,
     pub bounds: Bounds3,
     pub visible: bool,
     pub color: CloudColor,
+    /// Crop box: `None` draws every point of the band.
+    pub clip: Option<Clip>,
     /// Finest first.
     pub levels: Vec<CloudLevel>,
     /// Points the band held before the `maxPoints` cap.
@@ -105,6 +124,15 @@ pub struct Cloud {
 /// Points per cloud by default: a 6-million-point band is 96 MB of 16-byte vertices and still
 /// ten times more than a 4K screen can show at any zoom.
 pub const DEFAULT_MAX_POINTS: usize = 6_000_000;
+
+/// The most points `maxPoints: 0` ("every point of the band") will keep: 20 million is 320 MB of
+/// vertices, the point where a workstation scan stops being comfortable.
+pub const ALL_POINTS_LIMIT: usize = 20_000_000;
+
+/// Files up to this many points are read whole when no `decimate` is asked. Bigger ones are
+/// thinned to a 5 mm cube while streaming: 3.2 GB of `Pt` for a 100-million-point scan would
+/// exhaust most machines before the display cap could help.
+pub const SLICE_ALL_LIMIT: u64 = 8_000_000;
 
 impl Cloud {
     /// Build the levels of an already-sliced band.
@@ -121,23 +149,24 @@ impl Cloud {
         let b = slice.bounds;
         let origin = [b.min[0], b.min[1]];
         let (zmin, zmax) = (b.min[2], b.max[2]);
-        let (imin, imax) = slice.points.iter().fold((u8::MAX, 0u8), |(lo, hi), p| {
-            let v = (p.intensity / 257).min(255) as u8;
-            (lo.min(v), hi.max(v))
-        });
-        let (imin, imax) = if slice.points.is_empty() { (0, 255) } else { (imin, imax) };
-        let mut cell = decimate.filter(|c| *c > 0.0).unwrap_or(0.002).max(1e-4);
-        let cap = max_points.max(10_000);
-        let mut base = grid(&slice.points, cell, origin);
-        // Fit the cap, then keep halving the density: 1.6x cells make the next level ~2.5x lighter.
+        let (imin, imax) = slice.points.iter().fold((u16::MAX, 0u16), |(lo, hi), p| (lo.min(p.intensity), hi.max(p.intensity)));
+        let (imin, imax) = if slice.points.is_empty() { (0, 65535) } else { (imin, imax) };
+        let norm = Norm { lo: imin, span: u32::from(imax.saturating_sub(imin)) };
+        // No `decimate` (or `0`) means the source points themselves: the finest level keeps every
+        // point of the band, up to the memory cap. A cell is the drafting answer for huge scans.
+        let asked = decimate.filter(|c| *c > 0.0);
+        let mut cell = asked.unwrap_or(0.0);
+        let cap = if max_points == 0 { ALL_POINTS_LIMIT } else { max_points.max(10_000) };
+        let mut base = grid(&slice.points, cell, origin, norm);
+        // Fit the cap, then keep coarsening: 1.6x cells make the next level ~2.5x lighter.
         while base.len() > cap && cell < 1e4 {
-            cell *= 1.5;
-            base = grid(&slice.points, cell, origin);
+            cell = if cell > 0.0 { cell * 1.5 } else { 0.002 };
+            base = grid(&slice.points, cell, origin, norm);
         }
         let mut levels = vec![CloudLevel { cell, pts: base }];
         while levels.last().is_some_and(|l| l.pts.len() > 20_000) && levels.len() < 16 {
-            let c = levels.last().map_or(0.01, |l| l.cell) * 1.6;
-            let pts = grid(&slice.points, c, origin);
+            let c = if levels.last().is_some_and(|l| l.cell <= 0.0) { 0.005 } else { levels.last().map_or(0.01, |l| l.cell) * 1.6 };
+            let pts = grid(&slice.points, c, origin, norm);
             if pts.len() >= levels.last().map_or(0, |l| l.pts.len()) {
                 break;
             }
@@ -157,15 +186,26 @@ impl Cloud {
             bounds: b,
             visible: true,
             color,
+            clip: None,
             levels,
             full_points: slice.in_band as usize,
         }
     }
 
     /// Read `path`, cut the band and build the levels.
+    ///
+    /// A file larger than [`SLICE_ALL_LIMIT`] points is thinned to a 5 mm cube while streaming, so
+    /// the slice cannot hold a 100-million-point scan as 3.2 GB of `Pt`; the cap loop coarsens it
+    /// further if needed. Smaller files are read whole, which is what "all points" means.
     pub fn open(path: &Path, name: String, z0: f64, z1: f64, decimate: Option<f64>, max_points: usize, color: CloudColor) -> Result<Self> {
-        let slice = crate::slice(path, z0, z1, decimate)?;
-        Ok(Self::from_slice(name, path.display().to_string(), z0, z1, decimate, slice, max_points, color))
+        let asked = decimate.filter(|c| *c > 0.0);
+        let eff = match asked {
+            Some(c) => Some(c),
+            None if crate::read_info(path)?.points > SLICE_ALL_LIMIT => Some(0.005),
+            None => None,
+        };
+        let slice = crate::slice(path, z0, z1, eff)?;
+        Ok(Self::from_slice(name, path.display().to_string(), z0, z1, eff, slice, max_points, color))
     }
 
     pub fn points(&self) -> usize {
@@ -173,13 +213,15 @@ impl Cloud {
     }
 
     /// The level to draw at `px_per_m` screen pixels per metre: the one whose grid spacing is
-    /// nearest two pixels.
+    /// nearest two pixels. The source-point level (`cell` 0) counts as sub-millimetre, so it
+    /// appears only when the view is zoomed in far enough to resolve it.
     pub fn level_for(&self, px_per_m: f64) -> &CloudLevel {
         let want = if px_per_m.is_finite() && px_per_m > 0.0 { 2.0 / px_per_m } else { f64::INFINITY };
         let mut best = &self.levels[0];
         let mut best_d = f64::INFINITY;
         for l in &self.levels {
-            let d = if l.cell > 0.0 && want > 0.0 { (l.cell / want).ln().abs() } else { 0.0 };
+            let spacing = if l.cell > 0.0 { l.cell } else { 0.0002 };
+            let d = if want > 0.0 { (spacing / want).ln().abs() } else { 0.0 };
             if d < best_d {
                 best_d = d;
                 best = l;
@@ -192,14 +234,9 @@ impl Cloud {
     pub fn color_of(&self, v: &CloudVtx) -> [u8; 3] {
         match self.color {
             CloudColor::Rgb => v.rgb,
-            CloudColor::Intensity => {
-                // Normalised to the band, and never darker than a mid grey: indoor returns are
-                // dim, and black points on a dark canvas are invisible.
-                let span = u32::from(self.imax.saturating_sub(self.imin));
-                let t = if span > 0 { f32::from(v.intensity.saturating_sub(self.imin)) / span as f32 } else { 0.6 };
-                let g = (40.0 + 215.0 * t.clamp(0.0, 1.0)).round() as u8;
-                [g, g, g]
-            }
+            // A spectrum, not grey: the band's darkest return reads blue and its brightest red,
+            // so two walls with slightly different returns stay distinguishable.
+            CloudColor::Intensity => ramp(f32::from(v.intensity) / 255.0),
             CloudColor::Single(c) => c,
             CloudColor::Elevation => {
                 let span = self.zmax - self.zmin;
@@ -210,23 +247,46 @@ impl Cloud {
     }
 }
 
-/// One point per `cell`-metre XY square, keeping the first in file order.
-fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2]) -> Vec<CloudVtx> {
-    let inv = 1.0 / cell;
-    let mut seen: HashSet<(i64, i64)> = HashSet::with_capacity(points.len().min(4_000_000));
+/// Stretches 16-bit intensities to the band: the darkest becomes 0, the brightest 255.
+#[derive(Clone, Copy)]
+struct Norm {
+    lo: u16,
+    span: u32,
+}
+
+impl Norm {
+    fn u8(self, v: u16) -> u8 {
+        let scaled = u32::from(v.saturating_sub(self.lo)) * 255 + self.span / 2;
+        // A band with one intensity value (`span` 0) sits mid-ramp: visible, no fake contrast.
+        scaled.checked_div(self.span).map_or(128, |t| t.min(255) as u8)
+    }
+}
+
+/// One point per `cell`-metre cube, keeping the first in file order; `cell` 0 keeps every point.
+///
+/// The cube is three-dimensional on purpose: an XY-only grid keeps one point per column, so a
+/// vertical wall loses every point but one and the walls disappear from the 3D view.
+fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> Vec<CloudVtx> {
     let mut out = Vec::with_capacity(points.len().min(4_000_000));
+    let mut vtx = |p: &crate::Pt| CloudVtx {
+        x: (p.x - origin[0]) as f32,
+        y: (p.y - origin[1]) as f32,
+        z: p.z as f32,
+        rgb: p.rgb.unwrap_or([220, 220, 220]),
+        intensity: norm.u8(p.intensity),
+    };
+    if cell <= 0.0 || !cell.is_finite() {
+        out.extend(points.iter().map(&mut vtx));
+        return out;
+    }
+    let inv = 1.0 / cell;
+    let mut seen: HashSet<(i64, i64, i64)> = HashSet::with_capacity(points.len().min(4_000_000));
     for p in points {
-        let key = (((p.x - origin[0]) * inv).floor() as i64, ((p.y - origin[1]) * inv).floor() as i64);
+        let key = (((p.x - origin[0]) * inv).floor() as i64, ((p.y - origin[1]) * inv).floor() as i64, (p.z * inv).floor() as i64);
         if !seen.insert(key) {
             continue;
         }
-        out.push(CloudVtx {
-            x: (p.x - origin[0]) as f32,
-            y: (p.y - origin[1]) as f32,
-            z: p.z as f32,
-            rgb: p.rgb.unwrap_or([220, 220, 220]),
-            intensity: (p.intensity / 257).min(255) as u8,
-        });
+        out.push(vtx(p));
     }
     out
 }
@@ -305,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn intensity_spans_the_band_not_the_sensor_range() {
+    fn intensity_spans_the_band_as_a_spectrum() {
         let mk = |x: f64, i: u16| crate::Pt { x, y: 0.0, z: 1.0, rgb: None, intensity: i };
         let c = Cloud::from_slice(
             "t".into(),
@@ -317,10 +377,49 @@ mod tests {
             1000,
             CloudColor::Intensity,
         );
-        let lo = c.color_of(&c.levels[0].pts[0])[0];
-        let hi = c.color_of(&c.levels[0].pts[1])[0];
-        assert!(lo >= 40, "dim returns stay visible: {lo}");
-        assert!(hi > 200, "the band's brightest is near white: {hi}");
+        let lo = c.color_of(&c.levels[0].pts[0]);
+        let hi = c.color_of(&c.levels[0].pts[1]);
+        assert_ne!(lo, hi, "the ramp spans the band");
+        assert!(lo[2] > lo[0], "the darkest return reads blue: {lo:?}");
+        assert!(hi[0] > hi[2], "the brightest reads red: {hi:?}");
+    }
+
+    /// Scanners often write 8-bit intensities into the 16-bit field (`0..=255`). Dividing by 257
+    /// flattened every one of them to 0, so the whole cloud took the span-zero colour.
+    #[test]
+    fn eight_bit_intensities_keep_their_contrast() {
+        let mk = |x: f64, i: u16| crate::Pt { x, y: 0.0, z: 1.0, rgb: None, intensity: i };
+        let c = Cloud::from_slice(
+            "t".into(),
+            String::new(),
+            0.0,
+            2.0,
+            Some(0.01),
+            slice_of(vec![mk(0.0, 0), mk(1.0, 29), mk(2.0, 255)]),
+            1000,
+            CloudColor::Intensity,
+        );
+        let i: Vec<u8> = c.levels[0].pts.iter().map(|p| p.intensity).collect();
+        assert_eq!(i, [0, 29, 255], "the band's range is stretched, not truncated");
+        assert_eq!(c.imin, 0);
+        assert_eq!(c.imax, 255);
+    }
+
+    #[test]
+    fn no_decimation_keeps_every_band_point() {
+        let pts: Vec<_> = (0..500).map(|i| pt(f64::from(i) * 0.001, 0.0, 1.0)).collect();
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, None, slice_of(pts), 100_000, CloudColor::Rgb);
+        assert_eq!(c.levels[0].cell, 0.0, "the finest level is the source points");
+        assert_eq!(c.points(), 500);
+    }
+
+    /// An XY-only grid keeps one point per column, which empties a vertical wall; the grid is a
+    /// cube so height survives.
+    #[test]
+    fn the_grid_keeps_a_wall_vertical() {
+        let pts = vec![pt(1.0, 1.0, 1.0), pt(1.0, 1.0, 1.5), pt(1.0, 1.0, 2.0)];
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 3.0, Some(0.01), slice_of(pts), 1000, CloudColor::Rgb);
+        assert_eq!(c.points(), 3);
     }
 
     #[test]

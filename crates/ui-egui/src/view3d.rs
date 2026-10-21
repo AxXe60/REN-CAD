@@ -150,6 +150,10 @@ fn scene_key(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudL
         }
         level.cell.to_bits().hash(&mut hasher);
         level.pts.len().hash(&mut hasher);
+        if let Some(clip) = &c.clip {
+            clip.min.map(f64::to_bits).hash(&mut hasher);
+            clip.max.map(f64::to_bits).hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -160,10 +164,12 @@ fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::Clou
     let mut scene = Scene3d { points: Vec::with_capacity(total) };
     for (c, level) in picks {
         for v in &level.pts {
+            let (x, y, z) = (f64::from(v.x) + c.origin[0], f64::from(v.y) + c.origin[1], f64::from(v.z));
+            if c.clip.is_some_and(|clip| !clip.contains(x, y, z)) {
+                continue;
+            }
             let [r, g, b] = c.color_of(v);
-            scene
-                .points
-                .push(Point3d { pos: [(f64::from(v.x) + c.origin[0]) as f32, (f64::from(v.y) + c.origin[1]) as f32, v.z], color: [r, g, b, 255] });
+            scene.points.push(Point3d { pos: [x as f32, y as f32, z as f32], color: [r, g, b, 255] });
         }
     }
     scene
@@ -278,6 +284,9 @@ fn draw_cpu_fallback(painter: &egui::Painter, rect: Rect, vp: &[f32; 16], view: 
         let step = (level.pts.len() / 50_000).max(1);
         for v in level.pts.iter().step_by(step) {
             let p = [(f64::from(v.x) + c.origin[0]) as f32, (f64::from(v.y) + c.origin[1]) as f32, v.z];
+            if c.clip.is_some_and(|clip| !clip.contains(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))) {
+                continue;
+            }
             if let Some(at) = project(vp, p, rect) {
                 let [r, g, b] = c.color_of(v);
                 shapes.push(egui::Shape::rect_filled(

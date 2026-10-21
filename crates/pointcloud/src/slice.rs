@@ -27,10 +27,11 @@ pub struct Slice {
     pub bounds: Bounds3,
 }
 
-/// Keep the points with `z0 <= z <= z1`, thinning to one point per `decimate` metre cell in XY.
+/// Keep the points with `z0 <= z <= z1`, thinning to one point per `decimate` metre cube.
 ///
 /// `decimate` is the drafting answer to a 12-million-point scan: 1–5 cm keeps the wall outline
-/// and drops the noise. Streaming: the whole file is never held in memory.
+/// and drops the noise. The cell is a cube, not an XY square, so a wall keeps points up its
+/// height. Streaming: the whole file is never held in memory.
 pub fn slice(path: &Path, z0: f64, z1: f64, decimate: Option<f64>) -> Result<Slice> {
     if z1 <= z0 {
         return Err(Error::EmptyBand { z0, z1 });
@@ -44,7 +45,7 @@ pub fn slice(path: &Path, z0: f64, z1: f64, decimate: Option<f64>) -> Result<Sli
     let total = reader.header().number_of_points();
     let mut points = Vec::new();
     let mut bounds = Bounds3::EMPTY;
-    let mut seen: HashSet<(i64, i64)> = HashSet::new();
+    let mut seen: HashSet<(i64, i64, i64)> = HashSet::new();
     let mut in_band = 0u64;
     // Batches of a million keep memory flat while streaming a 12-million-point scan.
     loop {
@@ -59,7 +60,7 @@ pub fn slice(path: &Path, z0: f64, z1: f64, decimate: Option<f64>) -> Result<Sli
             }
             in_band += 1;
             if let Some(c) = cell {
-                let key = ((p.x / c).floor() as i64, (p.y / c).floor() as i64);
+                let key = ((p.x / c).floor() as i64, (p.y / c).floor() as i64, (p.z / c).floor() as i64);
                 if !seen.insert(key) {
                     continue;
                 }
