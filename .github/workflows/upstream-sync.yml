@@ -1,0 +1,49 @@
+name: upstream-sync
+
+# Opens a pull request that replays our commits on top of storytold/cadcraft's tip.
+# Nothing is force-pushed to main: a human reviews the rebase (and fixes conflicts locally).
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rebase onto upstream/main
+        id: rebase
+        run: |
+          git config user.name "upstream-sync"
+          git config user.email "sync@users.noreply.github.com"
+          git remote add upstream https://github.com/storytold/cadcraft.git
+          git fetch upstream --prune
+          git checkout -B sync/upstream
+          if git rebase upstream/main; then
+            echo "clean=1" >> "$GITHUB_ENV"
+          else
+            git rebase --abort || true
+            {
+              echo "### Upstream rebase has conflicts"
+              echo ""
+              echo "Resolve locally with \`pwsh scripts/sync-upstream.ps1\`, then push."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Open or update the pull request
+        if: env.clean == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push --force origin sync/upstream
+          gh pr create --base main --head sync/upstream \
+            --title "Sync with upstream/main" \
+            --body "Automated rebase of our commits onto \`storytold/cadcraft\`'s tip. CI must pass before merging." \
+            || gh pr view sync/upstream --web=false

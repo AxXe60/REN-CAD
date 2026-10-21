@@ -1,0 +1,15 @@
+[package]
+name = "cadcraft-pointcloud"
+description = "CADCraft point clouds: LAS/LAZ reading, Z slices and DXF export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cadcraft-dxf = { workspace = true }
+thiserror = { workspace = true }
+# LAS/LAZ reading (MIT / Apache-2.0).
+las = { version = "0.11.1", features = ["laz"] }

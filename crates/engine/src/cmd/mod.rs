@@ -30,6 +30,7 @@ mod mtext_opts;
 mod overkill;
 mod pline_opts;
 pub mod plotters;
+mod pointcloud;
 mod props;
 pub use draw2::breakline::BreaklineOptions;
 pub use props::MatchProps;
@@ -207,6 +208,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(txt2mtxt::specs());
         v.extend(constraints::specs());
         v.extend(lisp::specs());
+        v.extend(pointcloud::specs());
         v
     })
 }
