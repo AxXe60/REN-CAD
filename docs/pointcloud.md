@@ -70,6 +70,19 @@ walls from furniture.
 - No LAZ writing, no COPC streaming, no classification, no ortho PNG export yet.
 - The export is ASCII DXF; a 10 cm slice of a large scan can reach tens of MB. Decimate first.
 
+## Building this fork (Windows)
+
+A full workspace build needs ~10 GB. If `C:` is short on space, point the target directory at
+another drive first:
+
+```powershell
+. .\scripts\env.ps1      # sets PATH and CARGO_TARGET_DIR=D:\cargo-target\LASDraft
+cargo xtask ci
+```
+
+`cargo xtask ci` runs fmt, clippy (`-D warnings`), the whole test suite, the asset attribution
+check, the layering check and the wasm build. Do not push when it fails.
+
 ## Licence
 
 `las` (MIT) and `laz` (Apache-2.0) are ordinary Cargo dependencies; nothing is vendored.
