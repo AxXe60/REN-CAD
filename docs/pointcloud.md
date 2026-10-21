@@ -1,6 +1,6 @@
 # Point clouds (LAS/LAZ) — RENCAD
 
-> **Last reviewed:** 2026-10-21 · **Status:** M7 — smart 3D snapping, drawing constraints, measuring · **Fork addition**
+> **Last reviewed:** 2026-10-21 · **Status:** M9 — depth cue, front wall cut, robust colour ramps · **Fork addition**
 
 RENCAD is the working name of this fork of CADCraft (the crates and the binary keep their upstream
 names so the weekly rebase stays a fast-forward). The fork adds point cloud support: M1 read a
@@ -16,7 +16,10 @@ snap to its points and export as DXF `LINE` entities. M7 makes that tracing beha
 the snap keeps only the **front layer** under the cursor (so it cannot snap through a wall) and can
 average the scan noise away, the stroke can be held in a horizontal plane (**Z lock**) or on one
 cardinal axis (**ortho**), every stroke carries a **layer**, a polyline can be **closed**, and a
-**measure** tool reports the length, the run in plan and the rise of a segment.
+**measure** tool reports the length, the run in plan and the rise of a segment. M9 makes the picture
+readable without a depth buffer: a **front wall cut** drops the points between the camera and the
+target, a **depth cue** fades the far ones into the background, and the colour ramps run over the
+**2%–98% window** so a few outliers cannot flatten the contrast of the rest.
 
 ## Commands
 
@@ -185,6 +188,7 @@ script cannot drift apart.
   restore every point (the file is not re-read).
 - When the 3D view is on, the camera controls appear: **Persp/Ortho**, **Fit**, **Top/Front/Iso**,
   the **Lens** slider and the point size.
+- Below them, the clarity controls: **Cut** (the front wall cut) and **Cue** (the depth cue).
 - Above them, the drafting tools: **Draw 3D** and **Measure**, then **Finish**/**Close**/**Cancel**
   for the stroke being drawn, **Undo**/**Clear** for the committed ones, the snap mode
   (**Smooth**/**Exact**), the **Z lock** and **Ortho** checkboxes and the layer field.
@@ -220,7 +224,36 @@ perspective view of the visible clouds in the same rectangle; `{"on": false}` re
 - Without a wgpu render state (a wasm build without a GPU) the view projects a sampled 50k points
   on the CPU with egui shapes, so it still shows something.
 
-### 3D drafting
+### Clarity without a depth buffer
+
+The 3D pipeline has no depth attachment (the 2D canvas owns the pass), so the near and the far
+geometry are mixed. Two things stand in for the depth test:
+
+- **The front wall cut** (`Cut` in the palette, `{"cut": 0.3}` in the control channel): the points
+  between the eye and that fraction of the distance to the target are dropped in the vertex shader
+  (their vertex goes outside the clip volume, so nothing is drawn for them). The camera can look
+  into a room without cropping the walls out of the cloud in `LASCLIP`, and the cut moves with the
+  camera.
+- **The depth cue** (`Cue` in the palette, `{"cue": 1}`): every point knows its depth along the
+  view direction, so the ones behind the orbit target fade towards the background (up to 45%, with
+  a quadratic ramp so only the far ones recede) and their squares shrink. The near geometry
+  stands out from the wall behind it.
+
+Both live in the vertex shader of `crates/ui-egui/src/gpu3d.rs` and need no extra attachment: the
+depth is `dot(point − eye, forward)`, which works in the orthographic projection too (where
+`clip.w` is always 1). The uniform is a `repr(C)` struct of `f32` arrays, cast into the buffer with
+`bytemuck`, so the 16-byte vertex layout and the uniform layout are both exactly what the shader
+expects.
+
+### Colour ramps that survive outliers
+
+`Elevation` and `Intensity` map the value to the blue→red ramp. A single spike through the
+ceiling or one hot return would stretch the range and flatten the contrast of the other 99% of the
+points, so the ramp runs over the **2%–98% window** instead, computed at load time from a
+histogram (65 536 bins for Z, 256 for the intensity — no sorting of four million points). The
+values outside the window are clamped to its ends.
+
+
 
 The palette's **Draw 3D** turns the 3D view into a drafting surface (the `3DLINE` command is the
 same path for scripts):
@@ -343,7 +376,7 @@ buffer.
 - The CPU path (no GPU target) draws the same list as egui rectangles — slower, but clouds stay
   visible.
 
-## Limits (M7)
+## Limits (M9)
 
 - LAZ is read, not written; no COPC streaming yet — a file is opened in one pass.
 - No classification filter, no ortho PNG/GeoTIFF export, no intensity histogram.
@@ -355,9 +388,12 @@ buffer.
 - The 3D view draws clouds and 3D strokes only; the 2D drawing and the ViewCube are not part of it.
   It has no depth buffer, so points and strokes do not occlude each other (fine for translucent
   scans, wrong for solid surfaces later). The snap compensates by ranking the candidates by depth
-  and keeping only the front layer, but that is an approximation of a real depth test.
+  and keeping only the front layer, and the front wall cut and the depth cue make the picture
+  readable — but both are approximations of a real depth test, not a substitute for one.
 - The `Smooth` snap averages a 3 cm sphere, so details smaller than that are flattened; use `Exact`
   when the surface detail matters.
+- The 2%–98% window clips the extreme values: a point far above the others takes the top colour
+  instead of its own. That is the price of keeping the contrast of the rest.
 - 3D strokes live in the session: they survive closing the palette and switching to 2D, but not a
   restart. `3DEXPORT` is the way to keep them; the wrap-up into drawing entities waits for the 3D
   kernel.

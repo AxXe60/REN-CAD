@@ -36,6 +36,8 @@ log = "0.4"
 # All date/time conversion goes through chrono (no hand-rolled calendar code beyond the 400-year range extension; AGENTS.md).
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 rayon = "1"
+# GPU buffers: the uniform structs are cast straight into the buffer.
+bytemuck = { version = "1", features = ["derive"] }
 
 # rendering / formats
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }

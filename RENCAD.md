@@ -28,6 +28,8 @@ selecția, undo-ul și salvarea văd doar ce a desenat utilizatorul.
 | **Snap inteligent**: strat frontal (fără snap prin pereți) + mod Smooth/Exact | gata |
 | **Constrângeri 3D**: Z-lock (plan orizontal), Axis Ortho (Shift) | gata |
 | **Măsurare 3D**: lungime, dXY, dZ, pantă — live și ca comandă | gata |
+| **Claritate 3D fără depth buffer**: front wall cut + depth cue | gata |
+| **Contrast robust**: rampele folosesc percentilele 2%–98% | gata |
 | Layere pe stroke (DXF per layer) + închidere polilinie | gata |
 | Branding RENCAD (doar numele afișat) | gata |
 
@@ -48,6 +50,9 @@ LAS ──► 3DLINE ──► Session.sketch ───────────�
 - `level_for(px_per_m)` alege nivelul cu celula de ~2 pixeli pe ecran.
 - Intensitatea e întinsă pe intervalul benzii la construcție (nu `/257`), apoi colorată cu o rampă
   albastru→roșu.
+- Rampele (`Elevation`, `Intensity`) folosesc fereastra **2%–98%**, calculată la încărcare dintr-o
+  histogramă (65.536 bin-uri pentru Z, 256 pentru intensitate — fără sortare): câteva valori
+  extreme nu mai întind intervalul și nu mai șterg contrastul restului.
 - Fișierele > 8M puncte sunt subțiate la 5 mm la citire; `maxPoints` implicit 6M, `0` = toate
   punctele până la plafonul de 20M.
 
@@ -61,9 +66,16 @@ LAS ──► 3DLINE ──► Session.sketch ───────────�
 ### 3.3 Vederea 3D — `crates/ui-egui/src/view3d.rs` + `gpu3d.rs`
 - Înlocuiește canvasul în același dreptunghi; camera orbitează în jurul lui `target`, cu Z în sus.
 - Se încarcă doar bila din jurul țintei (rază `3 × dist`), pentru că e aceeași la orice unghi:
-  **orbitarea nu reconstruiește nimic**, doar scrie uniforma view-projection (80 bytes).
+  **orbitarea nu reconstruiește nimic**, doar scrie uniforma view-projection (144 bytes, `bytemuck`).
 - Buget: 3M puncte **vizibile**; nivelul e înrobit până încape. Zoom în → bila scade → nivelul fin
   devine accesibil exact unde se vede detaliul.
+- **Fără depth buffer** (pipeline-ul upstream folosește doar stencil). În locul lui:
+  - **Front wall cut** (`Cut`): punctele dintre ochi și `cut × dist` sunt aruncate în vertex shader
+    (vârful lor iese din volumul de clip, deci nu se desenează). Camera intră în cameră fără să
+    tai pereții din `LASCLIP`.
+  - **Depth cue** (`Cue`): adâncimea = `dot(p − ochi, forward)` (merge și în orto, unde `clip.w`
+    e mereu 1). Punctele din spatele țintei se estompează lin spre fundal (max. 45%, rampă
+    pătratică) și le scade pătratul → prim-planul iese în evidență.
 
 ### 3.4 Camera
 - `Projection::Perspective`: 35° vertical implicit (lentilă normală, fără fish-eye); slider 15–90°.
@@ -146,6 +158,7 @@ Exemplu:
   - **Draw 3D** / **Measure**, **Finish** / **Close** / **Cancel**, **Undo** / **Clear**.
   - **Smooth** / **Exact** (modul de snap), **Z lock**, **Ortho**, câmpul de layer.
   - **Persp/Ortho**, **Fit**, **Top/Front/Iso**, slider de **Lens** și mărimea punctului.
+  - **Cut** (front wall cut) și **Cue** (depth cue).
 
 ## 6. Performanță măsurată (Ap 1, București)
 
@@ -166,7 +179,7 @@ Exemplu:
 | Fișier | Rol |
 |---|---|
 | `crates/pointcloud/src/read.rs`, `slice.rs` | citire LAS/LAZ, bandă Z, flux |
-| `crates/pointcloud/src/cloud.rs` | `Cloud`, `CloudLevel`, piramidă, culori |
+| `crates/pointcloud/src/cloud.rs` | `Cloud`, `CloudLevel`, piramidă, culori, percentile 2%–98% |
 | `crates/pointcloud/src/sketch.rs` | `Sketch3d`, `Stroke3` (puncte, layer, closed) |
 | `crates/pointcloud/src/snap.rs` | strat frontal, centroid, Z-lock, axis-lock |
 | `crates/pointcloud/src/measure.rs` | lungime, dXY, dZ, pantă |
@@ -175,8 +188,8 @@ Exemplu:
 | `crates/engine/src/cmd/pointcloud.rs` | toate comenzile `LAS*` și `3D*` |
 | `crates/ui-egui/src/canvas.rs` | overlay-ul 2D și filtrarea la view |
 | `crates/ui-egui/src/gpu.rs` | pipeline-ul instanced 2D |
-| `crates/ui-egui/src/view3d.rs` | camera, culling, 3D drafting |
-| `crates/ui-egui/src/gpu3d.rs` | pipeline-ul 3D |
+| `crates/ui-egui/src/view3d.rs` | camera, culling, 3D drafting, cut + cue |
+| `crates/ui-egui/src/gpu3d.rs` | pipeline-ul 3D (front wall cut + depth cue în shader) |
 | `crates/ui-egui/src/palettes/pointcloud.rs` | paleta |
 | `docs/pointcloud.md` | documentația detaliată |
 
@@ -185,7 +198,10 @@ Exemplu:
 - LAZ doar citire; fără streaming COPC (fișierul se deschide dintr-o singură trecere).
 - Fără filtru pe clasificare, fără export ortho PNG/GeoTIFF, fără histogramă de intensitate.
 - Fără depth buffer în 3D: punctele nu se oclud reciproc (bine pentru nori translucizi). Snap-ul
-  prioritizează adâncimea, deci nu sare prin pereți, dar rămâne o aproximație.
+  prioritizează adâncimea, deci nu sare prin pereți, iar front wall cut + depth cue fac imaginea
+  lizibilă — dar rămân aproximații ale unui depth test adevărat.
+- Fereastra 2%–98% taie valorile extreme: un punct mult mai sus decât restul ia culoarea de sus,
+  nu a lui. E prețul contrastului restului.
 - Stroke-urile 3D trăiesc în sesiune; persistă doar prin `3DEXPORT`.
 - `maxPoints` limitează nivelul cel mai fin; peste el grila e înrobită (răspunsul comenzii spune cât).
 - Desenul 2D upstream e 2D; nu am împins Z prin entități, snap-uri și grip-uri.
@@ -214,3 +230,7 @@ Control (JSON lines pe `127.0.0.1:47902`): `engine.execute`, `cmdline.input`, `u
   polilinie, `3DMEASURE`): implementat, teste unitare în `crates/pointcloud` și
   `crates/engine`, verificat live pe fișierul real (Z constant pe stroke, segment pe axă,
   măsurare 8.184 m / dXY 7.731 / dZ 2.683, export cu layer).
+- M9 (claritate fără depth buffer: front wall cut + depth cue în shader; contrast robust prin
+  percentilele 2%–98%): implementat, teste unitare (uniformă `bytemuck`, shader WGSL validat cu
+  naga, percentile pentru Z și intensitate) și verificat live (zoom 30 → 15 m, 1.134.102 puncte pe
+  ecran, perechea față spate clar diferențiată, rampă elevation cu contrast plin).

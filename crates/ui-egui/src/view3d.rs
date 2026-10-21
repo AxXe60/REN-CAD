@@ -76,6 +76,13 @@ pub struct View3d {
     pub projection: Projection,
     /// Point square side, points.
     pub point_size: f32,
+    /// The front wall cut: the points closer to the camera than this fraction of the distance to
+    /// the target are dropped, so the camera can look into a room without cropping the walls out
+    /// of the cloud. 0 = off.
+    pub front_cut: f32,
+    /// How strong the depth cue is (0..1): the farthest points fade into the background and get
+    /// smaller. 1 fades them by 45%.
+    pub depth_cue: f32,
     /// Fit the camera to the clouds on the next frame.
     pub fitted: bool,
     /// The stroke being drawn, if 3D drafting is on.
@@ -172,6 +179,8 @@ impl Default for View3d {
             fov_y: 35.0_f64.to_radians(),
             projection: Projection::Perspective,
             point_size: 1.5,
+            front_cut: 0.0,
+            depth_cue: 1.0,
             fitted: false,
             draft: Draft3d::default(),
             key: None,
@@ -204,6 +213,27 @@ impl View3d {
         let right = [-sy, cy, 0.0];
         let up = [-cy * sp, -sy * sp, cp];
         (forward, right, up)
+    }
+
+    /// The unit vector the camera looks along.
+    pub fn forward(&self) -> [f64; 3] {
+        self.basis().0
+    }
+
+    /// The distance in front of the camera below which points are dropped (the front wall cut).
+    pub fn near_cut(&self) -> f64 {
+        (f64::from(self.front_cut) * self.dist).max(0.0)
+    }
+
+    /// How far behind the target the depth cue reaches its full strength.
+    pub fn cue_span(&self) -> f64 {
+        (self.dist * 2.0).max(1e-3)
+    }
+
+    /// The depth of the orbit target, where the depth cue starts: the points in front of it keep
+    /// their full colour and size.
+    pub fn target_depth(&self) -> f64 {
+        self.dist
     }
 
     /// World height of the view volume at the target plane: the pan step and the pixels-per-metre
@@ -739,6 +769,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     }
 
     if let Some(target) = app.canvas.gpu {
+        let bg = t.canvas;
+        let eye = app.view3d.eye();
+        let forward = app.view3d.forward();
         painter.add(egui_wgpu::Callback::new_paint_callback(
             rect,
             crate::gpu3d::Cloud3dCallback {
@@ -747,6 +780,13 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
                 view_proj: vp,
                 viewport: [rect.width(), rect.height()],
                 point_size: app.view3d.point_size,
+                eye: [eye[0] as f32, eye[1] as f32, eye[2] as f32],
+                forward: [forward[0] as f32, forward[1] as f32, forward[2] as f32],
+                near_cut: app.view3d.near_cut() as f32,
+                cue_span: app.view3d.cue_span() as f32,
+                target_depth: app.view3d.target_depth() as f32,
+                cue: app.view3d.depth_cue,
+                bg: [f32::from(bg.r()) / 255.0, f32::from(bg.g()) / 255.0, f32::from(bg.b()) / 255.0, 1.0],
                 stencil: target.stencil,
             },
         ));
@@ -1131,5 +1171,17 @@ mod tests {
     fn a_new_draft_writes_on_the_default_layer() {
         assert_eq!(Draft3d::default().layer, cadcraft_pointcloud::DEFAULT_LAYER);
         assert_eq!(Draft3d::default().tool, DraftTool::Draw);
+    }
+
+    /// The front wall cut and the depth cue are distances, so they follow the camera.
+    #[test]
+    fn the_cut_and_the_cue_follow_the_camera() {
+        let mut v = default_view();
+        v.dist = 20.0;
+        assert_eq!(v.near_cut(), 0.0, "the cut is off until it is asked for");
+        assert!((v.target_depth() - 20.0).abs() < 1e-9, "the cue starts at the target");
+        assert!((v.cue_span() - 40.0).abs() < 1e-9, "and reaches its strength two distances behind it");
+        v.front_cut = 0.3;
+        assert!((v.near_cut() - 6.0).abs() < 1e-5, "a third of the way to the target: {}", v.near_cut());
     }
 }

@@ -106,10 +106,17 @@ pub struct Cloud {
     pub origin: [f64; 2],
     pub zmin: f64,
     pub zmax: f64,
+    /// The 2nd and 98th percentiles of the band's Z: the elevation ramp uses them, so a few
+    /// isolated outliers do not stretch the ramp and flatten the contrast of the other 99%.
+    pub zp02: f64,
+    pub zp98: f64,
     /// The band's intensity range, so the ramp uses what the scanner recorded instead of the
     /// nominal 0–65535 (a typical indoor slice sits in a narrow dark band and would look black).
     pub imin: u16,
     pub imax: u16,
+    /// The same 2%–98% window for the intensity, in the 0..255 scale the vertices use.
+    pub ip02: u8,
+    pub ip98: u8,
     pub bounds: Bounds3,
     pub visible: bool,
     pub color: CloudColor,
@@ -152,6 +159,11 @@ impl Cloud {
         let (imin, imax) = slice.points.iter().fold((u16::MAX, 0u16), |(lo, hi), p| (lo.min(p.intensity), hi.max(p.intensity)));
         let (imin, imax) = if slice.points.is_empty() { (0, 65535) } else { (imin, imax) };
         let norm = Norm { lo: imin, span: u32::from(imax.saturating_sub(imin)) };
+        // The 2%–98% window of the Z and of the intensity: the colour ramps use it, so a handful
+        // of outliers (a spike through the ceiling, a hot return) cannot flatten the contrast of
+        // the other 99% of the points.
+        let (zp02, zp98) = z_percentiles(&slice.points, zmin, zmax);
+        let (ip02, ip98) = intensity_percentiles(&slice.points, norm);
         // No `decimate` (or `0`) means the source points themselves: the finest level keeps every
         // point of the band, up to the memory cap. A cell is the drafting answer for huge scans.
         let asked = decimate.filter(|c| *c > 0.0);
@@ -181,8 +193,12 @@ impl Cloud {
             origin,
             zmin,
             zmax,
+            zp02,
+            zp98,
             imin,
             imax,
+            ip02,
+            ip98,
             bounds: b,
             visible: true,
             color,
@@ -235,16 +251,86 @@ impl Cloud {
         match self.color {
             CloudColor::Rgb => v.rgb,
             // A spectrum, not grey: the band's darkest return reads blue and its brightest red,
-            // so two walls with slightly different returns stay distinguishable.
-            CloudColor::Intensity => ramp(f32::from(v.intensity) / 255.0),
+            // so two walls with slightly different returns stay distinguishable. The ramp runs
+            // over the 2%–98% window, so a few hot returns cannot flatten the rest.
+            CloudColor::Intensity => {
+                let span = f32::from(self.ip98) - f32::from(self.ip02);
+                let t = if span > 0.0 { (f32::from(v.intensity) - f32::from(self.ip02)) / span } else { 0.5 };
+                ramp(t.clamp(0.0, 1.0))
+            }
             CloudColor::Single(c) => c,
             CloudColor::Elevation => {
-                let span = self.zmax - self.zmin;
-                let t = if span > 0.0 { (f64::from(v.z) - self.zmin) / span } else { 0.5 };
+                let span = self.zp98 - self.zp02;
+                let t = if span > 0.0 { (f64::from(v.z) - self.zp02) / span } else { 0.5 };
                 ramp(t.clamp(0.0, 1.0) as f32)
             }
         }
     }
+}
+
+/// The bins of the Z histogram: 65536 keeps a half-metre wall resolvable even when one outlier
+/// stretches the range over a kilometre.
+const Z_BINS: usize = 65_536;
+/// The bins of the intensity histogram, in the 0..255 scale the vertices use.
+const INTENSITY_BINS: usize = 256;
+
+/// The 2nd and 98th percentile of a histogram over `[lo, hi]`, as values in the same range.
+fn bin_percentiles(counts: &[u32], lo: f64, hi: f64, total: usize) -> (f64, f64) {
+    if total == 0 || counts.len() < 2 {
+        return (lo, hi);
+    }
+    let step = (hi - lo) / (counts.len() - 1) as f64;
+    let low_at = (total as f64 * 0.02).ceil() as u64;
+    let high_at = (total as f64 * 0.98).floor() as u64;
+    let mut acc = 0u64;
+    let mut low = None;
+    let mut high = None;
+    for (i, c) in counts.iter().enumerate() {
+        acc += u64::from(*c);
+        if low.is_none() && acc >= low_at {
+            low = Some(lo + step * i as f64);
+        }
+        if acc >= high_at {
+            high = Some(lo + step * i as f64);
+            break;
+        }
+    }
+    match (low, high) {
+        (Some(l), Some(h)) if h > l => (l, h),
+        // A band that lives in one bin has no window: the full range is the honest answer.
+        _ => (lo, hi),
+    }
+}
+
+/// The 2nd and 98th percentile of the band's Z, from a histogram (no sorting of four million
+/// points).
+fn z_percentiles(points: &[crate::Pt], zmin: f64, zmax: f64) -> (f64, f64) {
+    if points.is_empty() || !zmin.is_finite() || !zmax.is_finite() {
+        return (zmin, zmax);
+    }
+    let mut hist = vec![0u32; Z_BINS];
+    let span = zmax - zmin;
+    for p in points {
+        let i = if span > 0.0 { (((p.z - zmin) / span) * (Z_BINS - 1) as f64).round() } else { 0.0 };
+        let i = (i as usize).min(Z_BINS - 1);
+        hist[i] = hist[i].saturating_add(1);
+    }
+    bin_percentiles(&hist, zmin, zmax, points.len())
+}
+
+/// The same window for the intensity, in the 0..255 scale the vertices store: a hot return
+/// cannot stretch the ramp and flatten the wall behind it.
+fn intensity_percentiles(points: &[crate::Pt], norm: Norm) -> (u8, u8) {
+    if points.is_empty() {
+        return (0, 255);
+    }
+    let mut hist = vec![0u32; INTENSITY_BINS];
+    for p in points {
+        let v = norm.u8(p.intensity) as usize;
+        hist[v.min(INTENSITY_BINS - 1)] = hist[v.min(INTENSITY_BINS - 1)].saturating_add(1);
+    }
+    let (lo, hi) = bin_percentiles(&hist, 0.0, 255.0, points.len());
+    (lo as u8, hi as u8)
 }
 
 /// Stretches 16-bit intensities to the band: the darkest becomes 0, the brightest 255.
@@ -425,5 +511,49 @@ mod tests {
     #[test]
     fn a_missing_file_is_an_error() {
         assert!(Cloud::open(Path::new("no-such-file.las"), "x".into(), 0.0, 1.0, None, 1000, CloudColor::Rgb).is_err());
+    }
+
+    /// A spike through the ceiling must not stretch the ramp: the wall keeps its gradient.
+    #[test]
+    fn outliers_do_not_flatten_the_elevation_ramp() {
+        let mut pts: Vec<crate::Pt> = (0..100).map(|i| pt(f64::from(i) * 0.01, 0.0, 2.0 + f64::from(i) * 0.005)).collect();
+        pts.push(pt(0.0, 0.0, 1000.0));
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2000.0, Some(0.001), slice_of(pts), 100_000, CloudColor::Elevation);
+        assert!((c.zp02 - 2.0).abs() < 0.05, "the window starts at the wall: {}", c.zp02);
+        assert!((c.zp98 - 2.5).abs() < 0.05, "and ends at its top: {}", c.zp98);
+        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p)).collect();
+        assert_ne!(colors[0], colors[99], "the wall still shows its gradient");
+        assert_eq!(colors[100], colors[99], "the spike takes the top colour");
+    }
+
+    /// The same for the intensity: one hot return cannot flatten the wall behind it.
+    #[test]
+    fn outliers_do_not_flatten_the_intensity_ramp() {
+        let mk = |x: f64, i: u16| crate::Pt { x, y: 0.0, z: 1.0, rgb: None, intensity: i };
+        let mut pts: Vec<crate::Pt> = (0..100).map(|i| mk(f64::from(i) * 0.01, 1000 + (i as u16) * 5)).collect();
+        pts.push(mk(5.0, 60000));
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.001), slice_of(pts), 100_000, CloudColor::Intensity);
+        let colors: Vec<[u8; 3]> = c.levels[0].pts.iter().map(|p| c.color_of(p)).collect();
+        assert_ne!(colors[0], colors[99], "the wall keeps its gradient");
+        assert_eq!(colors[100], colors[99], "the hot return takes the top colour");
+    }
+
+    /// Without an outlier the window is the band minus its 2% tails, so a clean scan keeps its
+    /// whole gradient.
+    #[test]
+    fn a_clean_band_uses_its_whole_range() {
+        let pts: Vec<crate::Pt> = (0..100).map(|i| pt(f64::from(i) * 0.01, 0.0, 1.0 + f64::from(i) * 0.01)).collect();
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 3.0, Some(0.001), slice_of(pts), 100_000, CloudColor::Elevation);
+        assert!((c.zp02 - c.zmin).abs() < 0.02, "the window starts at the floor: {} vs {}", c.zp02, c.zmin);
+        assert!((c.zp98 - (c.zmax - 0.02 * (c.zmax - c.zmin))).abs() < 0.02, "and ends at the 98th percentile: {} vs {}", c.zp98, c.zmax);
+    }
+
+    /// A band with one value has no window: the ramp sits in the middle instead of pretending.
+    #[test]
+    fn a_flat_band_does_not_panic() {
+        let pts: Vec<crate::Pt> = (0..10).map(|i| pt(f64::from(i) * 0.01, 0.0, 1.0)).collect();
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.001), slice_of(pts), 1000, CloudColor::Elevation);
+        let color = c.color_of(&c.levels[0].pts[0]);
+        assert!(color.iter().all(|v| *v < 255), "the mid ramp: {color:?}");
     }
 }

@@ -312,12 +312,42 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new("Lens").color(t.text_dim).size(12.0));
             let mut lens = app.view3d.fov_y.to_degrees();
             let slider = egui::Slider::new(&mut lens, 15.0..=90.0).suffix("°").fixed_decimals(0);
-            if ui.add(slider).on_hover_text("Vertical field of view: 35° is a normal lens, 15° a telephoto, 90° wide angle").changed() {
+            if ui
+                .add_sized([120.0, 18.0], slider)
+                .on_hover_text("Vertical field of view: 35° is a normal lens, 15° a telephoto, 90° wide angle")
+                .changed()
+            {
                 app.view3d.fov_y = lens.to_radians();
             }
             let mut size = app.view3d.point_size;
-            if ui.add(egui::Slider::new(&mut size, 0.5..=4.0).fixed_decimals(1).suffix(" pt")).changed() {
+            if ui.add_sized([70.0, 18.0], egui::Slider::new(&mut size, 0.5..=4.0).fixed_decimals(1).suffix(" pt")).changed() {
                 app.view3d.point_size = size;
+            }
+        });
+
+        // ---------- clarity without a depth buffer ----------
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Cut").color(t.text_dim).size(12.0));
+            let mut cut = app.view3d.front_cut;
+            if ui
+                .add_sized([170.0, 18.0], egui::Slider::new(&mut cut, 0.0..=0.9).fixed_decimals(2).suffix(" d"))
+                .on_hover_text("Front wall cut: drop the points between the camera and this fraction of the distance to the target, so you can look into a room without cropping the walls out of the cloud")
+                .changed()
+            {
+                app.view3d.front_cut = cut;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Cue").color(t.text_dim).size(12.0));
+            let mut cue = app.view3d.depth_cue;
+            if ui
+                .add_sized([170.0, 18.0], egui::Slider::new(&mut cue, 0.0..=1.0).fixed_decimals(2).suffix(" ×"))
+                .on_hover_text("Depth cue: the further a point is behind the target, the more it fades into the background and the smaller it gets")
+                .changed()
+            {
+                app.view3d.depth_cue = cue;
             }
         });
     }

@@ -115,8 +115,11 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         // Bare `ui.view3d` toggles; a call that only changes the camera or drafting keeps the state.
         let has_params = params.as_object().is_some_and(|o| !o.is_empty());
         let on = params.get("on").and_then(Value::as_bool).unwrap_or(if has_params { app.view3d.active } else { !app.view3d.active });
+        let was_on = app.view3d.active;
         app.view3d.active = on;
-        if on {
+        if on && !was_on {
+            // The view is coming on: frame the clouds once. A call that only moves the camera
+            // must not throw the framing away.
             app.view3d.fitted = false;
         }
         // Camera and drafting, so a script can drive what the palette's 3D section does.
@@ -169,6 +172,12 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         if let Some(layer) = params.get("layer").and_then(Value::as_str).map(str::trim).filter(|l| !l.is_empty()) {
             app.view3d.draft.layer = layer.to_string();
         }
+        if let Some(cut) = params.get("cut").and_then(Value::as_f64).filter(|v| v.is_finite()) {
+            app.view3d.front_cut = cut.clamp(0.0, 0.9) as f32;
+        }
+        if let Some(cue) = params.get("cue").and_then(Value::as_f64).filter(|v| v.is_finite()) {
+            app.view3d.depth_cue = cue.clamp(0.0, 1.0) as f32;
+        }
         if params.get("finish").and_then(Value::as_bool).unwrap_or(false) {
             crate::view3d::finish_draft(app, false);
         }
@@ -192,12 +201,16 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
             "points": app.view3d.drawn,
             "projection": app.view3d.projection.name(),
             "lens": app.view3d.fov_y.to_degrees(),
+            "dist": app.view3d.dist,
+            "target": app.view3d.target,
             "drawing": app.view3d.draft.active,
             "tool": app.view3d.draft.tool.name(),
             "snap": app.session.snap3d.name(),
             "zLock": app.view3d.draft.z_lock,
             "ortho3d": app.view3d.draft.ortho,
             "layer": app.view3d.draft.layer,
+            "frontCut": app.view3d.front_cut,
+            "depthCue": app.view3d.depth_cue,
             "strokeVertices": app.view3d.draft.points.len(),
             "measure": measure,
         })));

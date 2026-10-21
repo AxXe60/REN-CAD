@@ -57,7 +57,6 @@ field. `engine.commands` returns a separate command catalog, not a list of addit
 | `ui.click` / `ui.move` | `{x, y, button?, shift?, ctrl?}` | Real egui pointer events in screen points (reach every widget). |
 | `ui.drag` | `{x, y, to: [x, y], button?}` | Real press, move and release (drag the command line's top edge, the ViewCube ring…). |
 | `ui.wheel` | `{delta}` | Real mouse-wheel scroll at the pointer, in points: zooms the 2D canvas and the 3D view. |
-| `ui.view3d` | `{on?, projection?, lens?, view?, fit?, draw?, tool?, snap?, zlock?, ortho3d?, layer?, finish?, close?, cancel?}` | The 3D point cloud view (fork addition). Bare it toggles the view; with parameters it keeps the state and changes what is asked: `projection` `persp`/`ortho`, `lens` in degrees, `view` `top`/`front`/`iso`, `fit` re-frames, `tool` `draw`/`measure`/`off`, `snap` `smooth`/`exact`, `zlock` and `ortho3d` the drawing constraints, `layer` the DXF layer of the next stroke, `finish`/`close`/`cancel` end the stroke. Replies the projection, the lens, the tool, the snap mode, the constraint flags, the stroke vertices and the last measurement. |
 | `ui.key` / `ui.text` | `{key, cmd?, shift?, alt?}` / `{text}` | Synthetic keyboard input. |
 | `ui.set` | UiState fields | Show/hide palettes, toolbars, command line, ViewCube…; `theme: "system"\|"light"\|"dark"` (also `engine.execute` with `ui.theme {theme}`); `ui.inspect` reports the theme shown (`theme`: light/dark). `animations: "system"\|"on"\|"off"` (also `ui.animations {animations}`) shows or hides animation effects (dialog and menu fades, smoothed scrolling), `system` following the operating system's setting; `ui.inspect` reports whether they show (`animations`: true/false). `saveFormat: "dxf"\|"dwg"` (also `ui.saveformat {format}`) is the format Save As suggests for new drawings; `saveVersion: "2000"`…`"2018"` (also `ui.saveversion {version}`) the version it saves them in (SAVEAS also takes `version` and `binary` directly). |
 | `ui.resize` | `{width, height}` | Resize the window. |
@@ -73,6 +72,23 @@ in the nested `params.params` object, using `engine.execute` as the top-level me
 includes `open` and `document.bytes`, and the UI commands in the desktop app's catalog.
 `drawing.inspect` is also an engine command, but has an explicit top-level method; a dotted
 command id alone does not make it a protocol method.
+
+The point cloud view of the RENCAD fork is one of those UI commands, so it is driven with
+`engine.execute`:
+
+```json
+{"id":7,"method":"engine.execute","params":{"command":"ui.view3d",
+ "params":{"on":true,"projection":"ortho","view":"top","fit":true,"cut":0.3,"cue":1}}}
+```
+
+`ui.view3d` takes `on` (turn the 3D view on or off), `projection` (`persp`/`ortho`), `lens` (the
+vertical field of view in degrees), `view` (`top`/`front`/`iso`), `fit` (frame the clouds),
+`tool` (`draw`/`measure`/`off`), `snap` (`smooth`/`exact`), `zlock` and `ortho3d` (the drawing
+constraints), `layer` (the DXF layer of the next stroke), `cut` (the front wall cut, 0..0.9 of the
+distance to the target) and `cue` (the depth cue, 0..1), plus `finish`, `close` and `cancel` for
+the stroke being drawn. It replies the projection, the lens, the camera distance and target, the
+tool, the snap mode, the constraint flags, the cut and cue, the stroke vertices and the last
+measurement. `ui.panel.pointcloud` opens the palette.
 
 For example, inspect the drawing and list commands directly, then open a drawing and get its
 DXF bytes through `engine.execute` (one request per line):
