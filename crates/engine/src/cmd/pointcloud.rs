@@ -41,6 +41,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo(),
         CommandSpec::new("lascrs", "Set the Project CRS", lascrs).params("{epsg?: int, name?: string, reset?: bool}").enabled(always).noundo(),
+        CommandSpec::new("lasgeo", "Tie the Project to the Map", lasgeo).params("{lat: number, lon: number}").enabled(always).noundo(),
         CommandSpec::new("lasopacity", "Set the Cloud Opacity", lasopacity).params("{opacity?: number, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
@@ -482,6 +483,47 @@ fn lasopacity(s: &mut Session, p: &Value) -> Result<Value> {
         "message": format!("{}: the cloud is drawn at {:.0}%", s.clouds[i].name, opacity * 100.0),
         "index": i,
         "opacity": opacity,
+    }))
+}
+
+/// Tie the project to a point on the map.
+///
+/// A survey office says "this scan is at 44.1124° N, 24.9746° E"; the app turns that into the
+/// project's grid (Stereo 70, an UTM zone) and works out the local grid's own offsets: the file's
+/// coordinates minus the standard grid of that point. The offsets go into the WKT written next to
+/// an exported drawing, so the export lands where the survey office says it does, and the drawing's
+/// (0, 0, 0) moves to the declared point.
+fn lasgeo(s: &mut Session, p: &Value) -> Result<Value> {
+    let lat = number(p, "lat").ok_or_else(|| EngineError::Other("`lat` is required".into()))?;
+    let lon = number(p, "lon").ok_or_else(|| EngineError::Other("`lon` is required".into()))?;
+    let epsg = s.crs.as_ref().and_then(|c| c.epsg).ok_or_else(|| EngineError::Other("the project's CRS is not set: LASCRS {epsg} first".into()))?;
+    let grid = cadcraft_pointcloud::grid_from_lat_lon(epsg, cadcraft_pointcloud::LatLon { lat, lon })
+        .ok_or_else(|| EngineError::Other(format!("EPSG:{epsg} has no projection the fork knows")))?;
+    let Some(cloud) = s.clouds.first() else {
+        return Err(EngineError::Other("no cloud is open: the reference point is the middle of the first one".into()));
+    };
+    // The reference: the middle of the first cloud, in the file's own coordinates.
+    let b = cloud.bounds;
+    let reference = [(b.min[0] + b.max[0]) / 2.0, (b.min[1] + b.max[1]) / 2.0, b.min[2]];
+    // The local grid's offsets: the file's coordinates minus the standard grid of the same point.
+    let mut crs = s.crs.clone().unwrap_or_default();
+    crs.false_easting = reference[0] - grid[0];
+    crs.false_northing = reference[1] - grid[1];
+    s.crs = Some(crs.clone());
+    // The drawing's (0, 0, 0) is the declared point, which is the middle of the cloud.
+    s.local_origin = reference;
+    Ok(json!({
+        "message": format!(
+            "the project is at {lat:.7}, {lon:.7} — EPSG:{epsg} {:.2}, {:.2}; the local grid is E {:+.2} N {:+.2}",
+            grid[0], grid[1], crs.false_easting, crs.false_northing
+        ),
+        "lat": lat,
+        "lon": lon,
+        "epsg": epsg,
+        "grid": grid,
+        "reference": reference,
+        "origin": s.local_origin,
+        "crs": crs_json(&Some(crs)),
     }))
 }
 

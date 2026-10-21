@@ -319,18 +319,23 @@ project), so the project declares it: `LASCRS {epsg, name?, falseEasting?, false
 The offsets are the local grid's own: a survey office that writes the Stereo 70 northing without
 its leading millions needs `falseNorthing`, or the export lands kilometres from the truth.
 
+`LASGEO {lat, lon}` ties the project to a point on the map: the app projects that point into
+the project's grid (Stereo 70, an UTM zone — the standard Transverse Mercator series on GRS 80)
+and works out the local grid's offsets as *the file's coordinates minus the standard grid of that
+point*. The offsets go into the WKT, and the drawing's (0, 0, 0) moves to the declared point.
+
 ```json
-{"command":"lascrs","params":{"epsg":31700,"falseNorthing":-4000000}}
+{"command":"lascrs","params":{"epsg":31700}}
+{"command":"lasgeo","params":{"lat":44.1124385745297,"lon":24.974564167361805}}
 ```
 
 ```json
-{"message":"the project is in EPSG:31700 (Stereo 70 (Romania))",
- "crs":{"epsg":31700,"name":"Stereo 70 (Romania)","geographic":false,"wkt":false,
-        "falseEasting":0,"falseNorthing":-4000000}}
+{"message":"the project is at 44.1124386, 24.9745642 — EPSG:31700 497964.36, 7884400.12; the local grid is E +39.40 N -7594110.45",
+ "grid":[497964.36,7884400.12],"reference":[498003.76,290289.67,101.311]}
 ```
 
-The fork does not reproject: the drawing is 2D in local units, and a scan is placed where its file
-puts it. A file that names no system says so plainly instead of pretending.
+The fork does not reproject the points: the drawing is 2D in local units, and a scan is placed
+where its file puts it. A file that names no system says so plainly instead of pretending.
 
 ### `LASORIGIN {x?, y?, z?, reset?}` · `LASCRS {epsg?, name?, reset?}`
 

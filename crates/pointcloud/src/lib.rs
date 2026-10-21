@@ -13,6 +13,7 @@
 mod cloud;
 mod crs;
 mod dxf;
+mod geo;
 mod ground;
 mod measure;
 mod read;
@@ -23,6 +24,7 @@ mod snap;
 pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
 pub use crs::{Crs, epsg_from_wkt};
 pub use dxf::{SKETCH_RGB, write_points_dxf, write_strokes_dxf};
+pub use geo::{LatLon, grid_from_lat_lon};
 pub use ground::{CLASS_GROUND, CLASS_NOISE, CLASS_UNCLASSIFIED, GroundOptions, GroundResult, classify, classify_with};
 pub use measure::{Measure, measure, readout};
 pub use read::{CloudInfo, read_info};
