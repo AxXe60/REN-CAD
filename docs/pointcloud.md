@@ -190,9 +190,12 @@ script cannot drift apart.
   drop the ceiling, raise the Z minimum for the floor, pull X and Y in for the walls; untick it to
   restore every point (the file is not re-read).
 - **Find ground** classifies the floor (see below) and **Ground only** draws just that.
+- **Opacity** makes the cloud transparent; the 3D view thins the points (the x-ray), so the drawing
+  under the cloud stays readable.
 - The count line says whether the finest level is the source points, and the line under it names
   the coordinate reference system the file carries (`CRS: EPSG:32610 · WGS 84 / UTM zone 10N`), or
-  says that the file names none.
+  says that the file names none. The next line is the **site origin**: the world point that sits at
+  the drawing's (0, 0, 0).
 - When the 3D view is on, the camera controls appear: **Persp/Ortho**, **Fit**, **Top/Front/Iso**,
   the **Lens** slider and the point size.
 - Below them, the clarity controls: **Cut** (the front wall cut) and **Cue** (the depth cue).
@@ -259,6 +262,31 @@ ceiling or one hot return would stretch the range and flatten the contrast of th
 points, so the ramp runs over the **2%–98% window** instead, computed at load time from a
 histogram (65 536 bins for Z, 256 for the intensity — no sorting of four million points). The
 values outside the window are clamped to its ends.
+
+### Seeing through the cloud
+
+A dense cloud hides the drawing under it, and without a depth buffer the points in front and
+behind pile up: a wall seen edge-on becomes a solid slab of pixels, and the line drawn over it
+disappears.
+
+`LASOPACITY {opacity?, index?}` makes the cloud transparent (5%..=100%; without a value it
+toggles between opaque and a third). Two things happen at once:
+
+- the points are **thinned** by a deterministic mask on their index, so the wall keeps its shape
+  but stops being a solid slab — the x-ray, and the reason the drawing under it stays readable;
+- the colour and its alpha are scaled together, so the cloud fades into the background instead of
+  turning into a flat grey.
+
+The 2D overlay uses the same opacity (the render list's transparency), the 3D view the shader's
+alpha. The mask lives in the vertex shader, so it costs nothing per frame.
+
+```json
+{"command":"lasopacity","params":{"opacity":0.35}}
+```
+
+```json
+{"message":"Curte ulei: the cloud is drawn at 35%","index":0,"opacity":0.35}
+```
 
 ### The ground under the cloud
 

@@ -99,6 +99,9 @@ workflow a survey office actually does — open the scan, cut it, look at it, tr
 | M10b | A vertical section through the cloud: cut it with a plane, get a profile polyline, export it as a drawing (≈ 6–10 h) | planned |
 | M10c | COPC read on the octree (level + bounds query, so only the points in view are fetched) and LAZ writing (≈ 10–16 h) | planned |
 | M12 | A streaming LOD: the levels built while the file is read, so a 50-million-point survey keeps its walls sharp instead of thinning evenly (≈ 12–20 h) | planned |
+| M13 | **Seeing through the cloud**: `LASOPACITY` and a deterministic mask in the vertex shader, so a wall seen edge-on stops hiding the drawing | done |
+| M14 | The camera: the orbit target follows the point under the cursor, the presets animate, a walk mode locks the eye's height | planned |
+| M15 | The palette: a floating camera bar, collapsible sections, a mini Z-histogram behind the crop slider | planned |
 | Next | Reprojection, a height/DSM grid, the 3D strokes as drawing entities | planned |
 
 The fork's own overview is [RENCAD.md](RENCAD.md); the detail is [docs/pointcloud.md](docs/pointcloud.md).

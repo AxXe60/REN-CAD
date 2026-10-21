@@ -41,6 +41,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo(),
         CommandSpec::new("lascrs", "Set the Project CRS", lascrs).params("{epsg?: int, name?: string, reset?: bool}").enabled(always).noundo(),
+        CommandSpec::new("lasopacity", "Set the Cloud Opacity", lasopacity).params("{opacity?: number, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasclouds", "List Point Clouds", |s, _| lasclouds(s)).params("{}").enabled(always).noundo(),
@@ -449,6 +450,30 @@ fn lascrs(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// How opaque a cloud is drawn.
+///
+/// A dense cloud hides the drawing under it. With the opacity down, the 3D view thins the points
+/// by a deterministic mask (the x-ray), so a wall seen edge-on does not become a solid slab of
+/// pixels, and the lines drawn over the cloud stay readable.
+fn lasopacity(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let opacity = match number(p, "opacity") {
+        Some(v) => v,
+        None => {
+            // Without a value the opacity toggles between opaque and half.
+            let current = s.clouds[i].opacity;
+            if current > 0.6 { 0.35 } else { 1.0 }
+        }
+    };
+    s.clouds[i].set_opacity(opacity as f32);
+    let opacity = s.clouds[i].opacity;
+    Ok(json!({
+        "message": format!("{}: the cloud is drawn at {:.0}%", s.clouds[i].name, opacity * 100.0),
+        "index": i,
+        "opacity": opacity,
+    }))
+}
+
 /// Show or hide a cloud; without `visible` it toggles.
 fn lasvisible(s: &mut Session, p: &Value) -> Result<Value> {
     let i = cloud_index(s, p)?;
@@ -718,6 +743,27 @@ mod tests {
         let text = std::fs::read_to_string(&out2).unwrap_or_default();
         assert!(text.contains("WALLS"), "{text}");
         assert!(!text.contains(cadcraft_pointcloud::DEFAULT_LAYER), "{text}");
+    }
+
+    #[test]
+    fn the_opacity_is_clamped_and_toggles() {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let mut b = Bounds3::EMPTY;
+        b.add(0.0, 0.0, 0.0);
+        b.add(2.0, 2.0, 3.0);
+        let slice = Slice { points: vec![Pt { x: 1.0, y: 1.0, z: 1.0, rgb: None, intensity: 0, class: 1 }], total: 1, in_band: 1, bounds: b };
+        let mut s = Session::new();
+        s.clouds.push(Cloud::from_slice("t".into(), String::new(), 0.0, 3.0, None, slice, 1000, CloudColor::Rgb));
+        assert_eq!(s.clouds[0].opacity, 1.0, "opaque by default");
+        let r = lasopacity(&mut s, &json!({ "opacity": 0.3 })).ok();
+        assert_eq!(r.as_ref().and_then(|v| v["opacity"].as_f64()), Some(0.3f32 as f64));
+        lasopacity(&mut s, &json!({ "opacity": 5.0 })).ok();
+        assert_eq!(s.clouds[0].opacity, 1.0, "above 1 is opaque");
+        lasopacity(&mut s, &json!({ "opacity": 0.0 })).ok();
+        assert_eq!(s.clouds[0].opacity, 0.05, "below 5% is not drawn at all");
+        lasopacity(&mut s, &json!({ "opacity": f64::NAN })).ok();
+        assert!(s.clouds[0].opacity.is_finite(), "a broken number changes nothing");
+        assert!(s.clouds[0].opacity >= 0.05 && s.clouds[0].opacity <= 1.0, "and stays in range");
     }
 
     #[test]

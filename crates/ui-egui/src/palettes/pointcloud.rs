@@ -199,6 +199,20 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             run(app, "lasground", json!({ "index": selected, "show": only }));
         }
     });
+    // How opaque the cloud is: below 1 the 3D view thins the points (the x-ray), so the drawing
+    // under the cloud stays readable.
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Opacity").color(t.text_dim).size(12.0));
+        let mut opacity = app.session.clouds[selected].opacity;
+        if ui
+            .add_sized([150.0, 18.0], egui::Slider::new(&mut opacity, 0.05..=1.0).fixed_decimals(2).suffix(" ×"))
+            .on_hover_text("How opaque the cloud is drawn. Below 1 the points are thinned, so a wall seen edge-on does not hide the drawing under it")
+            .changed()
+        {
+            run(app, "lasopacity", json!({ "index": selected, "opacity": opacity }));
+        }
+    });
 
     // ---------- info ----------
     ui.add_space(8.0);

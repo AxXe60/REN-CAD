@@ -46,8 +46,12 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M10c | COPC on the octree (read only the levels and bounds in view) and LAZ writing (≈ 10–16 h) | planned |
 | M11d | Reprojection between CRSs, so a scan and a georeferenced drawing can share a frame (≈ 12–20 h) | planned |
 | M12 | A streaming LOD: the levels built while the file is read, so a huge survey keeps its walls sharp (≈ 12–20 h) | planned |
+| M13 | **Seeing through the cloud**: `LASOPACITY` plus a deterministic mask in the vertex shader, so a wall seen edge-on stops hiding the drawing (done) | done |
+| M14 | **The camera**: the orbit target follows the point under the cursor (the front-layer snap), the presets (Top/Front/Iso) animate instead of jumping, and a walk mode locks the eye's height for interiors (≈ 10–16 h) | planned |
+| M15 | **The palette**: a floating camera bar over the 3D view, collapsible sections, a mini Z-histogram behind the crop slider (≈ 8–14 h) | planned |
 | M11 | The 3D strokes as real drawing entities — waits for the 3D kernel, so the upstream's own 3D milestone is the blocker | planned |
 | M13 | A height/DSM grid over the band, with contours (≈ 12–18 h) | planned |
+| M14 | A local cache of the decimated pyramid next to the scan, so a 1.8 GB survey opens in a second the second time (≈ 6–10 h) | planned |
 
 M10b is the next one that can land without the upstream's 3D kernel.
 

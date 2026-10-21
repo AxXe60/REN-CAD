@@ -49,6 +49,9 @@ pub struct View3dUniform {
     pub forward: [f32; 4],
     /// The background colour (sRGB), the far end of the depth cue.
     pub bg: [f32; 4],
+    /// x: the cloud's opacity, y: whether the x-ray mask is on, z: the opacity as a byte (the
+    /// mask's threshold), w: unused.
+    pub misc: [f32; 4],
 }
 
 const UNIFORM3D_SIZE: u64 = std::mem::size_of::<View3dUniform>() as u64;
@@ -93,6 +96,11 @@ pub struct Cloud3dCallback {
     pub cue: f32,
     /// The background colour (sRGB), the far end of the depth cue.
     pub bg: [f32; 4],
+    /// The cloud's opacity (0..1) and whether the x-ray mask is on.
+    pub opacity: f32,
+    /// Thin the points by a deterministic mask on the instance index, so a wall seen edge-on does
+    /// not become a solid slab of pixels when the cloud is semi-transparent.
+    pub xray: bool,
     /// The render target's stencil format, so the pipeline matches the pass (depth stays off).
     pub stencil: Option<wgpu::TextureFormat>,
 }
@@ -227,6 +235,7 @@ impl egui_wgpu::CallbackTrait for Cloud3dCallback {
             eye: [self.eye[0], self.eye[1], self.eye[2], 0.0],
             forward: [self.forward[0], self.forward[1], self.forward[2], 0.0],
             bg: self.bg,
+            misc: [self.opacity, if self.xray { 1.0 } else { 0.0 }, (self.opacity.clamp(0.0, 1.0) * 255.0).round(), 0.0],
         };
         queue.write_buffer(&res.uniform, 0, bytemuck::bytes_of(&uniform));
         Vec::new()
@@ -265,6 +274,9 @@ struct View {
     forward: vec4<f32>,
     // the background colour (sRGB), the far end of the depth cue
     bg: vec4<f32>,
+    // x: the cloud's opacity, y: the x-ray mask on, z: the opacity as a byte (the mask's
+    // threshold), w: unused
+    misc: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> view: View;
 
@@ -287,6 +299,7 @@ fn out_color(c: vec4<f32>) -> vec4<f32> {
 @vertex
 fn vs(
     @builtin(vertex_index) vi: u32,
+    @builtin(instance_index) ii: u32,
     @location(0) p: vec3<f32>,
     @location(1) c: vec4<f32>,
 ) -> VOut {
@@ -295,6 +308,18 @@ fn vs(
     // do it in perspective, but the orthographic projection leaves it at 1.
     let depth = dot(p - view.eye.xyz, view.forward.xyz);
     var out: VOut;
+    // The x-ray: with a semi-transparent cloud the points are thinned by a deterministic mask on
+    // the instance index, so a wall seen edge-on does not turn into a solid slab of pixels. Without
+    // a depth buffer this is what keeps the drawing under the cloud readable.
+    let opacity = clamp(view.misc.x, 0.0, 1.0);
+    if (view.misc.y > 0.5 && opacity < 0.999) {
+        let h = (ii * 2654435761u >> 16) & 0xFFu;
+        if (h >= u32(view.misc.z)) {
+            out.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+            out.color = vec4<f32>(0.0);
+            return out;
+        }
+    }
     // The front wall cut: the points between the eye and the cut are dropped, so the camera can
     // look into a room without cropping the walls out of the cloud. The vertex goes outside the
     // clip volume, so nothing is drawn for it.
@@ -310,7 +335,8 @@ fn vs(
     let t = clamp((depth - view.clip.z) / span, 0.0, 1.0);
     let far = t * t;
     let cue = view.clip.w * far;
-    var col = vec4<f32>(mix(c.rgb, view.bg.rgb, cue * 0.45), c.a);
+    // The colour is premultiplied: the opacity scales the colour and its alpha together.
+    var col = vec4<f32>(mix(c.rgb, view.bg.rgb, cue * 0.45) * opacity, c.a * opacity);
     // Two counter-clockwise triangles in the 2x2 screen square:
     // 0,1,2 = (-1,-1), (1,-1), (-1,1) and 3,4,5 = (-1,-1), (-1,1), (1,1).
     let second = vi >= 3u;
@@ -341,7 +367,7 @@ mod tests {
     /// member must sit where WGSL expects it (16-byte aligned, 144 bytes in all).
     #[test]
     fn the_uniform_layout_is_ready_for_the_gpu() {
-        assert_eq!(std::mem::size_of::<View3dUniform>(), 144);
+        assert_eq!(std::mem::size_of::<View3dUniform>(), 160);
         assert_eq!(UNIFORM3D_SIZE % 16, 0);
         let u = View3dUniform {
             view_proj: [0.0; 16],
@@ -350,6 +376,7 @@ mod tests {
             eye: [9.0, 10.0, 11.0, 0.0],
             forward: [12.0, 13.0, 14.0, 0.0],
             bg: [0.25, 0.5, 0.75, 1.0],
+            misc: [0.35, 1.0, 0.0, 0.0],
         };
         let bytes = bytemuck::bytes_of(&u);
         let at = |offset: usize| f32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
@@ -358,7 +385,8 @@ mod tests {
         assert_eq!(at(96), 9.0, "eye");
         assert_eq!(at(112), 12.0, "forward");
         assert_eq!(at(128), 0.25, "bg");
-        for offset in [0, 64, 80, 96, 112, 128] {
+        assert_eq!(at(144), 0.35, "misc");
+        for offset in [0, 64, 80, 96, 112, 128, 144] {
             assert_eq!(offset % 16, 0, "every member is 16-byte aligned");
         }
     }

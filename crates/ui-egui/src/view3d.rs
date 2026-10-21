@@ -450,6 +450,7 @@ fn scene_key(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudL
         c.name.hash(&mut hasher);
         c.color.name().hash(&mut hasher);
         c.ground_only.hash(&mut hasher);
+        c.opacity.to_bits().hash(&mut hasher);
         if let CloudColor::Single([r, g, b]) = c.color {
             (r, g, b).hash(&mut hasher);
         }
@@ -799,6 +800,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
                 target_depth: app.view3d.target_depth() as f32,
                 cue: app.view3d.depth_cue,
                 bg: [f32::from(bg.r()) / 255.0, f32::from(bg.g()) / 255.0, f32::from(bg.b()) / 255.0, 1.0],
+                opacity: app.session.clouds.iter().filter(|c| c.visible).map(|c| c.opacity).fold(1.0f32, |a, b| a.min(b)),
+                xray: true,
                 stencil: target.stencil,
             },
         ));

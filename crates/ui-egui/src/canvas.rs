@@ -719,6 +719,7 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
         (c.name.as_str(), c.color.name(), c.points()).hash(&mut hasher);
         level.cell.to_bits().hash(&mut hasher);
         c.ground_only.hash(&mut hasher);
+        c.opacity.to_bits().hash(&mut hasher);
         if let cadcraft_pointcloud::CloudColor::Single([r, g, b]) = c.color {
             (r, g, b).hash(&mut hasher);
         }
@@ -746,12 +747,14 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
         }
         let len = list.verts.len() as u32 - start;
         if len > 0 {
+            // The transparency is a percentage; the cloud's opacity is the other way round.
+            let transparency = (((1.0 - c.opacity.clamp(0.05, 1.0)) * 100.0).round() as u8).min(90);
             list.prims.push(cadcraft_render::DPrim {
                 handle: Handle(0),
                 color: Rgb(255, 255, 255),
                 aci7: false,
                 lw: 0.0,
-                transparency: 0,
+                transparency,
                 kind: Kind::Cloud,
                 start,
                 len,

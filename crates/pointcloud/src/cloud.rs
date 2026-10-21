@@ -127,6 +127,9 @@ pub struct Cloud {
     pub clip: Option<Clip>,
     /// Draw only the points the ground filter found.
     pub ground_only: bool,
+    /// How opaque the cloud is drawn (0.05..=1.0). Below 1 the 3D view thins the points by a
+    /// deterministic mask, so the drawing under the cloud stays readable.
+    pub opacity: f32,
     /// Where the file says it is (the EPSG code and the WKT), when it says anything.
     pub crs: Option<crate::Crs>,
     /// Finest first.
@@ -211,6 +214,7 @@ impl Cloud {
             color,
             clip: None,
             ground_only: false,
+            opacity: 1.0,
             crs: None,
             levels,
             full_points: slice.in_band as usize,
@@ -240,6 +244,11 @@ impl Cloud {
     pub fn with_crs(mut self, crs: Option<crate::Crs>) -> Self {
         self.crs = crs;
         self
+    }
+
+    /// How opaque the cloud is drawn, clamped to what the display can show (5%..=100%).
+    pub fn set_opacity(&mut self, opacity: f32) {
+        self.opacity = if opacity.is_finite() { opacity.clamp(0.05, 1.0) } else { 1.0 };
     }
 
     pub fn points(&self) -> usize {
