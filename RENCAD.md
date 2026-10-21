@@ -170,6 +170,7 @@ Toate sunt `CommandSpec`, deci merg din linia de comandă, CLI, control JSON și
 | `LASEXPORT {path,out,z0?,z1?,decimate?,layer?}` | bandă → DXF de `POINT` |
 | `LASOPEN {path,z0?,z1?,decimate?,maxPoints?,color?,name?}` | deschide norul în sesiune |
 | `LASCOLOR {mode,index?}` | `rgb`, `elevation`, `intensity`, `single:#rrggbb` |
+| `LASPECTRUM {spectrum?,index?}` | scara de intensitate: `grey`, `bluered`, `viridis`, `turbo`, `magma`, `diverging` |
 | `LASDECIMATE {cell,index?}` | re-citește la altă celulă; `0` = toate punctele |
 | `LASCLIP {min,max,index?}` / `{reset:true}` | crop box (tavan/pereți/podea) |
 | `LASVISIBLE {visible?,index?}` | arată/ascunde |

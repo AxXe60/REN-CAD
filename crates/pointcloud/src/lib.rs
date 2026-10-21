@@ -21,6 +21,7 @@ mod read;
 mod sketch;
 mod slice;
 mod snap;
+mod spectrum;
 
 pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
 pub use compare::{DeviationStats, deviation_color, distances, stats};
@@ -33,6 +34,7 @@ pub use read::{CloudInfo, read_info};
 pub use sketch::{DEFAULT_LAYER, Sketch3d, Stroke3};
 pub use slice::{Pt, Slice, slice, slice_capped};
 pub use snap::{FRONT_LAYER_M, SMOOTH_RADIUS_M, SnapHit, SnapMode, axis_locked, front_layer, nearest, smooth_centroid, z_locked};
+pub use spectrum::Spectrum;
 
 /// An axis-aligned box in world units.
 #[derive(Clone, Copy, Debug, PartialEq)]

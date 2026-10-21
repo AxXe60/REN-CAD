@@ -142,6 +142,8 @@ pub struct Cloud {
     pub dev_scale: f32,
     /// The statistics of the last comparison, when the cloud was compared with a reference.
     pub dev_stats: Option<crate::compare::DeviationStats>,
+    /// The colour scale the intensity and the elevation bands are read on.
+    pub spectrum: crate::spectrum::Spectrum,
     /// The band's heights in 64 bins, so the palette can draw the scan's profile and the user can
     /// see where the floor and the ceiling are.
     pub zhisto: [u32; 64],
@@ -232,6 +234,7 @@ impl Cloud {
             opacity: 1.0,
             dev_scale: 1.0,
             dev_stats: None,
+            spectrum: crate::spectrum::Spectrum::BlueRed,
             zhisto: heights(&slice.points, zmin, zmax),
             crs: None,
             levels,
@@ -326,7 +329,7 @@ impl Cloud {
             CloudColor::Intensity => {
                 let span = f32::from(self.ip98) - f32::from(self.ip02);
                 let t = if span > 0.0 { (f32::from(v.intensity) - f32::from(self.ip02)) / span } else { 0.5 };
-                ramp(t.clamp(0.0, 1.0))
+                self.spectrum.apply(t.clamp(0.0, 1.0))
             }
             CloudColor::Single(c) => c,
             CloudColor::Deviation => match deviation {
@@ -336,7 +339,7 @@ impl Cloud {
             CloudColor::Elevation => {
                 let span = self.zp98 - self.zp02;
                 let t = if span > 0.0 { (f64::from(v.z) - self.zp02) / span } else { 0.5 };
-                ramp(t.clamp(0.0, 1.0) as f32)
+                self.spectrum.apply(t.clamp(0.0, 1.0) as f32)
             }
         }
     }
@@ -527,16 +530,6 @@ fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> (Vec<C
 }
 
 /// Blue → cyan → green → yellow → red, the drafting-friendly stand-in for a turbo ramp.
-fn ramp(t: f32) -> [u8; 3] {
-    const STOPS: [[f32; 3]; 5] = [[0.16, 0.20, 0.55], [0.15, 0.60, 0.85], [0.20, 0.80, 0.45], [0.95, 0.85, 0.25], [0.90, 0.20, 0.15]];
-    let x = t.clamp(0.0, 1.0) * (STOPS.len() - 1) as f32;
-    let i = (x.floor() as usize).min(STOPS.len() - 2);
-    let f = x - i as f32;
-    let (a, b) = (STOPS[i], STOPS[i + 1]);
-    let mix = |k: usize| ((a[k] * (1.0 - f) + b[k] * f) * 255.0).round().clamp(0.0, 255.0) as u8;
-    [mix(0), mix(1), mix(2)]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +691,29 @@ mod tests {
     }
 
     /// A band with one value has no window: the ramp sits in the middle instead of pretending.
+    #[test]
+    fn the_intensity_is_read_on_the_chosen_scale() {
+        let mut c = Cloud::from_slice(
+            "t".into(),
+            String::new(),
+            0.0,
+            1.0,
+            Some(0.01),
+            slice_of(vec![pt(0.0, 0.0, 0.5), pt(1.0, 0.0, 0.5)]),
+            100_000,
+            CloudColor::Intensity,
+        );
+        let default = c.color_of(&c.levels[0].pts[0], None);
+        c.spectrum = crate::spectrum::Spectrum::Grey;
+        let as_grey = c.color_of(&c.levels[0].pts[0], None);
+        c.spectrum = crate::spectrum::Spectrum::Viridis;
+        let as_viridis = c.color_of(&c.levels[0].pts[0], None);
+        assert_ne!(as_grey, as_viridis, "the scale changes the colour");
+        assert_eq!(as_grey[0], as_grey[1], "the grey scale has no hue");
+        assert_eq!(as_grey[1], as_grey[2]);
+        assert_ne!(default, as_viridis, "the default scale is not the viridis one");
+    }
+
     #[test]
     fn a_flat_band_does_not_panic() {
         let pts: Vec<crate::Pt> = (0..10).map(|i| pt(f64::from(i) * 0.01, 0.0, 1.0)).collect();

@@ -1395,3 +1395,8 @@
 	RENCAD draws in the World Coordinate System; user coordinate systems aren't available yet.	RENCAD малює в Світовій системі координат; користувацькі системи координат ще недоступні.
 	Tie the Project to the Map	Прив'язати проєкт до мапи
 	Compare Two Clouds	Порівняти дві хмари
+	Choose the Intensity Scale	Вибрати шкалу інтенсивності
+	Grey	Сірий
+	Blue to red	Синій-червоний
+	Diverging	Дивергентна
+	Intensity scale	Шкала інтенсивності

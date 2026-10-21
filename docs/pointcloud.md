@@ -115,6 +115,26 @@ and `single:#rrggbb` (or just `#rrggbb`) one flat colour.
 {"index":0,"color":"intensity","message":"Ap 1: colour intensity"}
 ```
 
+### `LASPECTRUM {spectrum?, index?}`
+
+Chooses the colour scale the intensity (and the elevation) band is read on. Six scales, all drawn
+in code — nothing imported, nothing licensed:
+
+| Scale | What it is for |
+|---|---|
+| `grey` | the black-and-white of the printed report |
+| `bluered` | the thermal scale of the screen (the default) |
+| `viridis` | even steps of light: a weak difference is still a difference |
+| `turbo` | the rainbow, ordered so it does not repeat itself |
+| `magma` | the scale of a relief |
+| `diverging` | the scale of the comparison |
+
+```json
+{"index":0,"spectrum":"viridis","message":"Ap 1: the intensity is read on the Viridis scale"}
+```
+
+Without a name the command walks to the next scale — the palette's row of buttons does the same.
+
 ### `LASDECIMATE {cell, index?}`
 
 Re-reads the file at a new grid cell, keeping the band, the name, the colour mode and the crop —

@@ -44,6 +44,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("lasgeo", "Tie the Project to the Map", lasgeo).params("{lat: number, lon: number}").enabled(always).noundo(),
         CommandSpec::new("lascmp", "Compare Two Clouds", lascmp).params("{index?: int, reference?: int, cell?: number}").enabled(always).noundo(),
         CommandSpec::new("lasopacity", "Set the Cloud Opacity", lasopacity).params("{opacity?: number, index?: int}").enabled(always).noundo(),
+        CommandSpec::new("lpectrum", "Choose the Intensity Scale", lpectrum).params("{spectrum?: string, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasclouds", "List Point Clouds", |s, _| lasclouds(s)).params("{}").enabled(always).noundo(),
@@ -283,6 +284,35 @@ fn lascolor(s: &mut Session, p: &Value) -> Result<Value> {
         }),
         "index": i,
         "color": mode.name(),
+    }))
+}
+
+/// Choose the colour scale the intensity (and the elevation) band is read on.
+///
+/// The scales are drawn in code — grey, the thermal blue-to-red, viridis, turbo, magma, the
+/// diverging scale — and the user picks the one the report is read on.
+fn lpectrum(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let wanted = text(p, "spectrum").ok();
+    let spectrum = match wanted {
+        Some(text) => cadcraft_pointcloud::Spectrum::parse(text)
+            .ok_or_else(|| EngineError::Other(format!("unknown scale `{text}`: grey, bluered, viridis, turbo, magma, diverging")))?,
+        None => {
+            // Without a name, the next scale of the list: the palette's button walks through them.
+            let current = s.clouds.get(i).map(|c| c.spectrum).unwrap_or(cadcraft_pointcloud::Spectrum::BlueRed);
+            let at = cadcraft_pointcloud::Spectrum::ALL.iter().position(|s| *s == current).unwrap_or(0);
+            cadcraft_pointcloud::Spectrum::ALL[(at + 1) % cadcraft_pointcloud::Spectrum::ALL.len()]
+        }
+    };
+    let name = {
+        let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+        c.spectrum = spectrum;
+        c.name.clone()
+    };
+    Ok(json!({
+        "message": format!("{name}: the intensity is read on the {} scale", spectrum.label()),
+        "index": i,
+        "spectrum": spectrum.name(),
     }))
 }
 
@@ -790,6 +820,28 @@ mod tests {
         assert!(lasclip(&mut s, &json!({"min": [0.0, 0.0, 2.0], "max": [1.0, 1.0, 1.0]})).is_err(), "a box with max below min is refused");
         assert!(lasclip(&mut s, &json!({"reset": true})).is_ok());
         assert!(s.clouds[0].clip.is_none());
+    }
+
+    #[test]
+    fn the_intensity_scale_is_the_user_s_choice() {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let mut b = Bounds3::EMPTY;
+        b.add(0.0, 0.0, 0.0);
+        b.add(1.0, 1.0, 1.0);
+        let pts = vec![Pt { x: 0.5, y: 0.5, z: 0.5, rgb: None, intensity: 100, class: 1 }];
+        let slice = Slice { points: pts, total: 1, in_band: 1, bounds: b };
+        let mut s = Session::new();
+        s.clouds.push(Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice, 1000, CloudColor::Intensity));
+        let r = lpectrum(&mut s, &json!({ "spectrum": "viridis" })).ok();
+        assert_eq!(r.as_ref().and_then(|v| v["spectrum"].as_str()), Some("viridis"));
+        assert_eq!(s.clouds[0].spectrum, cadcraft_pointcloud::Spectrum::Viridis);
+        // Without a name, the scale walks to the next one.
+        lpectrum(&mut s, &json!({})).ok();
+        assert_eq!(s.clouds[0].spectrum, cadcraft_pointcloud::Spectrum::Turbo);
+        // An unknown scale is an error, not a panic and not a silent change.
+        let before = s.clouds[0].spectrum;
+        assert!(lpectrum(&mut s, &json!({ "spectrum": "nope" })).is_err());
+        assert_eq!(s.clouds[0].spectrum, before);
     }
 
     #[test]

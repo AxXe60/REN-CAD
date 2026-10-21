@@ -134,6 +134,21 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     });
 
+    // ---------- the scale the intensity is read on ----------
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Intensity scale").color(t.text_dim).size(12.0));
+        let current = app.session.clouds[selected].spectrum;
+        for spectrum in cadcraft_pointcloud::Spectrum::ALL {
+            let label = egui::RichText::new(spectrum.label()).size(11.0);
+            let selected_spectrum = spectrum == current;
+            if ui.selectable_label(selected_spectrum, label).on_hover_text("The colour scale the intensity band is read on").clicked() {
+                run(app, "lpectrum", json!({"index": selected, "spectrum": spectrum.name()}));
+            }
+        }
+    });
+
     // ---------- resolution ----------
     ui.add_space(6.0);
     let all = cell_now <= 0.0;
