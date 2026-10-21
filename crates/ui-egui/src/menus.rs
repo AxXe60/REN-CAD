@@ -29,6 +29,8 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.panel.layers", "Layers Palette", &["Window", "Layers Palette"], None),
     ("ui.toggle.quickcalc", "QuickCalc", &["Window", "QuickCalc"], Some("Cmd+8")),
     ("ui.panel.quickcalc", "QuickCalc", &[], None),
+    ("ui.panel.pointcloud", "Point Cloud", &["Window", "Point Cloud"], None),
+    ("ui.view3d", "3D View", &["View", "3D View"], None),
     ("ui.toggle.systemcursor", "Show System Cursor", &["View", "Accessibility", "Show System Cursor"], None),
     ("ui.animations.system", "Use System Setting", &["View", "Accessibility", "Animation Effects", "Use System Setting"], None),
     ("ui.animations.on", "On", &["View", "Accessibility", "Animation Effects", "On"], None),
@@ -105,6 +107,17 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
     }
     if id == "ui.toggle.quickcalc" {
         return Some(crate::palettes::quickcalc::toggle(app));
+    }
+    if id == "ui.panel.pointcloud" {
+        return Some(crate::docking::command(app, false, &json!({"operation": "open", "panel": "pointCloud"})));
+    }
+    if id == "ui.view3d" {
+        let on = params.get("on").and_then(Value::as_bool).unwrap_or(!app.view3d.active);
+        app.view3d.active = on;
+        if on {
+            app.view3d.fitted = false;
+        }
+        return Some(Ok(json!({"view3d": on, "points": app.view3d.drawn})));
     }
     // Explicit opens remain idempotent; typed QUICKCALC with JSON parameters uses the engine's CAL alias.
     if id == "ui.panel.quickcalc" || (matches!(id, "quickcalc" | "qc") && params.is_null()) {

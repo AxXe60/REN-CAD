@@ -26,11 +26,14 @@ pub mod hatchdlg;
 mod mtext_editor;
 pub mod spacemouse;
 // The External References palette.
+/// The 3D point cloud view (orbit camera, GPU perspective points).
+pub mod view3d;
 pub mod xrefs;
 
 pub mod dyngrips;
 pub mod dyninput;
 pub mod gpu;
+pub mod gpu3d;
 pub mod grip_dyn;
 pub mod i18n;
 pub mod icons;
@@ -73,6 +76,11 @@ pub struct UiState {
     pub interface_language: i18n::Preference,
     pub show_toolsets: bool,
     pub show_palettes: bool,
+    /// The fork's Point Cloud palette (open by default).
+    pub show_pointcloud: bool,
+    /// The default dock layout revision this build expects; an older saved layout is rebuilt once.
+    /// Defaults to 0 so layouts saved before the Point Cloud palette are migrated.
+    pub layout_rev: u32,
     pub show_toolbar: bool,
     pub show_file_tabs: bool,
     pub show_status_bar: bool,
@@ -161,6 +169,8 @@ impl Default for UiState {
             interface_language: i18n::Preference::default(),
             show_toolsets: true,
             show_palettes: true,
+            show_pointcloud: true,
+            layout_rev: docking::LAYOUT_REV,
             show_toolbar: true,
             show_file_tabs: true,
             show_status_bar: true,
@@ -212,6 +222,8 @@ pub struct CadApp {
     pub options: options::UiOptions,
     pub services: Services,
     pub canvas: canvas::CanvasState,
+    /// The 3D point cloud view and its orbit camera.
+    pub view3d: view3d::View3d,
     /// Desktop HID status and navigation preferences; the web host supplies no HID backend.
     pub spacemouse: spacemouse::State,
     pub cmd: cmdline::CmdLine,
@@ -270,6 +282,7 @@ impl CadApp {
             options: options::UiOptions::default(),
             services,
             canvas: canvas::CanvasState::default(),
+            view3d: view3d::View3d::default(),
             spacemouse: spacemouse::State::default(),
             cmd: cmdline::CmdLine::default(),
             status: None,
@@ -313,7 +326,9 @@ impl CadApp {
     /// the format of the render pass's stencil buffer when the app asked for one (eframe
     /// `NativeOptions::stencil_buffer`); clipped viewports are clipped with it.
     pub fn set_wgpu(&mut self, rs: &egui_wgpu::RenderState, stencil: Option<egui_wgpu::wgpu::TextureFormat>) {
-        self.canvas.gpu = Some(gpu::install(rs, &self.gpu_faults, stencil));
+        let target = gpu::install(rs, &self.gpu_faults, stencil);
+        gpu3d::install(rs, target);
+        self.canvas.gpu = Some(target);
         self.canvas.gpu_device = Some(rs.device.clone());
     }
 

@@ -24,6 +24,8 @@ pub fn specs() -> Vec<CommandSpec> {
             .noundo(),
         CommandSpec::new("lascolor", "Colour Point Cloud", lascolor).params("{mode: string, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasdecimate", "Decimate Point Cloud", lasdecimate).params("{cell: number, index?: int}").enabled(always).noundo(),
+        CommandSpec::new("lasvisible", "Show Point Cloud", lasvisible).params("{visible?: bool, index?: int}").enabled(always).noundo(),
+        CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasclouds", "List Point Clouds", |s, _| lasclouds(s)).params("{}").enabled(always).noundo(),
     ]
@@ -217,6 +219,33 @@ fn lasdecimate(s: &mut Session, p: &Value) -> Result<Value> {
         "points": points,
         "levels": levels,
     }))
+}
+
+/// Show or hide a cloud; without `visible` it toggles.
+fn lasvisible(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let want = p.get("visible").and_then(Value::as_bool);
+    let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+    c.visible = want.unwrap_or(!c.visible);
+    Ok(json!({ "index": i, "visible": c.visible, "name": c.name }))
+}
+
+/// Frame a cloud's XY bounds in the drawing view (2D).
+fn lasframe(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let (name, b) = {
+        let c = s.clouds.get(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+        (c.name.clone(), (c.bounds.min, c.bounds.max))
+    };
+    let (w, h) = (b.1[0] - b.0[0], b.1[1] - b.0[1]);
+    let center = Vec2::new((b.0[0] + b.1[0]) / 2.0, (b.0[1] + b.1[1]) / 2.0);
+    let height = w.max(h).max(1e-6) * 1.15;
+    let mut framed = false;
+    if let Ok(st) = s.state_mut() {
+        st.set_view(View { center, height });
+        framed = true;
+    }
+    Ok(json!({ "index": i, "name": name, "framed": framed, "center": [center.x, center.y], "height": height }))
 }
 
 #[cfg(test)]

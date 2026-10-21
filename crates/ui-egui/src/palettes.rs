@@ -13,6 +13,8 @@ use crate::theme::Tokens;
 mod layer_menu_tests;
 /// The hatch pattern picker.
 pub mod patterns;
+/// The fork's point cloud palette.
+pub mod pointcloud;
 /// The QuickCalc palette.
 pub mod quickcalc;
 

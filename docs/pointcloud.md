@@ -1,11 +1,13 @@
-# Point clouds (LAS/LAZ)
+# Point clouds (LAS/LAZ) — RENCAD
 
-> **Last reviewed:** 2026-10-21 · **Status:** M3 — GPU overlay, LOD, colour and decimation · **Fork addition**
+> **Last reviewed:** 2026-10-21 · **Status:** M4 — palette and 3D view · **Fork addition**
 
-This fork adds point cloud support to CADCraft. M1 read a LAS/LAZ file, kept the points inside a Z
-band and wrote them as ordinary DXF POINT entities; M2 kept the band in the session and drew it in
-the canvas; M3 makes that overlay fast and controllable: a decimation pyramid, one GPU draw call,
-colour modes and live decimation.
+RENCAD is the working name of this fork of CADCraft (the crates and the binary keep their upstream
+names so the weekly rebase stays a fast-forward). The fork adds point cloud support: M1 read a
+LAS/LAZ file, kept the points inside a Z band and wrote them as ordinary DXF POINT entities; M2
+kept the band in the session and drew it in the canvas; M3 made that overlay fast and controllable
+(a decimation pyramid, one GPU draw call, colour modes and live decimation); M4 adds the **Point
+Cloud** palette and a **3D view** with an orbit camera over the same pyramid.
 
 ## Commands
 
@@ -95,6 +97,63 @@ Re-reads the file at a new grid cell, keeping the band, the name and the colour 
 `LASCLOSE` drops the last cloud, the one at `index`, or all of them; `LASCLOUDS` lists what is open
 with point counts, levels, colour mode and bounds.
 
+### `LASVISIBLE {visible?, index?}`
+
+Shows or hides a cloud without closing it (`visible` defaults to a toggle). The palette's **Show**
+checkbox and the 2D and 3D views all read the same flag.
+
+```json
+{"index":0,"visible":false,"name":"Ap 1"}
+```
+
+### `LASFRAME {index?}`
+
+Frames a cloud's XY bounds in the drawing view — the palette's **Fit** button, and the same extent
+the first cloud gets when it opens.
+
+```json
+{"index":0,"name":"Ap 1","framed":true,"center":[-2.595,-0.854],"height":21.15}
+```
+
+## The Point Cloud palette
+
+The fork adds a **Point Cloud** panel to the right dock (between Layers and Properties, opened by
+default; `Window ▸ Point Cloud` reopens it, and closing it is remembered). It is deliberately thin:
+every control runs the command above through `app.run`, so the palette, the command line and a
+script cannot drift apart.
+
+- The cloud list shows each cloud's points and level count; click a row to choose which cloud the
+  controls act on.
+- **Fit** frames it in 2D, **3D** switches the canvas to the 3D view (**2D** switches back),
+  **Close** drops the cloud and **Show** hides it without closing.
+- **Colour**: RGB, Elevation, Intensity, or the colour picker for a flat colour (`single:#rrggbb`).
+- **Grid** and **Apply** re-read the file at a new decimation cell.
+- When the 3D view is on, a point-size slider and **Fit 3D** appear, plus the number of points the
+  3D scene drew.
+
+## The 3D view
+
+`ui.view3d {"on": true}` (or the palette's **3D** button) replaces the drawing canvas with a
+perspective view of the visible clouds in the same rectangle; `{"on": false}` returns to 2D.
+
+- **Drag** orbits, **Shift+drag** or **middle drag** pans, the **wheel** dollies and
+  **double-click** fits the clouds. **Fit 3D** re-frames without touching the camera angles.
+- The camera is an orbit around the cloud's centre with world Z up (the scanner's vertical), 50°
+  vertical field of view. Angles survive switching to 2D and back.
+- The same decimation pyramid is used: the level is picked for the on-screen density at the camera
+  target, coarsened further if it would exceed 1.5 million points. Unlike 2D there is no view
+  filter, so orbiting and panning need **no rebuild and no upload** — each frame only writes an
+  80-byte view-projection uniform.
+- `crates/ui-egui/src/gpu3d.rs` owns a second pipeline (target format and stencil attachment shared
+  with the 2D canvas). Points are 6-vertex instanced screen-space squares because WGSL has no
+  `gl_PointSize`; the shader converts sRGB to linear when the target is sRGB, as the 2D shader does.
+- Without a wgpu render state (a wasm build without a GPU) the view projects a sampled 50k points
+  on the CPU with egui shapes, so it still shows something.
+
+Drawing in 3D is the next step: the camera and the scene are already independent of the 2D drawing,
+and the 2D entities are all at Z=0, so the overlay and then 3D entity creation can reuse the same
+view-projection.
+
 ## Measured on real data (Ap 1, Bucharest)
 
 | Step | Result |
@@ -106,6 +165,7 @@ with point counts, levels, colour mode and bounds.
 | `LASOPEN` whole file at 2 mm | **1,394,540 points, 9 levels** (~38 MB of 16-byte vertices) |
 | Mesh at default zoom | 44,259 points → **2.1 ms** |
 | Mesh zoomed to 6 m | 551,870 points → **22 ms**, one draw call |
+| 3D scene at fit (`ui.view3d`) | 46,319 points → **0.8 ms** to build and upload; orbiting then rebuilds nothing |
 | Recolour (`LASCOLOR`) | instant; the mesh rebuilds on the next frame |
 
 The LOD keeps the drawn count proportional to the screen, not to the file: ~550k is what a
@@ -133,14 +193,17 @@ buffer.
 - The CPU path (no GPU target) draws the same list as egui rectangles — slower, but clouds stay
   visible.
 
-## Limits (M3)
+## Limits (M4)
 
 - LAZ is read, not written; no COPC streaming yet — a file is opened in one pass.
 - No classification filter, no ortho PNG/GeoTIFF export, no intensity histogram.
 - The finest level is capped by `maxPoints`; above it the grid is coarsened silently (the returned
   `points` says so). Raise `maxPoints` for a dense survey workstation.
 - One mesh rebuild per zoom step costs ~20 ms at half a million points; panning within the built
-  area is free.
+  area is free. The 3D view caps its scene at 1.5 million points per frame.
+- The 3D view draws clouds only: the 2D drawing, the ViewCube and 3D drawing are not part of it yet.
+  It also has no depth buffer, so points do not occlude each other (fine for translucent scans,
+  wrong for solid surfaces later).
 
 ## Building this fork (Windows)
 

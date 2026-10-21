@@ -1474,6 +1474,11 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // draws the others.
     let tiles = tile_rects(app, full);
     let rect = tiles.iter().find(|(_, tile)| tile.active).map_or(full, |(r, _)| *r);
+    // The 3D point cloud view replaces the drawing in the same rect and handles its own input.
+    if app.view3d.active {
+        crate::view3d::show(app, ui, rect);
+        return;
+    }
     let resp = ui.interact(full, ui.id().with("canvas"), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     app.canvas.rect = Some(rect);

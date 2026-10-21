@@ -14,12 +14,14 @@ pub enum Panel {
     QuickCalc,
     Layers,
     Properties,
+    /// The fork's point cloud palette (RENCAD).
+    PointCloud,
     #[serde(rename = "externalReferences")]
     ExternalRefs,
 }
 
 impl Panel {
-    pub const ALL: &[Self] = &[Self::Canvas, Self::ToolSets, Self::Layers, Self::Properties, Self::ExternalRefs];
+    pub const ALL: &[Self] = &[Self::Canvas, Self::ToolSets, Self::Layers, Self::Properties, Self::ExternalRefs, Self::PointCloud];
     pub fn id(self) -> &'static str {
         match self {
             Self::Canvas => "canvas",
@@ -28,6 +30,7 @@ impl Panel {
             Self::Layers => "layers",
             Self::Properties => "properties",
             Self::ExternalRefs => "externalReferences",
+            Self::PointCloud => "pointCloud",
         }
     }
     fn label(self) -> &'static str {
@@ -38,6 +41,7 @@ impl Panel {
             Self::Layers => "Layers",
             Self::Properties => "Properties",
             Self::ExternalRefs => "External References",
+            Self::PointCloud => "Point Cloud",
         }
     }
     fn default_side(self) -> Zone {
@@ -48,6 +52,7 @@ impl Panel {
             Self::Layers => Zone::Right,
             Self::Properties => Zone::Right,
             Self::ExternalRefs => Zone::Right,
+            Self::PointCloud => Zone::Right,
         }
     }
     /// Palettes outside the default arrangement, opened on request (QUICKCALC).
@@ -91,7 +96,8 @@ impl Default for Workspace {
                         tabs(Panel::Canvas),
                         Node::Stack {
                             entries: vec![
-                                craft_ui::docking::StackEntry { panel: Panel::Layers, open: true, height: Some(280.0) },
+                                craft_ui::docking::StackEntry { panel: Panel::Layers, open: true, height: Some(240.0) },
+                                craft_ui::docking::StackEntry { panel: Panel::PointCloud, open: true, height: Some(270.0) },
                                 craft_ui::docking::StackEntry { panel: Panel::Properties, open: true, height: None },
                             ],
                         },
@@ -294,12 +300,19 @@ fn sync(workspace: &mut Workspace, app: &crate::CadApp) -> Result<(), String> {
         workspace.set_visible(Panel::Properties, true)?;
         workspace.set_visible(Panel::Layers, true)?;
     }
+    // Last: restoring the Point Cloud palette also restores the stack it shares with Properties,
+    // which would hide the pair's "both absent" state from the branch above.
+    workspace.set_visible(Panel::PointCloud, app.ui.show_palettes && app.ui.show_pointcloud)?;
     Ok(())
 }
 
 fn publish_visibility(app: &mut crate::CadApp, workspace: &Workspace) {
     app.ui.show_toolsets = workspace.layout.contains(&Panel::ToolSets);
     app.ui.show_palettes = workspace.layout.contains(&Panel::Layers) || workspace.layout.contains(&Panel::Properties);
+    // Hiding the palettes wholesale keeps the intent, so they come back as they were.
+    if app.ui.show_palettes {
+        app.ui.show_pointcloud = workspace.layout.contains(&Panel::PointCloud);
+    }
 }
 
 pub fn command(app: &mut crate::CadApp, reset: bool, params: &Value) -> Result<Value, String> {
@@ -315,8 +328,17 @@ pub fn command(app: &mut crate::CadApp, reset: bool, params: &Value) -> Result<V
     Ok(json!({"docking": app.ui.docking}))
 }
 
+/// Bumped when the default arrangement gains a panel (the fork's Point Cloud palette), so a
+/// layout saved by an older build is rebuilt once instead of opening the new panel as an extra
+/// column beside the existing palettes.
+pub const LAYOUT_REV: u32 = 1;
+
 pub fn show(app: &mut crate::CadApp, ui: &mut egui::Ui) {
     let t = crate::theme::Tokens::get();
+    if app.ui.layout_rev < LAYOUT_REV {
+        app.ui.docking = Workspace::default();
+        app.ui.layout_rev = LAYOUT_REV;
+    }
     let mut workspace = app.ui.docking.clone();
     if let Err(error) = workspace.validate().and_then(|()| sync(&mut workspace, app)) {
         app.set_status(format!("Panel layout could not be restored: {error}"));
@@ -364,6 +386,11 @@ pub fn show(app: &mut crate::CadApp, ui: &mut egui::Ui) {
             Panel::ExternalRefs => {
                 egui::ScrollArea::both().id_salt("dock-xrefs").auto_shrink([false, false]).show(ui, |ui| crate::xrefs::section(app, ui));
             }
+            Panel::PointCloud => {
+                egui::ScrollArea::vertical().id_salt("dock-pointcloud").auto_shrink([false, false]).show(ui, |ui| {
+                    crate::palettes::pointcloud::section(app, ui);
+                });
+            }
         },
     );
     // Existing panel close buttons and commands still own their visibility switches.
@@ -393,7 +420,7 @@ fn panel_limits(panel: &Panel) -> PanelLimits {
         Panel::Canvas => (egui::vec2(300.0, 180.0), 1_000_000.0),
         Panel::QuickCalc => (egui::vec2(240.0, 160.0), 600.0),
         Panel::ToolSets => (egui::vec2(220.0, 150.0), 480.0),
-        Panel::Layers | Panel::Properties | Panel::ExternalRefs => (egui::vec2(220.0, 100.0), 720.0),
+        Panel::Layers | Panel::Properties | Panel::ExternalRefs | Panel::PointCloud => (egui::vec2(220.0, 100.0), 720.0),
     };
     PanelLimits { min, max: egui::vec2(max_width, 1_000_000.0) }
 }
