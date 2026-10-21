@@ -227,11 +227,19 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         let crs = app.session.crs.clone().or_else(|| crs.clone());
         let text = match &crs {
-            Some(crs) => match (crs.epsg, crs.name()) {
-                (Some(code), Some(name)) => format!("CRS: EPSG:{code} · {name}"),
-                (Some(code), None) => format!("CRS: EPSG:{code}"),
-                (None, _) => "CRS: the file names a system, but no EPSG code".to_string(),
-            },
+            Some(crs) => {
+                let mut text = match (crs.epsg, crs.name()) {
+                    (Some(code), Some(name)) => format!("CRS: EPSG:{code} · {name}"),
+                    (Some(code), None) => format!("CRS: EPSG:{code}"),
+                    (None, _) => "CRS: the file names a system, but no EPSG code".to_string(),
+                };
+                // The local grid's offsets: a survey office that writes the northing without its
+                // leading millions shows it here.
+                if crs.false_easting != 0.0 || crs.false_northing != 0.0 {
+                    text.push_str(&format!(" · E {:+.0} N {:+.0}", crs.false_easting, crs.false_northing));
+                }
+                text
+            }
             None => "CRS: the file names none".to_string(),
         };
         ui.label(egui::RichText::new(text).color(t.text_dim).size(11.0));

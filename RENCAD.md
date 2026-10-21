@@ -134,6 +134,9 @@ LAS ──► 3DLINE ──► Session.sketch ───────────�
 - CRS-ul se citește din fișier: cheile GeoTIFF (codul EPSG) sau WKT-ul OGC.
 - `LASINFO` și paleta spun ce sistem e (EPSG + nume); `LASEXPORT` scrie WKT-ul lângă desen ca
   `out.prj` (convenția GIS).
+- `LASCRS {epsg, falseEasting?, falseNorthing?}` declară sistemul proiectului pentru fișierele
+  care nu-l spun (un scan Faro înregistrat nu are VLR-uri) + **offset-ul grilei locale**
+  (Stereo 70 cu northing fără cifra milioanelor: `EPSG:31700, falseNorthing: -4000000`).
 - Fork-ul **nu reproiectează**: desenul e 2D în unități locale, iar norul rămâne unde îl pune
   fișierul. Un fișier fără CRS spune asta, nu inventează.
 

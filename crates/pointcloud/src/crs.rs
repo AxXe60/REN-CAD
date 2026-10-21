@@ -9,12 +9,16 @@
 //! a WKT to write next to an exported drawing.
 
 /// The coordinate reference system of a cloud.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Crs {
     /// The EPSG code, when the file names one.
     pub epsg: Option<u32>,
     /// The WKT, when the file carries one.
     pub wkt: Option<String>,
+    /// The offset of the local grid on the easting (0 for the standard system).
+    pub false_easting: f64,
+    /// The offset of the local grid on the northing (0 for the standard system).
+    pub false_northing: f64,
 }
 
 impl Crs {
@@ -34,17 +38,19 @@ impl Crs {
         if epsg.is_none() && wkt.is_none() {
             return None;
         }
-        Some(Crs { epsg, wkt })
+        Some(Crs { epsg, wkt, false_easting: 0.0, false_northing: 0.0 })
     }
 
     /// The name of the system, for the ones a survey office meets every day: WGS 84, the UTM
-    /// zones and the web mercator. `None` for the rest — the code is the honest answer.
+    /// zones, the Romanian Stereo 70 and the web mercator. `None` for the rest — the code is the
+    /// honest answer.
     pub fn name(&self) -> Option<String> {
         let code = self.epsg?;
         Some(match code {
             4326 => "WGS 84 (geographic)".to_string(),
             4269 => "NAD83 (geographic)".to_string(),
             3857 => "WGS 84 / Pseudo-Mercator".to_string(),
+            31700 => "Stereo 70 (Romania)".to_string(),
             32601..=32660 => format!("WGS 84 / UTM zone {}N", code - 32600),
             32701..=32760 => format!("WGS 84 / UTM zone {}S", code - 32700),
             26901..=26923 => format!("NAD83 / UTM zone {}N", code - 26900),
@@ -62,23 +68,26 @@ impl Crs {
         self.wkt.as_deref()
     }
 
-    /// The WKT of a system the fork knows, for the files that name none: WGS 84, NAD83 and their
-    /// UTM zones. `None` for the rest — the code is still the honest answer.
-    pub fn wkt_for(epsg: u32) -> Option<String> {
+    /// The WKT of a system the fork knows, for the files that name none: WGS 84, NAD83, their UTM
+    /// zones and the Romanian Stereo 70. `None` for the rest — the code is still the honest answer.
+    ///
+    /// The offsets are the local grid's own: a survey office that writes the northing without its
+    /// leading millions gets a WKT that says so, and the exported points land where they belong.
+    pub fn wkt_for(epsg: u32, false_easting: f64, false_northing: f64) -> Option<String> {
         let geographic = |name: &str, datum: &str, ellipsoid: &str, code: &str| {
             format!(
                 "GEOGCS[\"{name}\",DATUM[\"{datum}\",SPHEROID[\"{ellipsoid}\",6378137,298.257223563,AUTHORITY[\"EPSG\",\"7030\"]],AUTHORITY[\"EPSG\",\"6326\"]],PRIMEM[\"Greenwich\",0,AUTHORITY[\"EPSG\",\"8901\"]],UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]],AUTHORITY[\"EPSG\",\"{code}\"]]"
             )
         };
-        let projected = |name: &str, base: &str, zone: u32, south: bool, code: u32| {
-            let central_meridian = 6.0 * f64::from(zone) - 183.0;
-            let false_northing = if south { 10_000_000.0 } else { 0.0 };
+        let projected = |name: &str, base: &str, central_meridian: f64, scale: f64, easting: f64, northing: f64, code: u32| {
             format!(
-                "PROJCS[\"{name}\",{base},PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",{central_meridian}],PARAMETER[\"scale_factor\",0.9996],PARAMETER[\"false_easting\",500000],PARAMETER[\"false_northing\",{false_northing}],UNIT[\"metre\",1,AUTHORITY[\"EPSG\",\"9001\"]],AUTHORITY[\"EPSG\",\"{code}\"]]",
+                "PROJCS[\"{name}\",{base},PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",{central_meridian}],PARAMETER[\"scale_factor\",{scale}],PARAMETER[\"false_easting\",{easting}],PARAMETER[\"false_northing\",{northing}],UNIT[\"metre\",1,AUTHORITY[\"EPSG\",\"9001\"]],AUTHORITY[\"EPSG\",\"{code}\"]]",
                 name = name,
                 base = base,
                 central_meridian = central_meridian,
-                false_northing = false_northing,
+                scale = scale,
+                easting = easting,
+                northing = northing,
                 code = code
             )
         };
@@ -87,9 +96,45 @@ impl Crs {
         Some(match epsg {
             4326 => wgs84,
             4269 => nad83,
-            32601..=32660 => projected(&format!("WGS 84 / UTM zone {}N", epsg - 32600), &wgs84, epsg - 32600, false, epsg),
-            32701..=32760 => projected(&format!("WGS 84 / UTM zone {}S", epsg - 32700), &wgs84, epsg - 32700, true, epsg),
-            26901..=26923 => projected(&format!("NAD83 / UTM zone {}N", epsg - 26900), &nad83, epsg - 26900, false, epsg),
+            32601..=32660 => projected(
+                &format!("WGS 84 / UTM zone {}N", epsg - 32600),
+                &wgs84,
+                6.0 * f64::from(epsg - 32600) - 183.0,
+                0.9996,
+                500_000.0 + false_easting,
+                false_northing,
+                epsg,
+            ),
+            32701..=32760 => projected(
+                &format!("WGS 84 / UTM zone {}S", epsg - 32700),
+                &wgs84,
+                6.0 * f64::from(epsg - 32700) - 183.0,
+                0.9996,
+                500_000.0 + false_easting,
+                10_000_000.0 + false_northing,
+                epsg,
+            ),
+            26901..=26923 => projected(
+                &format!("NAD83 / UTM zone {}N", epsg - 26900),
+                &nad83,
+                6.0 * f64::from(epsg - 26900) - 183.0,
+                0.9996,
+                500_000.0 + false_easting,
+                false_northing,
+                epsg,
+            ),
+            // Stereo 70: the Romanian national grid on GRS 80, the central meridian 25°E and the
+            // scale factor 0.9997. The false northing of the standard is 3 000 000 m; a local grid
+            // that writes the northing without its leading millions carries the difference here.
+            31700 => projected(
+                "Stereo 70",
+                &geographic("ETRS89", "European_Terrestrial_Reference_System_1989", "GRS 1980", "6258"),
+                25.0,
+                0.9997,
+                500_000.0 + false_easting,
+                3_000_000.0 + false_northing,
+                epsg,
+            ),
             _ => return None,
         })
     }
@@ -249,7 +294,7 @@ mod tests {
 
     #[test]
     fn the_common_systems_have_names() {
-        let named = |code: u32| Crs { epsg: Some(code), wkt: None }.name();
+        let named = |code: u32| Crs { epsg: Some(code), wkt: None, false_easting: 0.0, false_northing: 0.0 }.name();
         assert_eq!(named(4326).as_deref(), Some("WGS 84 (geographic)"));
         assert_eq!(named(32610).as_deref(), Some("WGS 84 / UTM zone 10N"));
         assert_eq!(named(32734).as_deref(), Some("WGS 84 / UTM zone 34S"));
@@ -259,21 +304,33 @@ mod tests {
 
     #[test]
     fn a_geographic_system_is_told_from_a_projected_one() {
-        assert!(Crs { epsg: Some(4326), wkt: None }.is_geographic());
-        assert!(!Crs { epsg: Some(32610), wkt: None }.is_geographic());
+        assert!(Crs { epsg: Some(4326), wkt: None, false_easting: 0.0, false_northing: 0.0 }.is_geographic());
+        assert!(!Crs { epsg: Some(32610), wkt: None, false_easting: 0.0, false_northing: 0.0 }.is_geographic());
     }
 
     /// The WKT the fork writes next to an exported drawing when only the code is known.
     #[test]
     fn the_known_systems_get_a_wkt() {
-        let wkt = Crs::wkt_for(32610).expect("UTM 10N is known");
+        let wkt = Crs::wkt_for(32610, 0.0, 0.0).expect("UTM 10N is known");
         assert!(wkt.contains("AUTHORITY[\"EPSG\",\"32610\"]"), "{wkt}");
         assert!(wkt.contains("PARAMETER[\"central_meridian\",-123]"), "zone 10's meridian is 123°W: {wkt}");
         assert!(wkt.contains("PARAMETER[\"false_easting\",500000]"), "{wkt}");
-        let south = Crs::wkt_for(32734).expect("UTM 34S is known");
+        let south = Crs::wkt_for(32734, 0.0, 0.0).expect("UTM 34S is known");
         assert!(south.contains("PARAMETER[\"false_northing\",10000000]"), "{south}");
-        let geographic = Crs::wkt_for(4326).expect("WGS 84 is known");
+        let geographic = Crs::wkt_for(4326, 0.0, 0.0).expect("WGS 84 is known");
         assert!(geographic.starts_with("GEOGCS[\"WGS 84\""), "{geographic}");
-        assert_eq!(Crs::wkt_for(1234), None, "an unknown code gets no WKT, only the number");
+        assert_eq!(Crs::wkt_for(1234, 0.0, 0.0), None, "an unknown code gets no WKT, only the number");
+    }
+
+    /// Stereo 70 with a local grid: the offsets are in the WKT, so an exported drawing lands where
+    /// the survey office says it does.
+    #[test]
+    fn stereo_70_carries_the_local_offsets() {
+        let wkt = Crs::wkt_for(31700, 0.0, -4_000_000.0).expect("Stereo 70 is known");
+        assert!(wkt.contains("Stereo 70"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"central_meridian\",25]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"scale_factor\",0.9997]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"false_northing\",-1000000]"), "3 000 000 − 4 000 000: {wkt}");
+        assert_eq!(Crs { epsg: Some(31700), wkt: None, false_easting: 0.0, false_northing: 0.0 }.name().as_deref(), Some("Stereo 70 (Romania)"));
     }
 }

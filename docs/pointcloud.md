@@ -314,6 +314,21 @@ full OGC WKT. RENCAD reads both, shows the system in the palette and in `LASINFO
 WKT next to an exported drawing as a `.prj` sidecar (the convention every GIS tool reads), so an
 exported slice keeps its place on the globe.
 
+A registered Faro scan carries no CRS record at all (the georeference lives in the survey
+project), so the project declares it: `LASCRS {epsg, name?, falseEasting?, falseNorthing?}`.
+The offsets are the local grid's own: a survey office that writes the Stereo 70 northing without
+its leading millions needs `falseNorthing`, or the export lands kilometres from the truth.
+
+```json
+{"command":"lascrs","params":{"epsg":31700,"falseNorthing":-4000000}}
+```
+
+```json
+{"message":"the project is in EPSG:31700 (Stereo 70 (Romania))",
+ "crs":{"epsg":31700,"name":"Stereo 70 (Romania)","geographic":false,"wkt":false,
+        "falseEasting":0,"falseNorthing":-4000000}}
+```
+
 The fork does not reproject: the drawing is 2D in local units, and a scan is placed where its file
 puts it. A file that names no system says so plainly instead of pretending.
 

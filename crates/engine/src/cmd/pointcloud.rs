@@ -101,6 +101,8 @@ fn crs_json(crs: &Option<cadcraft_pointcloud::Crs>) -> Value {
             "name": c.name(),
             "geographic": c.is_geographic(),
             "wkt": c.wkt.is_some(),
+            "falseEasting": c.false_easting,
+            "falseNorthing": c.false_northing,
         }),
         None => Value::Null,
     }
@@ -124,13 +126,18 @@ fn lasexport(s: &mut Session, p: &Value) -> Result<Value> {
     // wins; the project's (LASCRS) is the fallback for the files that name none.
     let file_crs = cadcraft_pointcloud::read_info(&path).map_err(oops)?.crs;
     let crs = file_crs.clone().or_else(|| s.crs.clone());
-    let prj = crs.as_ref().and_then(|c| c.prj().map(str::to_string).or_else(|| c.epsg.and_then(cadcraft_pointcloud::Crs::wkt_for))).map(|wkt| {
-        let sidecar = out.with_extension("prj");
-        if let Err(e) = std::fs::write(&sidecar, wkt) {
-            log::warn!("could not write the .prj sidecar: {e}");
-        }
-        sidecar.display().to_string()
-    });
+    let prj = crs
+        .as_ref()
+        .and_then(|c| {
+            c.prj().map(str::to_string).or_else(|| c.epsg.and_then(|code| cadcraft_pointcloud::Crs::wkt_for(code, c.false_easting, c.false_northing)))
+        })
+        .map(|wkt| {
+            let sidecar = out.with_extension("prj");
+            if let Err(e) = std::fs::write(&sidecar, wkt) {
+                log::warn!("could not write the .prj sidecar: {e}");
+            }
+            sidecar.display().to_string()
+        });
     Ok(json!({
         "message": format!("{} of {} points in the band written to {}", written, slice.in_band, out.display()),
         "path": out.display().to_string(),
@@ -427,7 +434,9 @@ fn lasorigin(s: &mut Session, p: &Value) -> Result<Value> {
 /// The coordinate reference system of the project, for the files that do not name one.
 ///
 /// A scan that says nothing is not a scan without a system: the survey office knows. The code is
-/// remembered with the drawing and written next to an exported drawing.
+/// remembered with the drawing and written next to an exported drawing. `falseEasting` and
+/// `falseNorthing` are the local grid's own offsets: a survey office that writes the northing
+/// without its leading millions needs them, or the export lands kilometres away.
 fn lascrs(s: &mut Session, p: &Value) -> Result<Value> {
     if p.get("reset").and_then(Value::as_bool).unwrap_or(false) {
         s.crs = None;
@@ -435,10 +444,12 @@ fn lascrs(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let epsg = p.get("epsg").and_then(Value::as_u64).map(|v| v as u32);
     let name = p.get("name").and_then(Value::as_str).map(str::to_string);
+    let false_easting = number(p, "falseEasting").unwrap_or(0.0);
+    let false_northing = number(p, "falseNorthing").unwrap_or(0.0);
     if epsg.is_none() && name.is_none() {
         return Err(EngineError::Other("`epsg` or `name` is required".into()));
     }
-    let crs = cadcraft_pointcloud::Crs { epsg, wkt: name };
+    let crs = cadcraft_pointcloud::Crs { epsg, wkt: name, false_easting, false_northing };
     s.crs = Some(crs.clone());
     Ok(json!({
         "message": match (crs.epsg, crs.name()) {
