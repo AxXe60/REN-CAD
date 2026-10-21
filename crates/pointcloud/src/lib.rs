@@ -12,15 +12,19 @@
 
 mod cloud;
 mod dxf;
+mod measure;
 mod read;
 mod sketch;
 mod slice;
+mod snap;
 
 pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
 pub use dxf::{SKETCH_RGB, write_points_dxf, write_strokes_dxf};
+pub use measure::{Measure, measure, readout};
 pub use read::{CloudInfo, read_info};
-pub use sketch::Sketch3d;
+pub use sketch::{DEFAULT_LAYER, Sketch3d, Stroke3};
 pub use slice::{Pt, Slice, slice};
+pub use snap::{FRONT_LAYER_M, SMOOTH_RADIUS_M, SnapHit, SnapMode, axis_locked, front_layer, nearest, smooth_centroid, z_locked};
 
 /// An axis-aligned box in world units.
 #[derive(Clone, Copy, Debug, PartialEq)]

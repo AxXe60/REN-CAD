@@ -25,6 +25,10 @@ selecția, undo-ul și salvarea văd doar ce a desenat utilizatorul.
 | Vedere 3D orbit, doar punctele vizibile pe ecran | gata |
 | Cameră: lentilă 35°, Persp/Ortho, zoom ancorat pe cursor, Top/Front/Iso | gata |
 | **3D drafting**: polilinii peste nor, snap pe puncte, export DXF cu Z | gata |
+| **Snap inteligent**: strat frontal (fără snap prin pereți) + mod Smooth/Exact | gata |
+| **Constrângeri 3D**: Z-lock (plan orizontal), Axis Ortho (Shift) | gata |
+| **Măsurare 3D**: lungime, dXY, dZ, pantă — live și ca comandă | gata |
+| Layere pe stroke (DXF per layer) + închidere polilinie | gata |
 | Branding RENCAD (doar numele afișat) | gata |
 
 ## 3. Cum funcționează, pe straturi
@@ -72,16 +76,36 @@ LAS ──► 3DLINE ──► Session.sketch ───────────�
 
 ### 3.5 3D drafting — `view3d.rs` + `cmd/pointcloud.rs` + `pointcloud/src/sketch.rs`
 1. Paleta → **Draw 3D** activează modul.
-2. Fiecare cadru proiectează cursorul: se caută cel mai apropiat punct din scena încărcată
-   (eșantion ~250k puncte, rază 14 px). Dacă nu există, click-ul cade pe planul view prin `target`.
-3. Click stânga = vârf; rubber-band de la ultimul vârf; cerc verde = snap pe nor.
-4. Dublu-click / click dreapta = termină stroke-ul; Esc = anulează.
-5. La terminare UI-ul cheamă comanda `3DLINE`; stroke-ul ajunge în `Session::sketch`.
-6. `draw_sketch()` proiectează stroke-urile cu aceeași matrice și le pictează peste nor (portocaliu).
-7. `3DEXPORT {path}` scrie DXF cu entități `LINE` la XYZ real (și `POINT` pentru un vârf singur).
+2. Fiecare cadru proiectează cursorul: se caută toate punctele din norul încărcat care cad în
+   raza de 14 px, se calculează adâncimea lor față de cameră și se păstrează doar **stratul frontal**
+   (adâncime ≤ minim + 0.15 m). Asta împiedică snap-ul prin pereți, fără depth buffer.
+3. Modul de snap: **Exact** (punctul din nor) sau **Smooth** (centroidul punctelor din sfera de
+   3 cm din jurul celui câștigător → zgomotul LiDAR de 2-5 mm se anulează). Implicit: Smooth.
+4. Click stânga = vârf; rubber-band de la ultimul vârf; cerc verde = snap pe nor.
+5. Dublu-click / click dreapta = termină stroke-ul; `Esc` = anulează; `C` = închide polilinia.
+6. La terminare UI-ul cheamă comanda `3DLINE`; stroke-ul ajunge în `Session::sketch`.
+7. `draw_sketch()` proiectează stroke-urile cu aceeași matrice și le pictează peste nor (portocaliu).
+8. `3DEXPORT {path}` scrie DXF cu entități `LINE` la XYZ real (și `POINT` pentru un vârf singur),
+   fiecare stroke pe layer-ul lui.
+
+### 3.6 Constrângeri de desenare 3D
+- **Z-lock** (tasta `Z` sau checkbox): orice vârf nou ia X/Y din snap, dar Z = Z-ul primului vârf
+  al stroke-ului → tot stroke-ul rămâne într-un plan orizontal.
+- **Axis Ortho** (tasta `Shift` sau checkbox): segmentul curent se proiectează pe axa cardinală
+  (X, Y sau Z) cea mai apropiată de direcția mișcării față de ultimul vârf.
+- Ambele sunt funcții pure în `pointcloud/src/snap.rs` (`z_locked`, `axis_locked`), testate fără
+  fereastră.
+
+### 3.7 Măsurare 3D
+- Comanda `3DMEASURE {p1, p2}` întoarce `dist_3d`, `dist_2d_xy`, `dx`, `dy`, `dz`, `slope_deg`,
+  `slope_pct` (matematica stă în `pointcloud/src/measure.rs`, ca să fie aceleași numere ca în UI).
+- Modul **Measure** din paletă: două clickuri măsoară un segment (care se snapuiează pe nor); pe
+  ecran rămâne segmentul albastru cu eticheta `8.184 m · dXY 7.731 · dZ 2.683`.
+- În timpul desenului, rubber-band-ul arată live lungimea, dXY și dZ segmentului curent.
 
 Nu există depth buffer în pipeline-ul 3D (folosește doar stencil), deci liniile și punctele nu se
-ocludează reciproc. E o alegere conștientă: nu atingem pipeline-urile upstream.
+ocludează reciproc. E o alegere conștientă: nu atingem pipeline-urile upstream. În schimb, snap-ul
+prioritizat pe adâncime compensează lipsa depth buffer-ului.
 
 ## 4. Comenzi
 
@@ -98,9 +122,11 @@ Toate sunt `CommandSpec`, deci merg din linia de comandă, CLI, control JSON și
 | `LASVISIBLE {visible?,index?}` | arată/ascunde |
 | `LASFRAME {index?}` | încadrează XY în 2D |
 | `LASCLOSE {index?,all?}` · `LASCLOUDS {}` | închide / listează |
-| `3DLINE {points:[[x,y,z],…]}` | adaugă o polilinie 3D |
-| `3DCLEAR` · `3DUNDO` · `3DLIST` | golire / ultimul stroke / listare |
-| `3DEXPORT {path,layer?}` | stroke-urile → DXF `LINE` cu Z |
+| `3DLINE {points:[[x,y,z],…], layer?, closed?}` | adaugă o polilinie 3D (implicit `3D_DRAFT`) |
+| `3DCLEAR` · `3DUNDO` · `3DLIST` | golire / ultimul stroke / listare (layer + closed) |
+| `3DEXPORT {path,layer?}` | stroke-urile → DXF `LINE` cu Z, fiecare pe layer-ul lui |
+| `3DSNAP {mode}` | `smooth` (implicit) sau `exact` |
+| `3DMEASURE {p1,p2}` | `dist_3d`, `dist_2d_xy`, `dx`, `dy`, `dz`, `slope_deg`, `slope_pct` |
 
 Exemplu:
 
@@ -116,8 +142,10 @@ Exemplu:
 - **Colour**: RGB, Elevation, Intensity, color picker.
 - **Remove walls / ceiling**: crop box pe axele X/Y/Z, reset din checkbox.
 - **3D / 2D**, **Fit**, **Show**, **Close**.
-- Secțiunea 3D: **Persp/Ortho**, **Lens**, **Top/Front/Iso**, **Fit**, mărime punct, **Draw 3D**,
-  **Finish/Cancel**, **Undo/Clear** și contorul de stroke-uri.
+- Secțiunea 3D:
+  - **Draw 3D** / **Measure**, **Finish** / **Close** / **Cancel**, **Undo** / **Clear**.
+  - **Smooth** / **Exact** (modul de snap), **Z lock**, **Ortho**, câmpul de layer.
+  - **Persp/Ortho**, **Fit**, **Top/Front/Iso**, slider de **Lens** și mărimea punctului.
 
 ## 6. Performanță măsurată (Ap 1, București)
 
@@ -139,9 +167,11 @@ Exemplu:
 |---|---|
 | `crates/pointcloud/src/read.rs`, `slice.rs` | citire LAS/LAZ, bandă Z, flux |
 | `crates/pointcloud/src/cloud.rs` | `Cloud`, `CloudLevel`, piramidă, culori |
-| `crates/pointcloud/src/sketch.rs` | `Sketch3d` (stroke-uri 3D) |
-| `crates/pointcloud/src/dxf.rs` | export DXF puncte + linii 3D |
-| `crates/engine/src/lib.rs` | `Session::clouds`, `Session::sketch` |
+| `crates/pointcloud/src/sketch.rs` | `Sketch3d`, `Stroke3` (puncte, layer, closed) |
+| `crates/pointcloud/src/snap.rs` | strat frontal, centroid, Z-lock, axis-lock |
+| `crates/pointcloud/src/measure.rs` | lungime, dXY, dZ, pantă |
+| `crates/pointcloud/src/dxf.rs` | export DXF puncte + linii 3D (per layer) |
+| `crates/engine/src/lib.rs` | `Session::clouds`, `Session::sketch`, `Session::snap3d` |
 | `crates/engine/src/cmd/pointcloud.rs` | toate comenzile `LAS*` și `3D*` |
 | `crates/ui-egui/src/canvas.rs` | overlay-ul 2D și filtrarea la view |
 | `crates/ui-egui/src/gpu.rs` | pipeline-ul instanced 2D |
@@ -154,10 +184,13 @@ Exemplu:
 
 - LAZ doar citire; fără streaming COPC (fișierul se deschide dintr-o singură trecere).
 - Fără filtru pe clasificare, fără export ortho PNG/GeoTIFF, fără histogramă de intensitate.
-- Fără depth buffer în 3D: punctele nu se oclud reciproc (bine pentru nori translucizi).
+- Fără depth buffer în 3D: punctele nu se oclud reciproc (bine pentru nori translucizi). Snap-ul
+  prioritizează adâncimea, deci nu sare prin pereți, dar rămâne o aproximație.
 - Stroke-urile 3D trăiesc în sesiune; persistă doar prin `3DEXPORT`.
 - `maxPoints` limitează nivelul cel mai fin; peste el grila e înrobită (răspunsul comenzii spune cât).
 - Desenul 2D upstream e 2D; nu am împins Z prin entități, snap-uri și grip-uri.
+- Smooth snap-ul e un centroid într-o sferă de 3 cm: la suprafețe cu detaliu sub 3 cm poate
+  netezi mici detalii (Exact e pentru asta).
 
 ## 9. Rulare și build
 
@@ -175,5 +208,9 @@ Control (JSON lines pe `127.0.0.1:47902`): `engine.execute`, `cmdline.input`, `u
 
 - M1–M5 (citire, overlay, LOD, paletă, 3D, rezoluție completă, spectru, crop): verificate pe
   fișierul real, `cargo xtask ci` verde.
-- M6 (cameră + 3D drafting): implementat; testele și verificarea live sunt pasul imediat următor
-  înainte de commit.
+- M6 (cameră + 3D drafting): implementat și verificat live (perspectivă/orto, zoom ancorat,
+  snap pe nor, export DXF).
+- M7 (snap cu strat frontal + Smooth/Exact, Z-lock, Axis Ortho, layere per stroke, închidere
+  polilinie, `3DMEASURE`): implementat, teste unitare în `crates/pointcloud` și
+  `crates/engine`, verificat live pe fișierul real (Z constant pe stroke, segment pe axă,
+  măsurare 8.184 m / dXY 7.731 / dZ 2.683, export cu layer).

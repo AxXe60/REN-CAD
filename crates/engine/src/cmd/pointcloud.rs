@@ -35,11 +35,13 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("lasframe", "Frame Point Cloud", lasframe).params("{index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasclose", "Close Point Cloud", lasclose).params("{index?: int, all?: bool}").enabled(always).noundo(),
         CommandSpec::new("lasclouds", "List Point Clouds", |s, _| lasclouds(s)).params("{}").enabled(always).noundo(),
-        CommandSpec::new("3dline", "3D Line", draw3d).params("{points: [[x,y,z], ...]}").enabled(always).noundo(),
+        CommandSpec::new("3dline", "3D Line", draw3d).params("{points: [[x,y,z], ...], layer?: string, closed?: bool}").enabled(always).noundo(),
         CommandSpec::new("3dclear", "Clear 3D Sketch", |s, _| sketch_clear(s)).params("{}").enabled(always).noundo(),
         CommandSpec::new("3dundo", "Undo 3D Stroke", |s, _| sketch_undo(s)).params("{}").enabled(always).noundo(),
         CommandSpec::new("3dlist", "List 3D Sketch", |s, _| sketch_list(s)).params("{}").enabled(always).noundo(),
         CommandSpec::new("3dexport", "Export 3D Sketch", sketch_export).params("{path: string, layer?: string}").enabled(always).noundo(),
+        CommandSpec::new("3dsnap", "3D Snap Mode", snap3d).params("{mode: \"smooth\"|\"exact\"}").enabled(always).noundo(),
+        CommandSpec::new("3dmeasure", "Measure 3D", |_, p| measure3d(p)).params("{p1: [x,y,z], p2: [x,y,z]}").enabled(always).noundo(),
     ]
 }
 
@@ -348,12 +350,45 @@ fn draw3d(s: &mut Session, p: &Value) -> Result<Value> {
         let pt = point3(v).ok_or_else(|| EngineError::Other(format!("`points[{i}]` must be [x, y, z] with finite numbers")))?;
         pts.push(pt);
     }
-    let vertices = s.sketch.add(&pts);
+    let layer = p.get("layer").and_then(Value::as_str).unwrap_or(cadcraft_pointcloud::DEFAULT_LAYER);
+    let closed = p.get("closed").and_then(Value::as_bool).unwrap_or(false);
+    let vertices = s.sketch.add(&pts, layer, closed);
     Ok(json!({
-        "message": format!("3D stroke: {vertices} vertices ({} strokes, {} segments)", s.sketch.count(), s.sketch.segments()),
+        "message": format!("3D stroke: {vertices} vertices on layer {layer}{} ({} strokes, {} segments)", if closed { ", closed" } else { "" }, s.sketch.count(), s.sketch.segments()),
         "vertices": vertices,
         "strokes": s.sketch.count(),
         "segments": s.sketch.segments(),
+        "layer": layer,
+        "closed": closed,
+    }))
+}
+
+/// How a click in the 3D view picks its point: `exact` (the cloud point itself) or `smooth` (the
+/// average of the points around it, which cancels the scan noise).
+fn snap3d(s: &mut Session, p: &Value) -> Result<Value> {
+    let text = text(p, "mode")?;
+    let mode = cadcraft_pointcloud::SnapMode::parse(text).ok_or_else(|| EngineError::Other(format!("unknown snap mode `{text}`: smooth, exact")))?;
+    s.snap3d = mode;
+    Ok(json!({
+        "message": format!("3D snap: {}", mode.name()),
+        "mode": mode.name(),
+    }))
+}
+
+/// Measure a segment between two points: its length, its run in plan, its rise and its slope.
+fn measure3d(p: &Value) -> Result<Value> {
+    let p1 = p.get("p1").and_then(point3).ok_or_else(|| EngineError::Other("`p1` must be [x, y, z]".into()))?;
+    let p2 = p.get("p2").and_then(point3).ok_or_else(|| EngineError::Other("`p2` must be [x, y, z]".into()))?;
+    let m = cadcraft_pointcloud::measure(p1, p2);
+    Ok(json!({
+        "message": cadcraft_pointcloud::readout(&m),
+        "dist_3d": m.length,
+        "dist_2d_xy": m.flat,
+        "dx": m.dx,
+        "dy": m.dy,
+        "dz": m.dz,
+        "slope_deg": m.slope_deg,
+        "slope_pct": m.slope_pct,
     }))
 }
 
@@ -385,9 +420,16 @@ fn sketch_list(s: &mut Session) -> Result<Value> {
         .iter()
         .enumerate()
         .map(|(i, st)| {
-            let first = st.first().copied().unwrap_or([0.0; 3]);
-            let last = st.last().copied().unwrap_or([0.0; 3]);
-            json!({ "index": i, "vertices": st.len(), "first": first, "last": last })
+            let first = st.points.first().copied().unwrap_or([0.0; 3]);
+            let last = st.points.last().copied().unwrap_or([0.0; 3]);
+            json!({
+                "index": i,
+                "vertices": st.points.len(),
+                "first": first,
+                "last": last,
+                "layer": st.layer,
+                "closed": st.closed,
+            })
         })
         .collect();
     Ok(json!({
@@ -399,18 +441,36 @@ fn sketch_list(s: &mut Session) -> Result<Value> {
 }
 
 /// Write the 3D sketch as DXF LINE entities, Z included, so it survives the session and can be
-/// traced over in the 2D drawing.
+/// traced over in the 2D drawing. Every stroke keeps its own layer; an explicit `layer` writes
+/// them all on that one instead.
 fn sketch_export(s: &mut Session, p: &Value) -> Result<Value> {
     let out = PathBuf::from(text(p, "path")?);
     if s.sketch.is_empty() {
         return Err(EngineError::Other("the 3D sketch is empty: draw with 3DLINE first".into()));
     }
-    let layer = p.get("layer").and_then(Value::as_str).unwrap_or("3D-SKETCH");
-    let written = cadcraft_pointcloud::write_strokes_dxf(&out, s.sketch.strokes(), layer).map_err(oops)?;
+    let forced = p.get("layer").and_then(Value::as_str).map(str::trim).filter(|l| !l.is_empty());
+    let strokes: Vec<cadcraft_pointcloud::Stroke3> = match forced {
+        Some(layer) => s
+            .sketch
+            .strokes()
+            .iter()
+            .map(|st| {
+                let mut copy = st.clone();
+                copy.layer = layer.to_string();
+                copy
+            })
+            .collect(),
+        None => s.sketch.strokes().to_vec(),
+    };
+    let written = cadcraft_pointcloud::write_strokes_dxf(&out, &strokes, "3D-SKETCH").map_err(oops)?;
+    let mut layers: Vec<&str> = strokes.iter().map(|st| st.layer.as_str()).collect();
+    layers.sort_unstable();
+    layers.dedup();
     Ok(json!({
-        "message": format!("{written} entities written to {} on layer {layer}", out.display()),
+        "message": format!("{written} entities written to {} on {}", out.display(), layers.join(", ")),
         "path": out.display().to_string(),
-        "layer": layer,
+        "layer": layers.first().copied().unwrap_or("3D-SKETCH"),
+        "layers": layers,
         "entities": written,
         "strokes": s.sketch.count(),
     }))
@@ -499,7 +559,15 @@ mod tests {
         let r = sketch_export(&mut s, &json!({"path": out.to_string_lossy()})).ok();
         assert_eq!(r.as_ref().and_then(|v| v["entities"].as_u64()), Some(1));
         let text = std::fs::read_to_string(&out).unwrap_or_default();
-        assert!(text.contains("LINE") && text.contains("3D-SKETCH"));
+        assert!(text.contains("LINE"), "{text}");
+        assert!(text.contains(cadcraft_pointcloud::DEFAULT_LAYER), "the stroke keeps its own layer: {text}");
+
+        // An explicit layer writes the whole sketch on that one.
+        let out2 = dir.join("sketch-layer.dxf");
+        sketch_export(&mut s, &json!({"path": out2.to_string_lossy(), "layer": "WALLS"})).ok();
+        let text = std::fs::read_to_string(&out2).unwrap_or_default();
+        assert!(text.contains("WALLS"), "{text}");
+        assert!(!text.contains(cadcraft_pointcloud::DEFAULT_LAYER), "{text}");
     }
 
     #[test]
@@ -520,6 +588,79 @@ mod tests {
             assert!(error.contains(name), "{error}");
             assert!(!error.contains("unsupported file type"), "{error}");
             assert!(s.clouds.is_empty());
+        }
+    }
+
+    /// A stroke remembers its layer and whether it is closed, and the export keeps both.
+    #[test]
+    fn a_stroke_keeps_its_layer_and_its_closing() {
+        let mut s = Session::new();
+        let r = draw3d(&mut s, &json!({"points": [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 2.0, 0.0]], "layer": "WALLS", "closed": true})).ok();
+        assert_eq!(r.as_ref().and_then(|v| v["closed"].as_bool()), Some(true));
+        assert_eq!(r.as_ref().and_then(|v| v["layer"].as_str()), Some("WALLS"));
+        assert_eq!(s.sketch.segments(), 3, "two sides and the closing one");
+        let list = sketch_list(&mut s).ok();
+        let first = list.as_ref().map(|v| v["strokes"][0].clone());
+        assert_eq!(first.as_ref().and_then(|v| v["layer"].as_str()), Some("WALLS"));
+        assert_eq!(first.as_ref().and_then(|v| v["closed"].as_bool()), Some(true));
+
+        let dir = std::env::temp_dir().join("cadcraft-3d-test");
+        std::fs::create_dir_all(&dir).ok();
+        let out = dir.join("layers.dxf");
+        let r = sketch_export(&mut s, &json!({"path": out.to_string_lossy()})).ok();
+        assert_eq!(r.as_ref().and_then(|v| v["entities"].as_u64()), Some(3));
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(text.contains("WALLS"), "{text}");
+    }
+
+    /// Without a layer a stroke lands on the default one.
+    #[test]
+    fn a_stroke_without_a_layer_gets_the_default_one() {
+        let mut s = Session::new();
+        draw3d(&mut s, &json!({"points": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]})).ok();
+        assert_eq!(s.sketch.strokes()[0].layer, cadcraft_pointcloud::DEFAULT_LAYER);
+    }
+
+    #[test]
+    fn the_snap_mode_is_read_set_and_refused_when_unknown() {
+        let mut s = Session::new();
+        assert_eq!(s.snap3d, cadcraft_pointcloud::SnapMode::Smooth, "smooth by default");
+        let r = snap3d(&mut s, &json!({"mode": "exact"})).ok();
+        assert_eq!(r.as_ref().and_then(|v| v["mode"].as_str()), Some("exact"));
+        assert_eq!(s.snap3d, cadcraft_pointcloud::SnapMode::Exact);
+        assert!(snap3d(&mut s, &json!({"mode": "nope"})).is_err());
+        assert!(snap3d(&mut s, &json!({})).is_err(), "the mode is required");
+        assert_eq!(s.snap3d, cadcraft_pointcloud::SnapMode::Exact, "a refused mode changes nothing");
+    }
+
+    #[test]
+    fn measuring_reports_the_length_the_run_and_the_slope() {
+        let r = measure3d(&json!({"p1": [0.0, 0.0, 0.0], "p2": [3.0, 4.0, 12.0]})).ok();
+        assert!((r.as_ref().and_then(|v| v["dist_3d"].as_f64()).unwrap_or(0.0) - 13.0).abs() < 1e-9);
+        assert!((r.as_ref().and_then(|v| v["dist_2d_xy"].as_f64()).unwrap_or(0.0) - 5.0).abs() < 1e-9);
+        assert_eq!(r.as_ref().and_then(|v| v["dx"].as_f64()), Some(3.0));
+        assert_eq!(r.as_ref().and_then(|v| v["dy"].as_f64()), Some(4.0));
+        assert_eq!(r.as_ref().and_then(|v| v["dz"].as_f64()), Some(12.0));
+        assert!((r.as_ref().and_then(|v| v["slope_deg"].as_f64()).unwrap_or(0.0) - 67.3801).abs() < 0.001);
+        assert!((r.as_ref().and_then(|v| v["slope_pct"].as_f64()).unwrap_or(0.0) - 240.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_vertical_measurement_has_no_percentage() {
+        let r = measure3d(&json!({"p1": [0.0, 0.0, 0.0], "p2": [0.0, 0.0, 2.5]})).ok();
+        assert!((r.as_ref().and_then(|v| v["slope_deg"].as_f64()).unwrap_or(0.0) - 90.0).abs() < 1e-9);
+        assert!(r.as_ref().and_then(|v| v["slope_pct"].as_f64()).is_none());
+    }
+
+    #[test]
+    fn hostile_measure_points_are_refused() {
+        for bad in [
+            json!({}),
+            json!({"p1": [0.0, 0.0, 0.0]}),
+            json!({"p1": [0.0, 0.0], "p2": [1.0, 1.0, 1.0]}),
+            json!({"p1": [0.0, "x", 0.0], "p2": [1.0, 1.0, 1.0]}),
+        ] {
+            assert!(measure3d(&bad).is_err(), "{bad}");
         }
     }
 }

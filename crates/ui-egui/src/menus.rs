@@ -139,21 +139,67 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         }
         if let Some(draw) = params.get("draw").and_then(Value::as_bool) {
             app.view3d.draft.active = draw;
+            app.view3d.draft.tool = crate::view3d::DraftTool::Draw;
             app.view3d.draft.cancel();
         }
+        // The tool the clicks use: draw a polyline, measure a segment, or nothing.
+        match params.get("tool").and_then(Value::as_str) {
+            Some("draw") => {
+                app.view3d.draft.active = true;
+                app.view3d.draft.tool = crate::view3d::DraftTool::Draw;
+            }
+            Some("measure") => {
+                app.view3d.draft.active = true;
+                app.view3d.draft.tool = crate::view3d::DraftTool::Measure;
+            }
+            Some("off" | "none") => app.view3d.draft.active = false,
+            _ => {}
+        }
+        if let Some(mode) = params.get("snap").and_then(Value::as_str)
+            && let Some(mode) = cadcraft_pointcloud::SnapMode::parse(mode)
+        {
+            let _ = app.run("3dsnap", json!({ "mode": mode.name() }));
+        }
+        if let Some(lock) = params.get("zlock").and_then(Value::as_bool) {
+            app.view3d.draft.z_lock = lock;
+        }
+        if let Some(ortho) = params.get("ortho3d").and_then(Value::as_bool) {
+            app.view3d.draft.ortho = ortho;
+        }
+        if let Some(layer) = params.get("layer").and_then(Value::as_str).map(str::trim).filter(|l| !l.is_empty()) {
+            app.view3d.draft.layer = layer.to_string();
+        }
         if params.get("finish").and_then(Value::as_bool).unwrap_or(false) {
-            crate::view3d::finish_draft(app);
+            crate::view3d::finish_draft(app, false);
+        }
+        if params.get("close").and_then(Value::as_bool).unwrap_or(false) {
+            crate::view3d::finish_draft(app, true);
         }
         if params.get("cancel").and_then(Value::as_bool).unwrap_or(false) {
             crate::view3d::cancel_draft(app);
         }
+        let measure = app.view3d.draft.measure.map(|m| {
+            json!({
+                "length": m.measure.length,
+                "flat": m.measure.flat,
+                "rise": m.measure.rise,
+                "slope_deg": m.measure.slope_deg,
+                "slope_pct": m.measure.slope_pct,
+            })
+        });
         return Some(Ok(json!({
             "view3d": on,
             "points": app.view3d.drawn,
             "projection": app.view3d.projection.name(),
             "lens": app.view3d.fov_y.to_degrees(),
             "drawing": app.view3d.draft.active,
+            "tool": app.view3d.draft.tool.name(),
+            "snap": app.session.snap3d.name(),
+            "zLock": app.view3d.draft.z_lock,
+            "ortho3d": app.view3d.draft.ortho,
+            "layer": app.view3d.draft.layer,
             "strokeVertices": app.view3d.draft.points.len(),
+            "measure": measure,
         })));
     }
     // Explicit opens remain idempotent; typed QUICKCALC with JSON parameters uses the engine's CAL alias.

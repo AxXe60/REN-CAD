@@ -712,6 +712,9 @@ pub struct Session {
     pub clouds: Vec<cadcraft_pointcloud::Cloud>,
     /// 3D strokes drawn over the clouds with 3DLINE (fork addition; the drawing model is 2D).
     pub sketch: cadcraft_pointcloud::Sketch3d,
+    /// How a click in the 3D view picks its point: the exact cloud point, or the average of the
+    /// points around it (fork addition; set with 3DSNAP).
+    pub snap3d: cadcraft_pointcloud::SnapMode,
 }
 
 impl Default for Session {
@@ -763,6 +766,7 @@ impl Session {
             hatch_picks: None,
             clouds: Vec::new(),
             sketch: cadcraft_pointcloud::Sketch3d::default(),
+            snap3d: cadcraft_pointcloud::SnapMode::default(),
         }
     }
     pub fn new_drawing(&mut self, metric: bool) -> usize {

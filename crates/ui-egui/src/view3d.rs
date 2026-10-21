@@ -18,11 +18,23 @@
 //! into the session's [`cadcraft_pointcloud::Sketch3d`] through the `3dline` command. The strokes
 //! are projected with the same camera and painted over the points, so a wall can be traced in
 //! elevation without ever leaving the 3D view.
+//!
+//! The snap is smart about depth: the 3D pipeline has no depth buffer, so the candidates under the
+//! cursor are ranked by their distance to the camera and only the front layer is kept. A click
+//! therefore cannot snap through a wall seen through a gap in the near one. Two modes: `Exact` (the
+//! cloud point itself) and `Smooth` (the average of the points around it, which cancels the
+//! 2-5 mm scan noise a wall is made of).
+//!
+//! Three constraints make the tracing behave like drafting: the **Z lock** holds the stroke in the
+//! horizontal plane of its first vertex, the **axis lock** makes a segment follow the cardinal axis
+//! it is closest to (hold Shift), and the **measure tool** reports the length, the run in plan and
+//! the rise of a segment.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
 use cadcraft_pointcloud::CloudColor;
+use cadcraft_pointcloud::{FRONT_LAYER_M, SMOOTH_RADIUS_M, SnapHit, SnapMode, axis_locked, front_layer, nearest, smooth_centroid, z_locked};
 use egui::{Pos2, Rect, Sense, pos2, vec2};
 
 use crate::CadApp;
@@ -74,16 +86,53 @@ pub struct View3d {
     slot: SceneSlot,
 }
 
+/// What a click in the 3D view does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DraftTool {
+    /// Place the vertices of a polyline.
+    #[default]
+    Draw,
+    /// Measure between two points.
+    Measure,
+}
+
+impl DraftTool {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Draw => "draw",
+            Self::Measure => "measure",
+        }
+    }
+}
+
+/// A measurement taken in the 3D view: the two points and what they measure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Measured {
+    pub a: [f64; 3],
+    pub b: [f64; 3],
+    pub measure: cadcraft_pointcloud::Measure,
+}
+
 /// The 3D polyline being drawn in the view.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Draft3d {
     pub active: bool,
+    /// Whether the clicks place vertices or measure a segment.
+    pub tool: DraftTool,
     /// Vertices placed so far in the current stroke.
     pub points: Vec<[f64; 3]>,
     /// Where the next click would land.
     pub hover: Option<[f64; 3]>,
     /// Whether [`Self::hover`] is a cloud point (snapped) rather than the view plane.
     pub snapped: bool,
+    /// Hold the stroke in the horizontal plane of its first vertex.
+    pub z_lock: bool,
+    /// Make every segment follow the cardinal axis it is closest to (Shift does it for one move).
+    pub ortho: bool,
+    /// The layer the finished stroke is written on.
+    pub layer: String,
+    /// The last measurement, kept on screen until the next one.
+    pub measure: Option<Measured>,
 }
 
 impl Draft3d {
@@ -92,6 +141,22 @@ impl Draft3d {
         self.points.clear();
         self.hover = None;
         self.snapped = false;
+    }
+}
+
+impl Default for Draft3d {
+    fn default() -> Self {
+        Self {
+            active: false,
+            tool: DraftTool::Draw,
+            points: Vec::new(),
+            hover: None,
+            snapped: false,
+            z_lock: false,
+            ortho: false,
+            layer: cadcraft_pointcloud::DEFAULT_LAYER.to_string(),
+            measure: None,
+        }
     }
 }
 
@@ -423,9 +488,20 @@ impl Screen {
 /// How close to a cloud point, in screen points, a click snaps to it.
 const SNAP_PX: f32 = 14.0;
 
-/// The nearest uploaded cloud point to `at`, searched on a sample of the scene so a hover costs a
+/// How many candidates under the cursor are kept before the front layer is cut out of them.
+const MAX_SNAP_HITS: usize = 20_000;
+
+/// The cloud point a click snaps to, searched on a sample of the scene so a hover costs a
 /// millisecond: the scan is dense enough that a 1-in-12 sample still lands within a millimetre.
-fn snap_to_cloud(slot: &SceneSlot, screen: &Screen, at: Pos2) -> Option<[f64; 3]> {
+///
+/// The candidates are ranked by their distance to the camera and only the **front layer** is kept —
+/// the shallowest ones plus everything within [`FRONT_LAYER_M`] behind them. That is what keeps a
+/// click from snapping through a far wall seen through a gap in the near one, without a depth
+/// buffer in the pipeline.
+///
+/// In `Smooth` mode the point is the average of the cloud points around the winner (a 3 cm
+/// sphere), which cancels the 2-5 mm scan noise; in `Exact` mode it is the cloud point itself.
+fn snap_to_cloud(slot: &SceneSlot, screen: &Screen, at: Pos2, mode: SnapMode) -> Option<[f64; 3]> {
     let guard = slot.lock().ok()?;
     let scene = guard.as_ref()?;
     let n = scene.points.len();
@@ -433,39 +509,71 @@ fn snap_to_cloud(slot: &SceneSlot, screen: &Screen, at: Pos2) -> Option<[f64; 3]
         return None;
     }
     let step = (n / 250_000).max(1);
-    let mut best = SNAP_PX * SNAP_PX;
-    let mut hit = None;
+    let mut hits: Vec<SnapHit> = Vec::new();
     for p in scene.points.iter().step_by(step) {
         let world = [f64::from(p.pos[0]), f64::from(p.pos[1]), f64::from(p.pos[2])];
-        if let Some(q) = screen.project(world) {
-            let d = (q.x - at.x).powi(2) + (q.y - at.y).powi(2);
-            if d < best {
-                best = d;
-                hit = Some(world);
+        let Some(q) = screen.project(world) else { continue };
+        let dx = q.x - at.x;
+        let dy = q.y - at.y;
+        if dx * dx + dy * dy > SNAP_PX * SNAP_PX {
+            continue;
+        }
+        let depth = dot(sub(world, screen.eye), screen.forward);
+        if hits.len() >= MAX_SNAP_HITS {
+            // A candidate deeper than the current front can never come back into it, so it goes.
+            let limit = hits.iter().map(|h| h.depth).fold(f64::INFINITY, f64::min) + FRONT_LAYER_M;
+            hits.retain(|h| h.depth <= limit);
+            if hits.len() >= MAX_SNAP_HITS {
+                break;
             }
         }
+        hits.push(SnapHit { point: world, depth, screen: [q.x, q.y] });
     }
-    hit
+    let front = front_layer(&hits, FRONT_LAYER_M);
+    let winner = nearest(&front, [at.x, at.y])?;
+    match mode {
+        SnapMode::Exact => Some(winner.point),
+        SnapMode::Smooth => Some(smooth_centroid(
+            winner.point,
+            scene.points.iter().step_by(step).map(|p| [f64::from(p.pos[0]), f64::from(p.pos[1]), f64::from(p.pos[2])]),
+            SMOOTH_RADIUS_M,
+        )),
+    }
 }
 
 /// Where a click at `at` places a vertex: the nearest cloud point within [`SNAP_PX`], else the
 /// view plane through the orbit target.
 fn place_point(app: &CadApp, screen: &Screen, at: Pos2) -> Option<([f64; 3], bool)> {
-    if let Some(p) = snap_to_cloud(&app.view3d.slot, screen, at) {
+    if let Some(p) = snap_to_cloud(&app.view3d.slot, screen, at, app.session.snap3d) {
         return Some((p, true));
     }
     app.view3d.plane_point(at, screen.rect).map(|p| (p, false))
 }
 
-/// Commit the stroke being drawn through `3dline` (the same command a script would call).
-pub fn finish_draft(app: &mut CadApp) {
+/// The drawing constraints: the Z lock holds the stroke in the plane of its first vertex, and the
+/// axis lock makes the segment follow the cardinal axis it is closest to (`Shift` does it for one
+/// move).
+fn constrain(draft: &Draft3d, p: [f64; 3], shift: bool) -> [f64; 3] {
+    let mut out = z_locked(p, draft.points.first().copied(), draft.z_lock);
+    if (shift || draft.ortho)
+        && let Some(last) = draft.points.last().copied()
+    {
+        out = axis_locked(out, last);
+    }
+    out
+}
+
+/// Commit the stroke being drawn through `3dline` (the same command a script would call). A closed
+/// stroke joins its last vertex back to its first.
+pub fn finish_draft(app: &mut CadApp, closed: bool) {
     let points = std::mem::take(&mut app.view3d.draft.points);
+    let layer = app.view3d.draft.layer.clone();
     app.view3d.draft.hover = None;
     app.view3d.draft.snapped = false;
     if points.is_empty() {
         return;
     }
-    if let Err(error) = app.run("3dline", serde_json::json!({ "points": points })) {
+    if let Err(error) = app.run("3dline", serde_json::json!({ "points": points, "layer": layer, "closed": closed })) {
         app.session.echo(error.clone());
         app.set_status(error);
     }
@@ -475,6 +583,20 @@ pub fn finish_draft(app: &mut CadApp) {
 pub fn cancel_draft(app: &mut CadApp) {
     app.view3d.draft.cancel();
     app.view3d.draft.active = false;
+}
+
+/// Measure a segment through the `3dmeasure` command, so the number on screen is the number a
+/// script gets.
+fn measure_between(app: &mut CadApp, a: [f64; 3], b: [f64; 3]) -> Measured {
+    let mut measure = cadcraft_pointcloud::measure(a, b);
+    if let Ok(value) = app.run("3dmeasure", serde_json::json!({ "p1": a, "p2": b }))
+        && let Some(length) = value.get("dist_3d").and_then(serde_json::Value::as_f64)
+        && let Some(flat) = value.get("dist_2d_xy").and_then(serde_json::Value::as_f64)
+    {
+        measure.length = length;
+        measure.flat = flat;
+    }
+    Measured { a, b, measure }
 }
 
 /// Show the 3D view in `rect` (the canvas area). Called by [`crate::canvas::show`].
@@ -536,19 +658,49 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     // ---------- drafting ----------
     let mut finished = false;
     let mut cancelled = false;
+    let mut close_stroke = false;
     if app.view3d.draft.active {
         let screen = Screen::new(&app.view3d, vp, rect);
         let at = pointer.filter(|p| rect.contains(*p));
-        let placed = at.and_then(|p| place_point(app, &screen, p));
+        let placed = at.and_then(|p| place_point(app, &screen, p)).map(|(p, s)| (constrain(&app.view3d.draft, p, shift), s));
         app.view3d.draft.hover = placed.map(|(p, _)| p);
         app.view3d.draft.snapped = placed.is_some_and(|(_, s)| s);
 
         // A double-click ends the stroke (its first click already placed the last vertex); a
         // right-click ends it without adding one.
-        finished = resp.double_clicked() || resp.secondary_clicked();
-        let add = resp.clicked() && !resp.dragged() && !finished;
+        let double = resp.double_clicked();
+        let secondary = resp.secondary_clicked();
+        let measuring = app.view3d.draft.tool == DraftTool::Measure;
+        finished = (double || secondary) && !measuring;
+        let add = resp.clicked() && !resp.dragged() && !double && !secondary;
         if add && let Some((p, _)) = placed {
             app.view3d.draft.points.push(p);
+            if measuring && app.view3d.draft.points.len() == 2 {
+                let (a, b) = (app.view3d.draft.points[0], app.view3d.draft.points[1]);
+                let measured = measure_between(app, a, b);
+                app.view3d.draft.measure = Some(measured);
+                app.view3d.draft.points.clear();
+            }
+        }
+        if (double || secondary) && measuring {
+            // A right-click drops the pending measurement.
+            app.view3d.draft.points.clear();
+        }
+        // Z holds the plane, C closes the stroke. They are consumed so they never reach the
+        // command line as text.
+        if inside {
+            let (z, c) = ui.input_mut(|i| {
+                let z = i.consume_key(egui::Modifiers::NONE, egui::Key::Z);
+                let c = i.consume_key(egui::Modifiers::NONE, egui::Key::C);
+                if z || c {
+                    i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case("z") || t.eq_ignore_ascii_case("c")));
+                }
+                (z, c)
+            });
+            if z {
+                app.view3d.draft.z_lock = !app.view3d.draft.z_lock;
+            }
+            close_stroke = c && !measuring;
         }
         cancelled = inside && ui.input(|i| i.key_pressed(egui::Key::Escape));
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -556,8 +708,10 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     if cancelled {
         app.view3d.draft.cancel();
     }
-    if finished {
-        finish_draft(app);
+    if close_stroke {
+        finish_draft(app, true);
+    } else if finished {
+        finish_draft(app, false);
     }
     if resp.double_clicked() && !app.view3d.draft.active {
         let bounds = cloud_bounds(app);
@@ -613,7 +767,19 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
         app.view3d.drawn
     );
     if app.view3d.draft.active {
-        info.push_str("\nDraw 3D: click places a vertex (snaps to the cloud) · right-click or double-click ends · Esc cancels");
+        let draft = &app.view3d.draft;
+        if draft.tool == DraftTool::Measure {
+            info.push_str("\nMeasure 3D: click two points (they snap to the cloud) · right-click clears · Esc leaves");
+        } else {
+            info.push_str("\nDraw 3D: click places a vertex (snaps to the cloud) · right-click or double-click ends · Esc cancels");
+        }
+        info.push_str(&format!("\nSnap: {} · Z: plane lock {}", app.session.snap3d.name(), if draft.z_lock { "on" } else { "off" }));
+        if draft.ortho {
+            info.push_str(" · Ortho on (Shift for one move)");
+        }
+        if let Some(m) = draft.measure {
+            info.push_str(&format!("\n{}", cadcraft_pointcloud::readout(&m.measure)));
+        }
     } else if !app.session.sketch.is_empty() {
         info.push_str(&format!("\n3D sketch: {} strokes, {} segments", app.session.sketch.count(), app.session.sketch.segments()));
     }
@@ -633,7 +799,7 @@ fn draw_sketch(painter: &egui::Painter, view: &View3d, vp: &[f32; 16], rect: Rec
         }
     }
     for stroke in sketch.strokes() {
-        for p in stroke {
+        for p in &stroke.points {
             if let Some(q) = screen.project(*p) {
                 painter.circle_filled(q, 2.5, color);
             }
@@ -653,6 +819,9 @@ fn draw_sketch(painter: &egui::Painter, view: &View3d, vp: &[f32; 16], rect: Rec
         && let (Some(a), Some(b)) = (screen.project(*last), screen.project(hover))
     {
         painter.line_segment([a, b], egui::Stroke::new(1.5, color.gamma_multiply(0.75)));
+        // The live numbers of the segment being drawn: its length, its run and its rise.
+        let m = cadcraft_pointcloud::measure(*last, hover);
+        painter.text(b + vec2(10.0, -10.0), egui::Align2::LEFT_BOTTOM, cadcraft_pointcloud::readout(&m), egui::FontId::monospace(12.0), color);
     }
     if let Some(hover) = draft.hover
         && let Some(q) = screen.project(hover)
@@ -662,6 +831,23 @@ fn draw_sketch(painter: &egui::Painter, view: &View3d, vp: &[f32; 16], rect: Rec
         if draft.snapped {
             painter.circle_filled(q, 2.0, stroke.color);
         }
+    }
+    // The measurement that was taken: the segment and its numbers.
+    if let Some(m) = draft.measure
+        && let (Some(a), Some(b)) = (screen.project(m.a), screen.project(m.b))
+    {
+        let blue = egui::Color32::from_rgb(0x4A, 0xC8, 0xFF);
+        painter.line_segment([a, b], egui::Stroke::new(2.0, blue));
+        painter.circle_stroke(a, 4.0, egui::Stroke::new(1.5, blue));
+        painter.circle_stroke(b, 4.0, egui::Stroke::new(1.5, blue));
+        let mid = pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+        painter.text(
+            mid + vec2(10.0, -10.0),
+            egui::Align2::LEFT_BOTTOM,
+            cadcraft_pointcloud::readout(&m.measure),
+            egui::FontId::monospace(12.0),
+            blue,
+        );
     }
 }
 
@@ -924,5 +1110,26 @@ mod tests {
         assert!((f[1] - 1.0).abs() < 1e-9 && r[0] > 0.99 && u[2] > 0.99, "front: +Y with X right and Z up");
         v.iso();
         assert!((v.yaw + 2.2).abs() < 1e-9 && (v.pitch - 0.55).abs() < 1e-9);
+    }
+
+    /// The Z lock holds the stroke in the plane of its first vertex; the axis lock makes the
+    /// segment leave the last vertex along one cardinal axis.
+    #[test]
+    fn the_constraints_shape_the_points() {
+        let mut draft = Draft3d::default();
+        draft.points.push([1.0, 2.0, 3.0]);
+        draft.z_lock = true;
+        assert_eq!(constrain(&draft, [5.0, 6.0, 9.0], false), [5.0, 6.0, 3.0], "the plane holds");
+        draft.z_lock = false;
+        assert_eq!(constrain(&draft, [5.0, 6.0, 9.0], false), [5.0, 6.0, 9.0], "off: the point is untouched");
+        assert_eq!(constrain(&draft, [5.0, 2.1, 3.05], true), [5.0, 2.0, 3.0], "Shift: one axis only");
+        draft.ortho = true;
+        assert_eq!(constrain(&draft, [5.0, 2.1, 3.05], false), [5.0, 2.0, 3.0], "the toggle does the same");
+    }
+
+    #[test]
+    fn a_new_draft_writes_on_the_default_layer() {
+        assert_eq!(Draft3d::default().layer, cadcraft_pointcloud::DEFAULT_LAYER);
+        assert_eq!(Draft3d::default().tool, DraftTool::Draw);
     }
 }

@@ -1,6 +1,6 @@
 # Point clouds (LAS/LAZ) — RENCAD
 
-> **Last reviewed:** 2026-10-21 · **Status:** M6 — camera (ortho/perspective) and 3D drafting · **Fork addition**
+> **Last reviewed:** 2026-10-21 · **Status:** M7 — smart 3D snapping, drawing constraints, measuring · **Fork addition**
 
 RENCAD is the working name of this fork of CADCraft (the crates and the binary keep their upstream
 names so the weekly rebase stays a fast-forward). The fork adds point cloud support: M1 read a
@@ -12,7 +12,11 @@ on real scans: the finest level can be every point of the file, intensity is a c
 grid is a 3D cube so walls keep their height, and a crop box removes the ceiling or the walls.
 M6 makes the 3D view a working surface: a long-lens perspective or true orthographic camera, zoom
 anchored at the cursor and named views, plus **3D drafting** — polylines traced over the cloud that
-snap to its points and export as DXF `LINE` entities.
+snap to its points and export as DXF `LINE` entities. M7 makes that tracing behave like drafting:
+the snap keeps only the **front layer** under the cursor (so it cannot snap through a wall) and can
+average the scan noise away, the stroke can be held in a horizontal plane (**Z lock**) or on one
+cardinal axis (**ortho**), every stroke carries a **layer**, a polyline can be **closed**, and a
+**measure** tool reports the length, the run in plan and the rise of a segment.
 
 ## Commands
 
@@ -179,10 +183,11 @@ script cannot drift apart.
 - **Remove walls / ceiling** enables a crop box: one min/max pair per axis. Lower the Z maximum to
   drop the ceiling, raise the Z minimum for the floor, pull X and Y in for the walls; untick it to
   restore every point (the file is not re-read).
-- When the 3D view is on, the camera controls appear: **Persp/Ortho**, the **Lens** slider,
-  **Top/Front/Iso**, **Fit**, the point-size slider and the number of points on screen.
-- Below them, **Draw 3D** enables 3D drafting, with **Finish** and **Cancel** for the stroke being
-  drawn, **Undo**/**Clear** for the committed ones and a stroke/segment count.
+- When the 3D view is on, the camera controls appear: **Persp/Ortho**, **Fit**, **Top/Front/Iso**,
+  the **Lens** slider and the point size.
+- Above them, the drafting tools: **Draw 3D** and **Measure**, then **Finish**/**Close**/**Cancel**
+  for the stroke being drawn, **Undo**/**Clear** for the committed ones, the snap mode
+  (**Smooth**/**Exact**), the **Z lock** and **Ortho** checkboxes and the layer field.
 
 ## The 3D view
 
@@ -220,32 +225,78 @@ perspective view of the visible clouds in the same rectangle; `{"on": false}` re
 The palette's **Draw 3D** turns the 3D view into a drafting surface (the `3DLINE` command is the
 same path for scripts):
 
-- A click places a vertex. It **snaps to the nearest cloud point** within 14 screen points (the
-  uploaded scene is searched on a ~250k-point sample, which is a millisecond per frame); with no
-  point nearby it lands on the view plane through the orbit target, so free vertices are always at
-  the depth you are looking at.
+- A click places a vertex. It **snaps to the cloud** within 14 screen points (the uploaded scene is
+  searched on a ~250k-point sample, which is a millisecond per frame); with no point nearby it lands
+  on the view plane through the orbit target, so free vertices are always at the depth you are
+  looking at.
 - The next vertex is previewed as a rubber band; a green ring and dot mark a snapped point, an
   orange ring a free one.
-- **Double-click** or **right-click** ends the stroke, **Esc** or **Cancel** drops it. Ending a
-  stroke calls `3DLINE`, so it lands in `Session::sketch` exactly as it would from a script.
+- **Double-click** or **right-click** ends the stroke, **Esc** or **Cancel** drops it, **C** closes
+  the polyline (the last vertex joins the first). Ending a stroke calls `3DLINE`, so it lands in
+  `Session::sketch` exactly as it would from a script.
 - Committed strokes are painted over the points in orange (the clouds' pipeline has no depth
   buffer, so the sketch is deliberately always visible). `3DUNDO` drops the last stroke, `3DCLEAR`
   all of them, and `3DEXPORT {path}` writes them as DXF `LINE` entities with their Z (a lone vertex
-  becomes a `POINT`), ready to open as an ordinary drawing file.
+  becomes a `POINT`), each on its own layer, ready to open as an ordinary drawing file.
 
-### `3DLINE`, `3DCLEAR`, `3DUNDO`, `3DLIST`, `3DEXPORT`
+### Smart snapping
 
-`3DLINE {points: [[x,y,z], …]}` appends one polyline (at most 100,000 vertices; non-finite
-coordinates are refused). `3DLIST` reports each stroke's vertex count and endpoints. `3DEXPORT
-{path, layer?}` writes the strokes on `3D-SKETCH` by default, and refuses an empty sketch instead of
-writing an empty file.
+The 3D pipeline has no depth buffer, so the snap cannot ask the GPU which point is in front. It
+ranks the candidates itself:
+
+1. Every visible point that projects within 14 px of the cursor is a candidate, with its distance
+   to the camera along the view direction.
+2. The **front layer** is the shallowest candidate plus everything within 0.15 m behind it. A point
+   on the far wall, seen through a gap in the near one, is deeper and stays out of the layer.
+3. The winner is the candidate of the front layer closest to the cursor.
+4. `Smooth` (the default) then averages the cloud points within a 3 cm sphere around the winner:
+   the 2-5 mm scan noise of a wall cancels out. `Exact` keeps the cloud point itself.
+
+`3DSNAP {mode}` switches the mode; the palette shows it as **Smooth** / **Exact**. The rules live
+in `crates/pointcloud/src/snap.rs` (`front_layer`, `nearest`, `smooth_centroid`) and are unit
+tested there.
+
+### Drawing constraints
+
+- **Z lock** (`Z` in the view, or a checkbox): a new vertex takes the X and Y of the snap but the Z
+  of the stroke's first vertex, so the whole stroke stays in one horizontal plane.
+- **Axis ortho** (`Shift` for one move, or a checkbox): the new vertex leaves the last one along
+  the cardinal axis the movement is closest to, so a segment is never accidentally diagonal.
+
+Both are pure functions in `crates/pointcloud/src/snap.rs` (`z_locked`, `axis_locked`).
+
+### Measuring 3D
+
+`3DMEASURE {p1, p2}` returns the numbers of a segment: `dist_3d`, `dist_2d_xy`, `dx`, `dy`, `dz`,
+`slope_deg` and `slope_pct` (null for a vertical segment, which has no horizontal run to compare).
+The palette's **Measure** mode measures with two clicks that snap to the cloud; the segment stays
+on screen in blue with its numbers, and the rubber band shows the length, the run and the rise live
+while a stroke is being drawn. The arithmetic lives in `crates/pointcloud/src/measure.rs`, so the
+command and the screen always agree.
+
+### `3DLINE`, `3DCLEAR`, `3DUNDO`, `3DLIST`, `3DEXPORT`, `3DSNAP`, `3DMEASURE`
+
+`3DLINE {points: [[x,y,z], …], layer?, closed?}` appends one polyline (at most 100,000 vertices;
+non-finite coordinates are refused). The layer defaults to `3D_DRAFT`; `closed: true` joins the
+last vertex back to the first. `3DLIST` reports each stroke's vertex count, endpoints, layer and
+closed flag. `3DEXPORT {path, layer?}` writes the strokes, each on its own layer (an explicit
+`layer` puts them all on one instead), and refuses an empty sketch instead of writing an empty
+file.
 
 ```json
-{"command":"3dline","params":{"points":[[0,0,1.2],[4,0,1.2],[4,3,1.2]]}}
+{"command":"3dline","params":{"points":[[0,0,1.2],[4,0,1.2],[4,3,1.2]],"layer":"WALLS"}}
 ```
 
 ```json
-{"message":"3D stroke: 3 vertices (1 strokes, 2 segments)","vertices":3,"strokes":1,"segments":2}
+{"message":"3D stroke: 3 vertices on layer WALLS (1 strokes, 2 segments)","vertices":3,"strokes":1,"segments":2}
+```
+
+```json
+{"command":"3dmeasure","params":{"p1":[0,0,0],"p2":[3,4,12]}}
+```
+
+```json
+{"dist_3d":13.0,"dist_2d_xy":5.0,"dx":3.0,"dy":4.0,"dz":12.0,"slope_deg":67.38,"slope_pct":240.0}
 ```
 
 The strokes live beside the clouds in `Session::sketch`, not in the drawing model: upstream entities
@@ -292,7 +343,7 @@ buffer.
 - The CPU path (no GPU target) draws the same list as egui rectangles — slower, but clouds stay
   visible.
 
-## Limits (M6)
+## Limits (M7)
 
 - LAZ is read, not written; no COPC streaming yet — a file is opened in one pass.
 - No classification filter, no ortho PNG/GeoTIFF export, no intensity histogram.
@@ -303,7 +354,10 @@ buffer.
   the level is coarsened until it fits, so the cap applies to the points on screen, not the cloud.
 - The 3D view draws clouds and 3D strokes only; the 2D drawing and the ViewCube are not part of it.
   It has no depth buffer, so points and strokes do not occlude each other (fine for translucent
-  scans, wrong for solid surfaces later).
+  scans, wrong for solid surfaces later). The snap compensates by ranking the candidates by depth
+  and keeping only the front layer, but that is an approximation of a real depth test.
+- The `Smooth` snap averages a 3 cm sphere, so details smaller than that are flattened; use `Exact`
+  when the surface detail matters.
 - 3D strokes live in the session: they survive closing the palette and switching to 2D, but not a
   restart. `3DEXPORT` is the way to keep them; the wrap-up into drawing entities waits for the 3D
   kernel.

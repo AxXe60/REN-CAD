@@ -196,24 +196,22 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         let strokes = app.session.sketch.count();
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            let active = app.view3d.draft.active;
-            let hint = format!("Click in the 3D view to place vertices; each click snaps to the nearest cloud point ({strokes} strokes so far)");
-            if ui.selectable_label(active, "Draw 3D").on_hover_text(hint).clicked() {
-                app.view3d.draft.active = !active;
+            let drawing = app.view3d.draft.active && app.view3d.draft.tool == crate::view3d::DraftTool::Draw;
+            let hint = format!("Click in the 3D view to place vertices; each click snaps to the cloud ({strokes} strokes so far)");
+            if ui.selectable_label(drawing, "Draw 3D").on_hover_text(hint).clicked() {
+                app.view3d.draft.active = !drawing;
+                app.view3d.draft.tool = crate::view3d::DraftTool::Draw;
                 app.view3d.draft.cancel();
             }
-            if active {
-                let placed = app.view3d.draft.points.len();
-                if ui
-                    .add_enabled(placed > 0, egui::Button::new("Finish"))
-                    .on_hover_text("End the stroke (double-click or right-click in the view)")
-                    .clicked()
-                {
-                    crate::view3d::finish_draft(app);
-                }
-                if ui.button("Cancel").clicked() {
-                    crate::view3d::cancel_draft(app);
-                }
+            let measuring = app.view3d.draft.active && app.view3d.draft.tool == crate::view3d::DraftTool::Measure;
+            if ui
+                .selectable_label(measuring, "Measure")
+                .on_hover_text("Click two points to measure: the length, the run in plan and the rise")
+                .clicked()
+            {
+                app.view3d.draft.active = !measuring;
+                app.view3d.draft.tool = crate::view3d::DraftTool::Measure;
+                app.view3d.draft.cancel();
             }
             if ui.small_button("Undo").on_hover_text("Drop the last 3D stroke (3DUNDO)").clicked() {
                 run(app, "3dundo", json!({}));
@@ -223,10 +221,71 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             }
         });
 
+        if app.view3d.draft.active {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let placed = app.view3d.draft.points.len();
+                let measuring = app.view3d.draft.tool == crate::view3d::DraftTool::Measure;
+                if ui
+                    .add_enabled(placed > 0 && !measuring, egui::Button::new("Finish"))
+                    .on_hover_text("End the stroke (double-click or right-click in the view)")
+                    .clicked()
+                {
+                    crate::view3d::finish_draft(app, false);
+                }
+                if ui
+                    .add_enabled(placed > 1 && !measuring, egui::Button::new("Close"))
+                    .on_hover_text("Close the stroke: the last vertex joins the first (C in the view)")
+                    .clicked()
+                {
+                    crate::view3d::finish_draft(app, true);
+                }
+                if ui.button("Cancel").on_hover_text("Drop the stroke being drawn (Esc in the view)").clicked() {
+                    crate::view3d::cancel_draft(app);
+                }
+                let mut z_lock = app.view3d.draft.z_lock;
+                if ui
+                    .checkbox(&mut z_lock, "Z lock")
+                    .on_hover_text("Hold the stroke in the horizontal plane of its first vertex (Z in the view)")
+                    .changed()
+                {
+                    app.view3d.draft.z_lock = z_lock;
+                }
+                let mut ortho = app.view3d.draft.ortho;
+                if ui
+                    .checkbox(&mut ortho, "Ortho")
+                    .on_hover_text("Every segment follows the cardinal axis it is closest to (Shift for one move)")
+                    .changed()
+                {
+                    app.view3d.draft.ortho = ortho;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                for (mode, label, hint) in [
+                    (
+                        cadcraft_pointcloud::SnapMode::Smooth,
+                        "Smooth",
+                        "Snap to the average of the points around the front one: the scan noise cancels out",
+                    ),
+                    (cadcraft_pointcloud::SnapMode::Exact, "Exact", "Snap to the cloud point itself, exactly under the cursor"),
+                ] {
+                    if ui.selectable_label(app.session.snap3d == mode, label).on_hover_text(hint).clicked() {
+                        run(app, "3dsnap", json!({ "mode": mode.name() }));
+                    }
+                }
+                // The layer the finished stroke is written on.
+                let mut layer = app.view3d.draft.layer.clone();
+                let edit = egui::TextEdit::singleline(&mut layer).desired_width(70.0).hint_text("layer");
+                if ui.add(edit).on_hover_text("The DXF layer the finished stroke is written on").changed() {
+                    app.view3d.draft.layer = layer;
+                }
+            });
+        }
+
         // ---------- camera ----------
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("Camera").color(t.text_dim).size(12.0));
             for (mode, label, hint) in [
                 (crate::view3d::Projection::Perspective, "Persp", "Perspective with a long lens: a little depth, no fish-eye"),
                 (crate::view3d::Projection::Ortho, "Ortho", "Parallel projection: walls stay parallel and distances are true at any depth"),
@@ -238,18 +297,6 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             if ui.button("Fit").on_hover_text("Frame the clouds (double-click in the view does the same)").clicked() {
                 app.view3d.fitted = false;
             }
-        });
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Lens").color(t.text_dim).size(12.0));
-            let mut lens = app.view3d.fov_y.to_degrees();
-            let slider = egui::Slider::new(&mut lens, 15.0..=90.0).suffix("°").fixed_decimals(0);
-            if ui.add(slider).on_hover_text("Vertical field of view: 35° is a normal lens, 15° a telephoto, 90° wide angle").changed() {
-                app.view3d.fov_y = lens.to_radians();
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
             for (label, hint, yaw, pitch) in [
                 ("Top", "Look down: X right, Y up", -std::f64::consts::FRAC_PI_2, 1.5),
                 ("Front", "Look along +Y: X right, Z up", -std::f64::consts::FRAC_PI_2, 0.0),
@@ -258,6 +305,15 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
                 if ui.small_button(label).on_hover_text(hint).clicked() {
                     app.view3d.preset(yaw, pitch);
                 }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Lens").color(t.text_dim).size(12.0));
+            let mut lens = app.view3d.fov_y.to_degrees();
+            let slider = egui::Slider::new(&mut lens, 15.0..=90.0).suffix("°").fixed_decimals(0);
+            if ui.add(slider).on_hover_text("Vertical field of view: 35° is a normal lens, 15° a telephoto, 90° wide angle").changed() {
+                app.view3d.fov_y = lens.to_radians();
             }
             let mut size = app.view3d.point_size;
             if ui.add(egui::Slider::new(&mut size, 0.5..=4.0).fixed_decimals(1).suffix(" pt")).changed() {
