@@ -18,6 +18,19 @@ pub use dxf::write_points_dxf;
 pub use read::{CloudInfo, read_info};
 pub use slice::{Pt, Slice, slice};
 
+/// A band of points kept in the session and drawn in the canvas (the `LASOPEN` overlay).
+///
+/// It owns its points: a 2 cm decimated apartment slice is ~9k points, a few hundred KB, so
+/// several clouds can stay open without touching the drawing database.
+#[derive(Clone, Debug)]
+pub struct Cloud {
+    pub name: String,
+    pub path: String,
+    pub points: Vec<Pt>,
+    pub bounds: Bounds3,
+    pub visible: bool,
+}
+
 /// An axis-aligned box in world units.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bounds3 {

@@ -692,6 +692,43 @@ fn adaptive(unit: f64, scale: f64, min_px: f64) -> f64 {
     u
 }
 
+/// Point clouds opened with LASOPEN, drawn under the drawing so they can be traced over.
+///
+/// Points are flat squares: egui tessellates rectangles cheaply, while a circle per point would
+/// cost a fan each. Anything denser than a quarter of a million points is sampled by stride —
+/// the slice is already decimated, so this only matters when the user asks for every point.
+fn draw_clouds(app: &CadApp, p: &egui::Painter, xf: &Xf, rect: Rect) {
+    if app.session.clouds.is_empty() {
+        return;
+    }
+    let vis = xf.world_bounds();
+    let mut shapes: Vec<Shape> = Vec::new();
+    for cloud in app.session.clouds.iter().filter(|c| c.visible) {
+        let b = &cloud.bounds;
+        if b.max[0] < vis.min.x || b.min[0] > vis.max.x || b.max[1] < vis.min.y || b.min[1] > vis.max.y {
+            continue;
+        }
+        let step = (cloud.points.len() / 250_000).max(1);
+        for pt in cloud.points.iter().step_by(step) {
+            if pt.x < vis.min.x || pt.x > vis.max.x || pt.y < vis.min.y || pt.y > vis.max.y {
+                continue;
+            }
+            let at = xf.to_screen(Vec2::new(pt.x, pt.y));
+            if !rect.contains(at) {
+                continue;
+            }
+            let color = match pt.rgb {
+                Some([r, g, b]) => Color32::from_rgb(r, g, b),
+                None => Color32::from_gray(190),
+            };
+            shapes.push(Shape::rect_filled(Rect::from_center_size(at, vec2(2.0, 2.0)), 0.0, color));
+        }
+    }
+    if !shapes.is_empty() {
+        p.extend(shapes);
+    }
+}
+
 fn draw_grid(app: &CadApp, p: &egui::Painter, xf: &Xf) {
     let t = Tokens::get();
     let s = app.session.drafting_settings();
@@ -1805,6 +1842,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         None => {
             blockedit::wash(app, &painter, rect);
             draw_grid(app, &painter, &xf);
+            draw_clouds(app, &painter, &xf, rect);
             (Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b()), None)
         }
     };

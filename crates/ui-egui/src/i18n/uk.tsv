@@ -1368,3 +1368,6 @@
 # Point clouds (fork addition: LASINFO, LASEXPORT).
 	Point Cloud Information	Інформація про хмару точок
 	Export Point Cloud Slice	Експорт зрізу хмари точок
+	Open Point Cloud	Відкрити хмару точок
+	Close Point Cloud	Закрити хмару точок
+	List Point Clouds	Список хмар точок

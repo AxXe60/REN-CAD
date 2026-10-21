@@ -1,6 +1,6 @@
 # Point clouds (LAS/LAZ)
 
-> **Last reviewed:** 2026-10-21 · **Status:** M1 — slice to DXF · **Fork addition**
+> **Last reviewed:** 2026-10-21 · **Status:** M2 — view in the canvas · **Fork addition**
 
 This fork adds point cloud support to CADCraft. M1 is the smallest useful step: read a LAS/LAZ
 file, keep the points inside a Z band, and write them as ordinary DXF POINT entities the drawing
@@ -45,6 +45,25 @@ The band `1.535–1.695` m is apartment 1's floor (−0.505 m) plus 2.04–2.20 
 (2.06 m) and below the wall cabinets (2.24 m), the same rule the scan-to-BIM work uses to separate
 walls from furniture.
 
+### `LASOPEN {path, z0?, z1?, decimate?, name?}`
+
+Cuts the band and keeps it in the session, drawn in the canvas under the drawing — trace over it
+and save the trace as one DXF. `decimate` defaults to 0.02 m here (2 cm): dense enough for walls,
+light enough to pan smoothly. The first cloud in an empty drawing is framed automatically.
+
+```bash
+cadcraft-cli run --cmd 'lasopen {"path":"D:/LIdar/Ap 1.las","z0":1.535,"z1":1.695}'
+```
+
+```json
+{"name":"Ap 1","points":8712,"inBand":153034,"filePoints":3899546,"open":1}
+```
+
+### `LASCLOSE {index?, all?}` · `LASCLOUDS {}`
+
+`LASCLOSE` drops the last cloud, the one at `index`, or all of them; `LASCLOUDS` lists what is open
+with point counts and bounds.
+
 ## Measured on real data (Ap 1, Bucharest)
 
 | Step | Result |
@@ -61,12 +80,13 @@ walls from furniture.
 - Points stream in batches of one million, so a 12-million-point scan never sits in memory whole.
 - The DXF carries true colour (group 420) when the cloud has RGB, so the slice arrives looking
   like the scan.
-- M2 will keep the cloud as a session resource (not DXF entities) and draw it through a new
-  `Kind::Cloud` primitive with per-vertex colour.
+- M2 keeps the band as a session resource (`Session::clouds`, not drawing entities) and the canvas
+  draws it under the drawing: snaps, picking and the entity count see only what the user drew.
 
-## Limits in M1
+## Limits (M2)
 
-- No in-canvas overlay yet: the slice is a DXF you open (or a TRACE over).
+- The overlay is drawn on the CPU as 2 px squares with a 250k-point stride; a ten-million-point
+  band would need the GPU point pipeline.
 - No LAZ writing, no COPC streaming, no classification, no ortho PNG export yet.
 - The export is ASCII DXF; a 10 cm slice of a large scan can reach tens of MB. Decimate first.
 
