@@ -737,7 +737,22 @@ step is for the coarse levels to inherit from the fine one.
   pixels.
 - The canvas clips the chosen level to the view plus a quarter screen, builds a `DisplayList` with
   one `Kind::Cloud` primitive, and hands it to the GPU instanced-quad pipeline on `LAYER_CLOUD`
-  (5): one instance per point with its own colour, one draw call. `gpu::CLOUD_SIZE` is 2 px,  matching the LOD spacing.
+  (5): one instance per point with its own colour, one draw call. Each cloud asks for a square as
+  wide as the spacing of its level on screen (through the primitive's `lw`), so the points tile the
+  cloud instead of leaving it a dotted haze; `gpu::CLOUD_SIZE` is the fallback.
+- **The level does not flicker at a zoom boundary.** `level_for_sticky` keeps the level drawn last
+  while its spacing on screen is between 1.25 and 3.2 pixels, so a zoom that hovers where the
+  nearest-level choice sits between two levels keeps the density it had instead of flipping it from
+  one frame to the next. The 3D view remembers the level it really drew, the budget coarsening
+  included, so a count hovering at the scene budget is steady too.
+- **The squares sit on the pixel grid.** A square that is a fraction of a pixel, at a fractional
+  position, covers a different set of pixels for every sub-pixel of view motion: that is what made
+  the cloud crawl while panning and orbiting. Both renderers now round the square to a whole number
+  of device pixels and put its centre in the middle of a pixel (the 2D quad shader through the
+  `c.z` flag only the cloud layer sets, the 3D shader in its vertex stage), so a point covers the
+  same pixels until it really moves by one. The 3D square also had its half-extent divided by the
+  viewport once instead of twice, which drew every point at half the requested size: the points are
+  now the width they ask for, which is what makes them read as clear.
 - The mesh is rebuilt only when the level, the colour mode or the ground covered changes
   (quantised view centre and zoom); plain panning just moves it. The overlay list is kept with
   its key, so a frame that changes nothing walks no points at all.

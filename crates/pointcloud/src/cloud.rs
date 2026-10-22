@@ -344,6 +344,26 @@ impl Cloud {
         best
     }
 
+    /// The level to draw at this zoom, keeping the level drawn last while it still reads well.
+    ///
+    /// [`level_for`] answers with the level nearest the ideal two-pixel spacing, so a zoom that
+    /// hovers at the boundary between two levels flips between them from one frame to the next and
+    /// the cloud changes density under the cursor. This keeps `last_cell` while its spacing on
+    /// screen is between 1.25 and 3.2 pixels: a wobble around the boundary then costs nothing, and
+    /// a real zoom still moves on at the step it always did.
+    pub fn level_for_sticky(&self, px_per_m: f64, last_cell: Option<f64>) -> &CloudLevel {
+        let kept = last_cell.and_then(|cell| {
+            let spacing = if cell > 0.0 { cell } else { 0.0002 };
+            let px = spacing * px_per_m;
+            if px_per_m.is_finite() && px_per_m > 0.0 && (1.25..=3.2).contains(&px) {
+                self.levels.iter().find(|l| l.cell.to_bits() == cell.to_bits())
+            } else {
+                None
+            }
+        });
+        kept.unwrap_or_else(|| self.level_for(px_per_m))
+    }
+
     /// Find the ground under the cloud. Every level is classified on its own, so the answer is as
     /// sharp as the level it belongs to: the fine levels see the furniture, the coarse ones the
     /// shape of the ground. The counts are the finest level's, the one the user draws.
@@ -797,6 +817,26 @@ mod tests {
         let far = c.level_for(2.0).cell;
         let near = c.level_for(200.0).cell;
         assert!(near <= far);
+    }
+
+    #[test]
+    fn a_zoom_hovering_at_a_boundary_keeps_its_level() {
+        let pts: Vec<_> = (0..4000).map(|i| pt(f64::from(i % 100) * 0.01, f64::from(i / 100) * 0.01, 1.0)).collect();
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.01), slice_of(pts), 100_000, CloudColor::Rgb);
+        let fine = c.levels[0].cell;
+        let spacing = if fine > 0.0 { fine } else { 0.0002 };
+        // 1.41 pixels is the spacing at which the nearest-level choice sits exactly between the
+        // fine level and the one above it: the point where a wobble would start flipping.
+        let hover = 1.41 / spacing;
+        assert_eq!(
+            c.level_for_sticky(hover, Some(fine)).cell.to_bits(),
+            fine.to_bits(),
+            "a zoom that hovers at the boundary must keep the level under the cursor"
+        );
+        // A real zoom out still moves on.
+        assert_ne!(c.level_for_sticky(2.0, Some(fine)).cell.to_bits(), fine.to_bits(), "a real zoom must still change level");
+        // With nothing drawn yet, the answer is the plain nearest level.
+        assert_eq!(c.level_for_sticky(hover, None).cell.to_bits(), c.level_for(hover).cell.to_bits());
     }
 
     #[test]

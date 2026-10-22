@@ -235,12 +235,15 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
                     push_instance(&mut m.quads, p, p, col, POINT_SIZE, 0.0);
                 }
             }
-            // One quad per point, its own colour: the instance buffer already carries RGB.
+            // One quad per point, its own colour: the instance buffer already carries RGB. The
+            // canvas asks for a square as wide as the level's spacing on screen, so the points
+            // tile the cloud instead of leaving it a dotted haze; a plain square is the fallback.
             Kind::Cloud => {
+                let size = if prim.lw > 0.0 { prim.lw } else { CLOUD_SIZE };
                 for (i, q) in pts.iter().enumerate() {
                     let c = list.colors.get(prim.start as usize + i).map_or(col, |c| premultiplied(*c, prim.alpha()));
                     let p = rel(*q, origin);
-                    push_instance(&mut m.quads, p, p, c, CLOUD_SIZE, 0.0);
+                    push_instance(&mut m.quads, p, p, c, size, 0.0);
                 }
             }
             // Drawn on the CPU each frame (clipped to the view).
@@ -420,7 +423,7 @@ const SHADER: &str = r#"
 struct View {
     a: vec4<f32>, // offset x, offset y (world), scale (device px per unit), 1 = linear output
     b: vec4<f32>, // canvas centre x, y (device px), screen w, h (device px)
-    c: vec4<f32>, // pixels per point, dash period in points (0 = solid)
+    c: vec4<f32>, // pixels per point, dash period in points (0 = solid), z > 0: snap quads to the pixel grid
     d: vec4<f32>, // transform linear part: a, b, c, d (x' = a x + c y, y' = b x + d y)
     e: vec4<f32>, // transform translation x, y (world, origin-relative)
 };
@@ -481,11 +484,21 @@ fn vs_quad(
         dir = d / len;
     }
     let n = vec2<f32>(-dir.y, dir.x);
-    // Width arrives in points.
-    let hw = 0.5 * width * view.c.x;
+    // Width arrives in points. A cloud point is a whole number of device pixels on the pixel
+    // grid: a one-pixel square at a fractional position covers one, two or four pixels depending
+    // on its phase, which is what made the cloud crawl while the view panned.
+    var hw = 0.5 * width * view.c.x;
+    var va = pa;
+    var vb = pb;
+    if (view.c.z > 0.5) {
+        hw = 0.5 * max(1.0, floor(width * view.c.x + 0.5));
+        let centre = floor(0.5 * (pa + pb)) + vec2<f32>(0.5, 0.5);
+        va = centre;
+        vb = centre;
+    }
     let t = select(0.0, 1.0, vi == 1u || vi == 4u || vi == 5u);
     let s = select(-1.0, 1.0, vi == 2u || vi == 3u || vi == 5u);
-    let along = mix(pa - dir * hw, pb + dir * hw, t);
+    let along = mix(va - dir * hw, vb + dir * hw, t);
     var o: VOut;
     o.pos = px_to_clip(along + n * hw * s);
     o.color = out_color(color);
@@ -734,7 +747,8 @@ impl egui_wgpu::CallbackTrait for CanvasCallback {
         let [w, h] = screen.size_in_pixels;
         let a = [self.offset[0], self.offset[1], self.scale * ppp, if linear_out { 1.0 } else { 0.0 }];
         let b = [self.center[0] * ppp, self.center[1] * ppp, w.max(1) as f32, h.max(1) as f32];
-        let c = [ppp, self.dash, 0.0, 0.0];
+        // `c.z` asks the shader for pixel-grid-snapped point squares (the cloud layer alone).
+        let c = [ppp, self.dash, if self.layer == LAYER_CLOUD { 1.0 } else { 0.0 }, 0.0];
         let [ma, mb, mc, md, tx, ty] = self.xform;
         let d = [ma, mb, mc, md];
         let e = [tx, ty, 0.0, 0.0];
@@ -954,6 +968,39 @@ mod tests {
         assert_eq!(m.quad_instances(), 3);
         assert_eq!(wide_width(0.25, true), None, "thin lineweights stay hairlines");
         assert_eq!(wide_width(0.7, false), None);
+    }
+
+    #[test]
+    fn cloud_instances_carry_the_width_the_cloud_asks_for() {
+        let mut l = DisplayList { verts: vec![Vec2::new(0.0, 0.0), Vec2::new(3.0, 1.0), Vec2::new(7.0, 2.0)], ..Default::default() };
+        l.prims =
+            vec![DPrim { handle: Handle(1), color: Rgb(255, 255, 255), aci7: true, lw: 2.0, transparency: 0, kind: Kind::Cloud, start: 0, len: 3 }];
+        for v in l.verts.clone() {
+            l.bounds.add(v);
+        }
+        let m = build_mesh(&l, Vec2::ZERO, Rgb(0, 0, 0), false);
+        assert_eq!(m.quad_instances(), 3, "one quad per cloud point");
+        let field = |i: usize, byte: usize| {
+            let o = i * INSTANCE_SIZE + byte;
+            f32::from_le_bytes([m.quads[o], m.quads[o + 1], m.quads[o + 2], m.quads[o + 3]])
+        };
+        for i in 0..m.quad_instances() {
+            // The width comes from the primitive, not the fixed cloud size.
+            assert_eq!(field(i, 20), 2.0);
+            // A degenerate instance: a == b, so the shader turns it into an axis-aligned square.
+            assert_eq!((field(i, 0), field(i, 4)), (field(i, 8), field(i, 12)));
+        }
+        // A cloud that leaves the width unset keeps the fallback size.
+        if let Some(p) = l.prims.first_mut() {
+            p.lw = 0.0;
+        }
+        let m = build_mesh(&l, Vec2::ZERO, Rgb(0, 0, 0), false);
+        let o = 20;
+        assert_eq!(
+            f32::from_le_bytes([m.quads[o], m.quads[o + 1], m.quads[o + 2], m.quads[o + 3]]),
+            CLOUD_SIZE,
+            "the fixed cloud size is the fallback"
+        );
     }
 
     #[test]

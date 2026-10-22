@@ -344,10 +344,25 @@ fn vs(
     let right = select(k == 1u, k == 2u, second);
     let up_corner = select(k == 2u, k == 1u, second);
     let o = vec2<f32>(select(-1.0, 1.0, right), select(-1.0, 1.0, up_corner));
-    let half = view.params.x * (1.0 - 0.45 * far) * 0.5;
-    let ndc = vec2<f32>(half / view.params.y, half / view.params.z);
-    clip.x += o.x * ndc.x * clip.w;
-    clip.y += o.y * ndc.y * clip.w;
+    // The square is drawn at a whole-pixel size, keeping the depth cue's shrink but rounding it and
+    // never going below one pixel, and its centre is snapped to a half pixel. A fractional square at
+    // a fractional position covers a different set of pixels for every sub-pixel of camera motion,
+    // which made the cloud crawl while orbiting. The old half-extent was half of the square asked
+    // for, so the points were sub-pixel and dim.
+    let side = max(1.0, floor(view.params.x * (1.0 - 0.45 * far) + 0.5));
+    let half_viewport = vec2<f32>(view.params.y * 0.5, view.params.z * 0.5);
+    if (clip.w > 0.0) {
+        // The viewport is the full size in device pixels, so half of it spans the [-1, 1] NDC range.
+        let centre = clip.xy / clip.w * half_viewport;
+        let snapped = floor(centre) + vec2<f32>(0.5);
+        clip.x = snapped.x / half_viewport.x * clip.w;
+        clip.y = snapped.y / half_viewport.y * clip.w;
+    }
+    // A square of `side` device pixels needs an NDC half-extent of `side / params.y` on x (and
+    // `side / params.z` on y), times `clip.w` to get back into clip space.
+    let extent = vec2<f32>(side / view.params.y, side / view.params.z);
+    clip.x += o.x * extent.x * clip.w;
+    clip.y += o.y * extent.y * clip.w;
     out.pos = clip;
     out.color = out_color(col);
     return out;
@@ -407,5 +422,55 @@ mod tests {
             w.write().unwrap();
             assert!(out.contains("#version 300 es"), "{entry}");
         }
+    }
+
+    /// The side the shader asks for: the requested size shrunk by the depth cue, rounded to a whole
+    /// pixel and never below one.
+    fn side(requested: f32, far: f32) -> f32 {
+        (requested * (1.0 - 0.45 * far) + 0.5).floor().max(1.0)
+    }
+
+    /// The shader's centre snap, replicated in NDC: to device pixels, onto the half-pixel grid, and
+    /// back again.
+    fn snap(ndc: f32, viewport: f32) -> f32 {
+        let pixels = ndc * viewport * 0.5;
+        (pixels.floor() + 0.5) / (viewport * 0.5)
+    }
+
+    /// The four corners of the screen-space square, in device pixels, built from the centre in NDC,
+    /// the viewport in device pixels and the side in device pixels.
+    fn square(centre: [f32; 2], viewport: [f32; 2], side: f32) -> [[f32; 2]; 4] {
+        let x = snap(centre[0], viewport[0]);
+        let y = snap(centre[1], viewport[1]);
+        let dx = side / viewport[0];
+        let dy = side / viewport[1];
+        let mut out = [[0.0; 2]; 4];
+        for (corner, (sx, sy)) in out.iter_mut().zip([(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)]) {
+            *corner = [(x + sx * dx) * viewport[0] * 0.5, (y + sy * dy) * viewport[1] * 0.5];
+        }
+        out
+    }
+
+    /// The square covers exactly the requested number of device pixels on both axes, and its centre
+    /// sits on the half-pixel grid, so no sub-pixel camera motion changes which pixels it covers.
+    #[test]
+    fn the_point_square_is_whole_pixels_wide_and_centred_on_a_half_pixel() {
+        assert_eq!(side(3.0, 0.0), 3.0);
+        assert_eq!(side(10.0, 1.0), 6.0, "the cue's shrink is rounded to a whole pixel");
+        assert_eq!(side(1.0, 1.0), 1.0, "never below one pixel");
+
+        let viewport = [1600.0, 1000.0];
+        // A centre that lands exactly on the corner of four device pixels.
+        let corners = square([400.0 / 800.0, 300.0 / 500.0], viewport, 3.0);
+        // Device pixels are floats in the shader, so the corners are pinned to a thousandth of one.
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        assert!(close(corners[0][0], 399.0) && close(corners[0][1], 299.0), "{corners:?}");
+        assert!(close(corners[1][0], 402.0) && close(corners[1][1], 299.0), "{corners:?}");
+        assert!(close(corners[2][0], 399.0) && close(corners[2][1], 302.0), "{corners:?}");
+        assert!(close(corners[3][0], 402.0) && close(corners[3][1], 302.0), "{corners:?}");
+        assert!(close((corners[1][0] - corners[0][0]).abs(), 3.0), "3 device pixels wide");
+        assert!(close((corners[2][1] - corners[0][1]).abs(), 3.0), "3 device pixels high");
+        let centre = [(corners[0][0] + corners[3][0]) * 0.5, (corners[0][1] + corners[3][1]) * 0.5];
+        assert!(close(centre[0], 400.5) && close(centre[1], 300.5), "{centre:?}");
     }
 }

@@ -73,6 +73,9 @@ pub struct CanvasState {
     /// the vectors' capacity is reused and a quiet frame costs the hash and the draw alone.
     /// An empty result is not cached (the key is dropped with it, see [`draw_clouds`]).
     cloud_list: DisplayList,
+    /// The level each cloud was last drawn at, by cloud name: a zoom that hovers at the boundary
+    /// between two levels keeps the one under the cursor instead of flipping its density.
+    cloud_levels: std::collections::HashMap<String, f64>,
     /// The dragged objects of a MOVE/COPY/ROTATE/SCALE preview, uploaded once per drag (see
     /// [`draw_drag_gpu`]).
     drag_key: Option<u64>,
@@ -719,8 +722,22 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
     // the view in coarse steps (below). A quiet frame costs the hash and the draw alone; the
     // list is rebuilt only when this key moves.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for c in app.session.clouds.iter().filter(|c| c.visible) {
-        cloud_state_key(c, c.level_for(xf.scale).cell).hash(&mut hasher);
+    // The level each cloud is drawn at: the one drawn last while it still reads well on screen,
+    // so a zoom hovering at a boundary between two levels does not flip the cloud's density.
+    let picks: Vec<f64> = app
+        .session
+        .clouds
+        .iter()
+        .filter(|c| c.visible)
+        .map(|c| c.level_for_sticky(xf.scale, app.canvas.cloud_levels.get(&c.name).copied()).cell)
+        .collect();
+    for (c, cell) in app.session.clouds.iter().filter(|c| c.visible).zip(picks.iter()) {
+        if app.canvas.cloud_levels.get(&c.name).copied() != Some(*cell) {
+            app.canvas.cloud_levels.insert(c.name.clone(), *cell);
+        }
+    }
+    for (c, cell) in app.session.clouds.iter().filter(|c| c.visible).zip(picks.iter()) {
+        cloud_state_key(c, *cell).hash(&mut hasher);
     }
     // Which ground the buffer covers: rebuild after panning a quarter screen or zooming a step.
     ((xf.center.x / (span * 0.25)).round() as i64).hash(&mut hasher);
@@ -738,8 +755,10 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
         // The bounds are folded into the push loop: a second walk over the vertices would
         // double the cost of every rebuild.
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for c in app.session.clouds.iter().filter(|c| c.visible) {
-            let level = c.level_for(xf.scale);
+        for (c, cell) in app.session.clouds.iter().filter(|c| c.visible).zip(picks.iter()) {
+            // The level the key above hashed picks: the sticky choice of the last frame, so the
+            // key and the built points agree.
+            let level = c.level_for_sticky(xf.scale, Some(*cell));
             let start = list.verts.len() as u32;
             for (i, v) in level.pts.iter().enumerate() {
                 // With the ground filter on, only the points it found are drawn.
@@ -771,7 +790,7 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
                     handle: Handle(0),
                     color: Rgb(255, 255, 255),
                     aci7: false,
-                    lw: 0.0,
+                    lw: cloud_point_size(*cell, xf.scale),
                     transparency,
                     kind: Kind::Cloud,
                     start,
@@ -855,6 +874,19 @@ fn cloud_state_key(c: &cadcraft_pointcloud::Cloud, cell: f64) -> u64 {
     }
     c.offset.map(f64::to_bits).hash(&mut h);
     h.finish()
+}
+
+/// The side of a cloud point on screen, in points: as wide as the spacing of the level's points,
+/// so the squares tile the cloud instead of leaving it a dotted haze. Never thinner than a pixel
+/// (the level can be finer than the screen) and never fatter than three (a wider square would
+/// cover its neighbours and, with a semi-transparent cloud, double-blend them).
+fn cloud_point_size(cell: f64, px_per_m: f64) -> f32 {
+    let spacing = if cell > 0.0 { cell } else { 0.0002 };
+    let px = spacing * px_per_m;
+    if !px.is_finite() {
+        return 1.0;
+    }
+    ((px + 0.5).floor() as f32).clamp(1.0, 3.0)
 }
 
 fn draw_grid(app: &CadApp, p: &egui::Painter, xf: &Xf) {
@@ -993,7 +1025,9 @@ pub(crate) fn draw_list(p: &egui::Painter, xf: &Xf, list: &DisplayList, bg: Rgb,
                 if !bb.intersects(&vis) {
                     continue;
                 }
-                let size = vec2(1.5, 1.5);
+                // The side the level's spacing asked for: the GPU builder uses `prim.lw` too.
+                let side = prim.lw.max(1.0);
+                let size = vec2(side, side);
                 for (i, q) in pts.iter().enumerate() {
                     if !vis.contains(*q) {
                         continue;
@@ -3190,7 +3224,7 @@ mod hatch_pick_tests {
 mod cloud_overlay_tests {
     use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice, Spectrum};
 
-    use super::cloud_state_key;
+    use super::{cloud_point_size, cloud_state_key};
 
     /// A small band: a line of points from 0 to 9 m, the way view3d's tests build theirs.
     fn cloud() -> Cloud {
@@ -3223,5 +3257,18 @@ mod cloud_overlay_tests {
         let mut dev = c.clone();
         dev.dev_scale = 7.5;
         assert_ne!(k, cloud_state_key(&dev, 0.001), "a new comparison scale needs new colours");
+    }
+
+    /// The square must be as wide as the spacing it decimates on, so a coarse level tiles the
+    /// cloud instead of leaving it a dotted haze, and a level finer than the screen still shows
+    /// points a pixel wide.
+    #[test]
+    fn the_cloud_point_size_follows_the_spacing_and_stays_in_pixel_bounds() {
+        assert_eq!(cloud_point_size(0.002, 1000.0), 2.0, "a two pixel spacing draws two point squares");
+        assert_eq!(cloud_point_size(0.0, 1000.0), 1.0, "the source level has no cell, so a point is a pixel wide");
+        assert_eq!(cloud_point_size(0.002, 800.0), 2.0, "rounding keeps the square steady while the zoom wobbles");
+        assert_eq!(cloud_point_size(10.0, 1000.0), 3.0, "a very coarse level is clamped so it cannot cover its neighbours");
+        assert_eq!(cloud_point_size(0.002, f64::INFINITY), 1.0, "a zoom that is not finite draws single pixel points");
+        assert_eq!(cloud_point_size(0.002, f64::NAN), 1.0, "a zoom that is not a number draws single pixel points");
     }
 }
