@@ -381,46 +381,47 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         },
     );
 
-    // ---------- info ----------
-    ui.add_space(8.0);
-    let shown = if all { format!("{} points (all)", num(points)) } else { format!("{} of {} band points", num(points), num(in_band)) };
-    let intensity = if color == cadcraft_pointcloud::CloudColor::Intensity { format!(" · intensity {imin}–{imax}") } else { String::new() };
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new(format!("{shown} · {levels} levels{intensity}")).color(t.text_dim).size(11.0));
-    });
-    // Where the scan says it is: the EPSG code and the system's name.
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        let crs = app.session.crs.clone().or_else(|| crs.clone());
-        let text = match &crs {
-            Some(crs) => {
-                let mut text = match (crs.epsg, crs.name()) {
-                    (Some(code), Some(name)) => format!("CRS: EPSG:{code} · {name}"),
-                    (Some(code), None) => format!("CRS: EPSG:{code}"),
-                    (None, _) => "CRS: the file names a system, but no EPSG code".to_string(),
-                };
-                // The local grid's offsets: a survey office that writes the northing without its
-                // leading millions shows it here.
-                if crs.false_easting != 0.0 || crs.false_northing != 0.0 {
-                    text.push_str(&format!(" · E {:+.0} N {:+.0}", crs.false_easting, crs.false_northing));
+    // ---------- info (folded: the scan facts are read rarely, the controls are read all the time) ----------
+    egui::CollapsingHeader::new(egui::RichText::new("Scan info").size(12.0)).id_salt("cc_pc_info").default_open(false).show(ui, |ui| {
+        let shown = if all { format!("{} points (all)", num(points)) } else { format!("{} of {} band points", num(points), num(in_band)) };
+        let intensity = if color == cadcraft_pointcloud::CloudColor::Intensity { format!(" · intensity {imin}–{imax}") } else { String::new() };
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(format!("{shown} · {levels} levels{intensity}")).color(t.text_dim).size(11.0));
+        });
+        // Where the scan says it is: the EPSG code and the system's name.
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            let crs = app.session.crs.clone().or_else(|| crs.clone());
+            let text = match &crs {
+                Some(crs) => {
+                    let mut text = match (crs.epsg, crs.name()) {
+                        (Some(code), Some(name)) => format!("CRS: EPSG:{code} · {name}"),
+                        (Some(code), None) => format!("CRS: EPSG:{code}"),
+                        (None, _) => "CRS: the file names a system, but no EPSG code".to_string(),
+                    };
+                    // The local grid's offsets: a survey office that writes the northing without its
+                    // leading millions shows it here.
+                    if crs.false_easting != 0.0 || crs.false_northing != 0.0 {
+                        text.push_str(&format!(" · E {:+.0} N {:+.0}", crs.false_easting, crs.false_northing));
+                    }
+                    text
                 }
-                text
-            }
-            None => "CRS: the file names none".to_string(),
-        };
-        ui.label(egui::RichText::new(text).color(t.text_dim).size(11.0));
-    });
-    // The site frame: the drawing's (0, 0, 0) is that point in the world.
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        let o = app.session.local_origin;
-        let text = if o == [0.0; 3] {
-            "Site origin: the drawing's (0, 0, 0) is the world's (0, 0, 0)".to_string()
-        } else {
-            format!("Site origin: {:.3}, {:.3}, {:.3}", o[0], o[1], o[2])
-        };
-        ui.label(egui::RichText::new(text).color(t.text_dim).size(11.0));
+                None => "CRS: the file names none".to_string(),
+            };
+            ui.label(egui::RichText::new(text).color(t.text_dim).size(11.0));
+        });
+        // The site frame: the drawing's (0, 0, 0) is that point in the world.
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            let o = app.session.local_origin;
+            let text = if o == [0.0; 3] {
+                "Site origin: the drawing's (0, 0, 0) is the world's (0, 0, 0)".to_string()
+            } else {
+                format!("Site origin: {:.3}, {:.3}, {:.3}", o[0], o[1], o[2])
+            };
+            ui.label(egui::RichText::new(text).color(t.text_dim).size(11.0));
+        });
     });
     if app.view3d.active {
         // ---------- 3D drafting (first: it is what the view is for) ----------
@@ -515,29 +516,8 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         }
 
         // ---------- camera ----------
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            for (mode, label, hint) in [
-                (crate::view3d::Projection::Perspective, "Persp", "Perspective with a long lens: a little depth, no fish-eye"),
-                (crate::view3d::Projection::Ortho, "Ortho", "Parallel projection: walls stay parallel and distances are true at any depth"),
-            ] {
-                if ui.selectable_label(app.view3d.projection == mode, label).on_hover_text(hint).clicked() {
-                    app.view3d.projection = mode;
-                }
-            }
-            if ui.button("Fit").on_hover_text("Frame the clouds (double-click in the view does the same)").clicked() {
-                app.view3d.fitted = false;
-            }
-            for (label, hint, yaw, pitch) in [
-                ("Top", "Look down: X right, Y up", -std::f64::consts::FRAC_PI_2, 1.5),
-                ("Front", "Look along +Y: X right, Z up", -std::f64::consts::FRAC_PI_2, 0.0),
-                ("Iso", "The three-quarter default", -2.2, 0.55),
-            ] {
-                if ui.small_button(label).on_hover_text(hint).clicked() {
-                    app.view3d.preset(yaw, pitch);
-                }
-            }
-        });
+        // The projection and the standard views live in the floating bar of the 3D view; here remain
+        // only the sliders that have no room there.
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Lens").color(t.text_dim).size(12.0));
