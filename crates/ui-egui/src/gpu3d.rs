@@ -348,7 +348,8 @@ fn vs(
     // going below one pixel, and its centre is snapped to a half pixel. A fractional square at a
     // fractional position covers a different set of pixels for every sub-pixel of camera motion,
     // which made the cloud crawl while orbiting. The size does not shrink with depth: the depth cue
-    // only fades the colour, because a smaller far square left one-pixel holes in the fitted view.
+    // only fades the colour, because a far square that shrank as well fell to a single pixel and
+    // left gaps wherever the level drew its points close together.
     // The old half-extent was half of the square asked for, so the points were sub-pixel and dim.
     let side = max(1.0, floor(view.params.x + 0.5));
     let half_viewport = vec2<f32>(view.params.y * 0.5, view.params.z * 0.5);

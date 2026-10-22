@@ -307,9 +307,9 @@ geometry are mixed. Two things stand in for the depth test:
 - **The depth cue** (`Cue` in the palette, `{"cue": 1}`): every point knows its depth along the
   view direction, so the ones behind the orbit target fade towards the background (up to 45%, with
   a quadratic ramp so only the far ones recede). The squares keep their size: the level's spacing
-  still sets the side, and the cue works through colour alone. Shrinking the far squares as well
-  left one-pixel holes between them in the fitted view (79% of the cloud covered there, against 98%
-  in the same view in 2D), so the depth is told by the fade and not by a smaller point.
+  still sets the side, and the cue works through colour alone. Shrinking the far squares as well took
+  them down to a single pixel, which left one-pixel gaps between them wherever the level drew its
+  points close together, so the depth is told by the fade and not by a smaller point.
 
 Both live in the vertex shader of `crates/ui-egui/src/gpu3d.rs` and need no extra attachment: the
 depth is `dot(point − eye, forward)`, which works in the orthographic projection too (where
