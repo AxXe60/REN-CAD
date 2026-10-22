@@ -516,8 +516,7 @@ and choosing one names the group.
 ### The cloud belongs to the drawing, not over it
 
 A cloud opened with `LASOPEN` is an **overlay**: it is looked at, and it is not written. A cloud
-**attached** to the drawing travels with it — the points are written into the file the drawing is
-saved as, and they come back when the file is opened again.
+**attached** to the drawing is *referred to* by the drawing — and the file stays small.
 
 ```json
 {"command":"lasopen","params":{"path":"D:/scan/Ap 1.las","decimate":0.05,"attach":true}}
@@ -529,26 +528,42 @@ saved as, and they come back when the file is opened again.
 
 The palette's **Attach to the drawing** box does the same, and it can be turned off again.
 
-How the cloud is written:
+**What the file carries is the reference, not the points.** A scan of a building has millions of
+points; a file that holds them all is a file nobody can send. So the drawing says:
 
-* the points are ordinary **`POINT` entities**, on a layer of their own (`PCLOUD-<name>`), with
-  the scanner's true colour — so **any program reads the file**: AutoCAD shows the points, and
-  the drawing next to them;
-* the description of the cloud — its name, the file it came from, its coordinate system, how it is
-  coloured — goes into an `XRECORD` of the named object dictionary (`CADCRAFT_CLOUDS`). An
-  `XRECORD` and not a header variable, because the DWG keeps the records and drops the variables
-  it does not know.
+* the **file the scan is in** (`D:/scan/Ap 1.las`), the **band** of Z it holds, the **grid cell** it
+  is read at, the **colour mode** and the **colour scale**;
+* the **coordinate system** the file declares (the EPSG code);
+* **where the scan sits in the drawing**: the world point that is the drawing's (0, 0, 0) — the
+  same tie `LASORIGIN` makes, saved with the drawing.
 
-When the file is opened, the points are taken back out of the drawing and become the cloud again:
-the same name, the same path, the same bounds, the colour mode it was saved with. The drawing
-does not keep them twice.
+That is written in the `XRECORD` `CADCRAFT_CLOUDS` of the named object dictionary. An `XRECORD`
+and not a header variable, because the DWG keeps the records and drops the variables it does not
+know (the first try lost the cloud in the DWG, and the test says so now).
 
-Measured: the Ap 1 scan decimated to a 5 cm grid (184 499 points) written as a **DWG** is
-4.9 MB, and opens back as the very same cloud.
+**When the file is opened, the scan is loaded from the disk**, at the position the file says: the
+same band, the same grid, the same colour mode, the same place in the drawing. If the scan is not
+on that computer, the drawing opens without it and says which file it was looking for — a drawing
+that travels to a colleague carries the reference, and the colleague points it at the scan.
 
-> The points that come back have no intensity and no class: the DXF `POINT` entity carries neither,
-> and the per-point data would need an extension dictionary per point. The classification can be
-> run again on the cloud that comes back (`LASCLASS`).
+Measured: the Ap 1 scan decimated to a 5 cm grid (184 499 points) is a **DWG of 22 kB** — the
+drawing and the reference, nothing else — and opening it loads the scan from
+`D:/…/Ap 1_….las` with its position:
+
+```json
+{"clouds":[{"name":"Ap 1_2026-10-06-13-44-44.section_in1","path":"D:/…/Ap 1_….las",
+            "points":184499,"levels":4,"bounds":{"min":[-9.2382,-9.7418,-1.6544],"max":[4.0479,8.0337,5.3914]}}],
+ "count":1}
+```
+
+And when the scan is not there, the drawing still opens:
+
+```text
+D:/tmp/scan_temp.las: the scan could not be loaded: The system cannot find the file specified.
+```
+
+> The reference does not carry the points, so the DWG holds no cloud points at all: any program
+> that opens the file sees the drawing, and RENCAD sees the drawing plus the scan it points at.
 
 ### The site frame
 A registered survey sits hundreds of kilometres from the drawing's origin — the factory at

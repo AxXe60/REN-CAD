@@ -1,24 +1,25 @@
-//! The point clouds a file carries.
+//! The point clouds a drawing refers to.
 //!
-//! A cloud is written as ordinary `POINT` entities on a layer of its own, so any program reads it
-//! (AutoCAD included: they are points), and a header variable says what they are, so RENCAD
-//! recognises them again as the cloud they were:
+//! A cloud is not in the drawing: a scan holds millions of points, and a file that carries them
+//! all is a file nobody can send. What the drawing carries is the *reference*, and an `XRECORD`
+//! of the named object dictionary describes it, so RENCAD loads the scan again when the drawing
+//! is opened:
 //!
 //! ```text
 //! $RENCAD_CLOUDS
-//! [{"name":"Ap 1","layer":"PCLOUD-Ap 1","source":"D:/scan/Ap 1.las","crs":null,"color":"rgb"}]
+//! [{"name":"Ap 1","path":"D:/scan/Ap 1.las","z0":2.04,"z1":2.2,"cell":0.05,"color":"rgb","spectrum":"bluered","crs":null,"offset":[498162,290290,0]}]
 //! ```
 //!
-//! The points themselves are the entities; the variable carries the rest.
+//! The reference is what travels in the file; the scan stays where it was. The `XRECORD` and not
+//! a header variable, because the DWG keeps the records and drops the variables it does not know.
 
-use cadcraft_color::Color;
-use cadcraft_doc::{CLOUD_HEADER_VAR, Drawing, EntityKind, PointCloud};
+use cadcraft_doc::{CLOUD_HEADER_VAR, Drawing, PointCloud};
 
 /// The description of the clouds, as the header variable carries it.
 ///
-/// The points are not in it: they are the entities on the layers. What is here is what cannot be
-/// read off an entity — the name, where the cloud came from, its coordinate system, how it is
-/// coloured.
+/// The points are not in it: they are in the scan on the disk. What is here is the reference, and
+/// the parts of it that cannot be read off the drawing: the name, the file the scan is in, the
+/// band of Z, the grid, the colour, the coordinate system and the place.
 pub fn header_value(clouds: &[PointCloud]) -> String {
     let mut out = String::from("[");
     for (i, c) in clouds.iter().enumerate() {
@@ -26,13 +27,18 @@ pub fn header_value(clouds: &[PointCloud]) -> String {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{\"name\":{},\"layer\":{},\"source\":{},\"crs\":{},\"color\":{},\"points\":{}}}",
+            "{{\"name\":{},\"path\":{},\"z0\":{},\"z1\":{},\"cell\":{},\"color\":{},\"spectrum\":{},\"crs\":{},\"offset\":[{},{},{}]}}",
             quoted(&c.name),
-            quoted(&c.layer),
-            quoted(&c.source),
-            c.crs.as_ref().map_or_else(|| "null".to_string(), |s| quoted(s)),
+            quoted(&c.path),
+            num(c.z0),
+            num(c.z1),
+            num(c.cell),
             quoted(&c.color),
-            c.points.len()
+            quoted(&c.spectrum),
+            c.crs.as_ref().map_or_else(|| "null".to_string(), |s| quoted(s)),
+            num(c.offset[0]),
+            num(c.offset[1]),
+            num(c.offset[2]),
         ));
     }
     out.push(']');
@@ -57,9 +63,16 @@ fn quoted(text: &str) -> String {
     out
 }
 
-/// The clouds a header variable describes.
+/// A JSON number for the value: something endless becomes a zero, so the description stays text
+/// a reader can parse back.
+fn num(x: f64) -> String {
+    if x.is_finite() { format!("{x}") } else { "0".to_string() }
+}
+
+/// The clouds a header variable describes: the references, read back the way they were written.
 ///
-/// The points are not here: they are the `POINT` entities on the layers the description names.
+/// A value that is not the description gives no clouds, and never a panic: the description is
+/// hostile input, and a hostile number is a zero.
 pub fn from_header(value: &str) -> Vec<PointCloud> {
     let mut out = Vec::new();
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) else { return out };
@@ -67,31 +80,53 @@ pub fn from_header(value: &str) -> Vec<PointCloud> {
     for item in list {
         let Some(obj) = item.as_object() else { continue };
         let name = obj.get("name").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-        let layer = obj.get("layer").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-        if name.is_empty() && layer.is_empty() {
+        let path = obj.get("path").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+        if name.is_empty() && path.is_empty() {
             continue;
         }
+        let place = obj.get("offset").and_then(serde_json::Value::as_array);
         out.push(PointCloud {
             name,
-            layer,
-            source: obj.get("source").and_then(serde_json::Value::as_str).unwrap_or_default().to_string(),
-            crs: obj.get("crs").and_then(serde_json::Value::as_str).map(str::to_string),
+            path,
+            z0: f64_of(obj.get("z0")),
+            z1: f64_of(obj.get("z1")),
+            cell: f64_of(obj.get("cell")),
             color: obj.get("color").and_then(serde_json::Value::as_str).unwrap_or("rgb").to_string(),
-            ..PointCloud::default()
+            spectrum: obj.get("spectrum").and_then(serde_json::Value::as_str).unwrap_or("bluered").to_string(),
+            crs: obj.get("crs").and_then(serde_json::Value::as_str).map(str::to_string),
+            offset: [f64_at(place, 0), f64_at(place, 1), f64_at(place, 2)],
         });
     }
     out
+}
+
+/// A number of the description, or zero when it is not one.
+fn f64_of(value: Option<&serde_json::Value>) -> f64 {
+    value.and_then(serde_json::Value::as_f64).unwrap_or_default()
+}
+
+/// The `i`th number of the place, or zero when the place has no such number.
+fn f64_at(place: Option<&Vec<serde_json::Value>>, i: usize) -> f64 {
+    f64_of(place.and_then(|p| p.get(i)))
 }
 
 /// The name of the header variable the clouds are described in.
 pub const VAR: &str = CLOUD_HEADER_VAR;
 
 /// The description of the clouds, in pieces small enough for a DXF string.
+///
+/// The split never cuts a character in half: a path with a letter outside the ASCII in it (a
+/// Romanian name, a Chinese one) must not become an invalid byte in the file.
 pub fn chunks(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
     while rest.len() > 200 {
-        let (head, tail) = rest.split_at(200);
+        let mut cut = 200;
+        // Move the cut back to the start of the character it lands in.
+        while cut > 0 && !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let (head, tail) = rest.split_at(cut);
         out.push(head.to_string());
         rest = tail;
     }
@@ -99,63 +134,44 @@ pub fn chunks(text: &str) -> Vec<String> {
     out
 }
 
-/// Take the clouds out of a drawing: the points on the clouds' layers become the clouds, and the
-/// entities are removed, so the drawing does not carry them twice.
+/// Take the clouds out of a drawing: the references the header variable carries.
+///
+/// The drawing does not hold the points any more, so there is nothing to remove: what comes back
+/// is the reference, and the scan is loaded from the disk when the drawing is opened.
 pub fn take_from(drawing: &mut Drawing) -> Vec<PointCloud> {
     let Some(value) = drawing.header.get(VAR).and_then(cadcraft_doc::HVal::as_str).map(str::to_string) else {
         return Vec::new();
     };
-    let mut clouds = from_header(&value);
-    if clouds.is_empty() {
-        return clouds;
-    }
-    for cloud in clouds.iter_mut() {
-        let layer = cloud.layer.clone();
-        let handles: Vec<cadcraft_doc::Handle> = drawing
-            .model
-            .iter()
-            .filter(|e| e.common.layer.eq_ignore_ascii_case(&layer))
-            .filter_map(|e| match &e.kind {
-                EntityKind::Point(_) => Some(e.handle),
-                _ => None,
-            })
-            .collect();
-        for h in handles {
-            let Some(e) = drawing.model.remove(h) else { continue };
-            let EntityKind::Point(p) = &e.kind else { continue };
-            cloud.points.push([p.p.x, p.p.y, p.p.z]);
-            if let Color::True(rgb) = e.common.color {
-                cloud.colors.push([rgb.0, rgb.1, rgb.2]);
-            }
-        }
-        // The colours are there for every point or for none: the cloud is read as one thing.
-        if cloud.colors.len() != cloud.points.len() {
-            cloud.colors.clear();
-        }
-    }
-    clouds.retain(|c| !c.points.is_empty());
-    clouds
+    from_header(&value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The whole description goes round: every field of the reference comes back.
     #[test]
     fn the_description_survives_the_round_trip() {
-        let mut c = PointCloud::new("Ap 1", "PCLOUD-Ap 1");
-        c.source = "D:/scan/Ap 1.las".into();
-        c.crs = Some("EPSG:31700".into());
+        let mut c = PointCloud::new("Ap 1", "D:/scan/Ap 1.las");
+        c.z0 = 2.04;
+        c.z1 = 2.2;
+        c.cell = 0.05;
         c.color = "intensity".into();
-        c.points.push([1.0, 2.0, 3.0]);
+        c.spectrum = "viridis".into();
+        c.crs = Some("EPSG:31700".into());
+        c.offset = [498_162.0, 290_290.0, 0.0];
         let value = header_value(std::slice::from_ref(&c));
         let back = from_header(&value);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].name, "Ap 1");
-        assert_eq!(back[0].layer, "PCLOUD-Ap 1");
-        assert_eq!(back[0].source, "D:/scan/Ap 1.las");
-        assert_eq!(back[0].crs.as_deref(), Some("EPSG:31700"));
+        assert_eq!(back[0].path, "D:/scan/Ap 1.las");
+        assert_eq!(back[0].z0, 2.04);
+        assert_eq!(back[0].z1, 2.2);
+        assert_eq!(back[0].cell, 0.05);
         assert_eq!(back[0].color, "intensity");
+        assert_eq!(back[0].spectrum, "viridis");
+        assert_eq!(back[0].crs.as_deref(), Some("EPSG:31700"));
+        assert_eq!(back[0].offset, [498_162.0, 290_290.0, 0.0]);
     }
 
     #[test]
@@ -163,40 +179,61 @@ mod tests {
         assert!(from_header("not json").is_empty());
         assert!(from_header("{}").is_empty());
         assert!(from_header("[1,2]").is_empty());
+        // The numbers are hostile input too: what is not a number is a zero, never a panic.
+        let hostile = from_header(r#"[{"name":"n","z0":"not a number","offset":[1,"x",true]}]"#);
+        assert_eq!(hostile[0].z0, 0.0);
+        assert_eq!(hostile[0].offset, [1.0, 0.0, 0.0]);
     }
 
     #[test]
     fn the_quotes_are_escaped() {
-        let mut c = PointCloud::new("a \"b\"", "L");
-        c.source = "c:\\d".into();
+        let c = PointCloud::new("a \"b\"", "c:\\d");
         let value = header_value(std::slice::from_ref(&c));
         let back = from_header(&value);
         assert_eq!(back[0].name, "a \"b\"");
-        assert_eq!(back[0].source, "c:\\d");
+        assert_eq!(back[0].path, "c:\\d");
     }
 
-    /// The whole way round: a cloud is written into a drawing and read back out of it.
+    /// A path with a letter outside the ASCII in it must not be cut in half.
+    #[test]
+    fn the_pieces_never_cut_a_character_in_half() {
+        let c = PointCloud::new("Curte Ulei", "D:/scan/съемка.las");
+        let value = header_value(std::slice::from_ref(&c));
+        for piece in chunks(&value) {
+            assert!(piece.is_char_boundary(0), "the piece is whole text");
+        }
+        let back = from_header(&value);
+        assert_eq!(back[0].path, "D:/scan/съемка.las");
+    }
+
+    /// The whole way round: a drawing written with the reference reads back with the same
+    /// reference, and the file carries no points of the cloud.
     #[test]
     fn a_cloud_survives_the_file() {
-        let mut cloud = PointCloud::new("Ap 1", "PCLOUD-Ap 1");
-        cloud.source = "D:/scan/Ap 1.las".into();
+        let mut cloud = PointCloud::new("Ap 1", "D:/scan/Ap 1.las");
+        cloud.z0 = 2.04;
+        cloud.z1 = 2.2;
+        cloud.cell = 0.05;
         cloud.color = "intensity".into();
-        cloud.points = vec![[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
-        cloud.colors = vec![[10, 20, 30], [40, 50, 60], [70, 80, 90]];
+        cloud.spectrum = "magma".into();
+        cloud.crs = Some("EPSG:31700".into());
+        cloud.offset = [498_162.0, 290_290.0, 0.0];
         let drawing = Drawing::default();
         let bytes = crate::write_clouds(&drawing, std::slice::from_ref(&cloud), "c.dxf").expect("the file is written");
         let (back, clouds) = crate::read_clouds(&bytes, "c.dxf").expect("the file is read");
-        assert_eq!(clouds.len(), 1, "the cloud comes back: {clouds:?}");
+        assert_eq!(clouds.len(), 1, "the reference comes back: {clouds:?}");
         assert_eq!(clouds[0].name, "Ap 1");
-        assert_eq!(clouds[0].layer, "PCLOUD-Ap 1");
-        assert_eq!(clouds[0].source, "D:/scan/Ap 1.las");
+        assert_eq!(clouds[0].path, "D:/scan/Ap 1.las");
+        assert_eq!(clouds[0].z0, 2.04);
+        assert_eq!(clouds[0].z1, 2.2);
+        assert_eq!(clouds[0].cell, 0.05);
         assert_eq!(clouds[0].color, "intensity");
-        assert_eq!(clouds[0].points.len(), 3, "every point is there");
-        assert_eq!(clouds[0].points[2], [4.0, 5.0, 6.0]);
-        assert_eq!(clouds[0].colors.len(), 3, "the colours come back too");
-        assert_eq!(clouds[0].colors[1], [40, 50, 60]);
-        // The points are the cloud's, not loose entities in the drawing.
-        assert!(back.model.is_empty(), "the drawing holds no loose points: {}", back.model.len());
+        assert_eq!(clouds[0].spectrum, "magma");
+        assert_eq!(clouds[0].crs.as_deref(), Some("EPSG:31700"));
+        assert_eq!(clouds[0].offset, [498_162.0, 290_290.0, 0.0]);
+        // The scan is not in the file any more: the drawing carries the reference only.
+        assert!(back.model.is_empty(), "the file holds no points of the cloud: {}", back.model.len());
+        assert!(back.layers.iter().all(|l| !l.name.starts_with("PCLOUD-")), "the cloud has no layer of its own");
     }
 
     #[test]
@@ -208,12 +245,14 @@ mod tests {
         assert!(back.model.is_empty());
     }
 
-    /// The DWG is what the user asked for: the cloud has to be in it too.
+    /// The DWG is what the user asked for: the reference has to be in it too (the DWG keeps the
+    /// XRECORD, a header variable alone would not survive).
     #[test]
     fn a_cloud_survives_the_dwg() {
-        let mut cloud = PointCloud::new("Ap 1", "PCLOUD-Ap 1");
-        cloud.points = vec![[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]];
-        cloud.colors = vec![[10, 20, 30], [40, 50, 60]];
+        let mut cloud = PointCloud::new("Ap 1", "D:/scan/Ap 1.las");
+        cloud.cell = 0.05;
+        cloud.color = "elevation".into();
+        cloud.offset = [10.0, 20.0, 30.0];
         let drawing = Drawing::default();
         let bytes = crate::write_clouds(&drawing, std::slice::from_ref(&cloud), "c.dwg").expect("the file is written");
         assert!(cadcraft_dwg::is_dwg(&bytes), "it is a DWG");
@@ -227,10 +266,11 @@ mod tests {
             dxf.contains("RENCAD_CLOUDS")
         );
         let (back, clouds) = crate::read_clouds(&bytes, "c.dwg").expect("the file is read");
-        assert_eq!(clouds.len(), 1, "the cloud comes back from the DWG: {clouds:?}");
+        assert_eq!(clouds.len(), 1, "the reference comes back from the DWG: {clouds:?}");
         assert_eq!(clouds[0].name, "Ap 1");
-        assert_eq!(clouds[0].points.len(), 2, "every point is there");
-        assert_eq!(clouds[0].points[1], [1.0, 2.0, 3.0]);
-        assert!(back.model.is_empty(), "the drawing holds no loose points");
+        assert_eq!(clouds[0].path, "D:/scan/Ap 1.las");
+        assert_eq!(clouds[0].color, "elevation");
+        assert_eq!(clouds[0].offset, [10.0, 20.0, 30.0]);
+        assert!(back.model.is_empty(), "the file holds no points of the cloud");
     }
 }

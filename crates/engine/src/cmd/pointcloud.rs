@@ -163,94 +163,60 @@ fn lasexport(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
-/// The layer a cloud's points are written on: `PCLOUD-<name>`, with the characters a DXF layer
-/// name cannot hold replaced.
-pub fn cloud_layer(name: &str) -> String {
-    let mut out = String::from("PCLOUD-");
-    for c in name.chars() {
-        if out.len() >= 60 {
-            break;
-        }
-        if matches!(c, '<' | '>' | '/' | '\\' | '"' | ':' | ';' | '?' | '*' | '|' | '=' | '\'') {
-            out.push('_');
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// The cloud as the file carries it: the points in the drawing's own units.
+/// The cloud as the file carries it: a reference to the scan, not the points themselves.
 ///
-/// The drawing's frame is the site's: the world point that sits at the drawing's (0, 0, 0) is
-/// the local origin, so the cloud's points are written relative to it.
-pub fn cloud_to_file(c: &cadcraft_pointcloud::Cloud, local: [f64; 3]) -> cadcraft_doc::PointCloud {
-    let mut out = cadcraft_doc::PointCloud::new(c.name.clone(), cloud_layer(&c.name));
-    out.source = c.path.clone();
-    out.crs = c.crs.as_ref().and_then(|crs| crs.epsg).map(|e| format!("EPSG:{e}"));
+/// The file says where the scan is on the disk, the band and the grid it was read at, how it is
+/// drawn, and where it sits in the drawing, so opening the file loads the scan from the disk again.
+pub fn cloud_to_ref(c: &cadcraft_pointcloud::Cloud) -> cadcraft_doc::PointCloud {
+    let mut out = cadcraft_doc::PointCloud::new(c.name.clone(), c.path.clone());
+    out.z0 = c.z0;
+    out.z1 = c.z1;
+    out.cell = c.levels.first().map_or(0.0, |l| l.cell);
     out.color = c.color.name().to_string();
-    if let Some(level) = c.levels.first() {
-        for v in level.pts.iter() {
-            out.points.push([f64::from(v.x) + c.origin[0] - local[0], f64::from(v.y) + c.origin[1] - local[1], f64::from(v.z) - local[2]]);
-            out.colors.push(v.rgb);
-            out.intensities.push(u16::from(v.intensity) * 257);
-        }
-    }
+    out.spectrum = c.spectrum.name().to_string();
+    out.crs = c.crs.as_ref().and_then(|crs| crs.epsg).map(|e| format!("EPSG:{e}"));
+    out.offset = c.offset;
     out
 }
 
-/// The cloud a file carries, as the session's cloud: the points in the world's units again.
-pub fn cloud_from_file(c: &cadcraft_doc::PointCloud, local: [f64; 3]) -> Option<cadcraft_pointcloud::Cloud> {
-    if c.points.is_empty() {
-        return None;
+/// The cloud a file refers to, loaded from the scan on the disk.
+///
+/// A file that is not there, or that cannot be read, is an error: the caller reports it and the
+/// other clouds still open.
+pub fn ref_to_cloud(r: &cadcraft_doc::PointCloud) -> Result<cadcraft_pointcloud::Cloud> {
+    if r.is_empty() {
+        return Err(EngineError::Other(format!("the cloud `{}` names no file", r.name)));
     }
-    let mut b = cadcraft_pointcloud::Bounds3::EMPTY;
-    let points: Vec<cadcraft_pointcloud::Pt> = c
-        .points
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let w = [p[0] + local[0], p[1] + local[1], p[2] + local[2]];
-            b.add(w[0], w[1], w[2]);
-            cadcraft_pointcloud::Pt {
-                x: w[0],
-                y: w[1],
-                z: w[2],
-                rgb: c.colors.get(i).copied(),
-                intensity: c.intensities.get(i).copied().unwrap_or(0),
-                class: 1,
-            }
-        })
-        .collect();
-    let n = points.len() as u64;
-    let slice = cadcraft_pointcloud::Slice { points, total: n, in_band: n, bounds: b };
-    let color = cadcraft_pointcloud::CloudColor::parse(&c.color).unwrap_or(cadcraft_pointcloud::CloudColor::Rgb);
-    Some(cadcraft_pointcloud::Cloud::from_slice(
-        c.name.clone(),
-        c.source.clone(),
-        b.min[2],
-        b.max[2],
-        None,
-        slice,
-        cadcraft_pointcloud::DEFAULT_MAX_POINTS,
-        color,
-    ))
+    let color = cadcraft_pointcloud::CloudColor::parse(&r.color).unwrap_or(cadcraft_pointcloud::CloudColor::Rgb);
+    let decimate = (r.cell > 0.0).then_some(r.cell);
+    let mut cloud =
+        cadcraft_pointcloud::Cloud::open(Path::new(&r.path), r.name.clone(), r.z0, r.z1, decimate, cadcraft_pointcloud::DEFAULT_MAX_POINTS, color)
+            .map_err(oops)?;
+    cloud.offset = r.offset;
+    cloud.spectrum = cadcraft_pointcloud::Spectrum::parse(&r.spectrum).unwrap_or(cadcraft_pointcloud::Spectrum::BlueRed);
+    Ok(cloud)
 }
 
 /// The clouds that belong to the drawing being written, as the file carries them.
 pub fn clouds_for_file(s: &Session, _path: &str) -> Vec<cadcraft_doc::PointCloud> {
-    let local = s.local_origin;
-    s.clouds.iter().filter(|c| c.attached && c.doc == s.active).map(|c| cloud_to_file(c, local)).collect()
+    s.clouds.iter().filter(|c| c.attached && c.doc == s.active).map(cloud_to_ref).collect()
 }
 
-/// The clouds a file carries, added to the session: they belong to the drawing they came with.
+/// The clouds a file refers to, loaded from their scans: they belong to the drawing they came with.
 pub fn add_clouds(s: &mut Session, doc: usize, clouds: Vec<cadcraft_doc::PointCloud>) {
-    let local = s.local_origin;
-    for c in clouds {
-        let Some(mut cloud) = cloud_from_file(&c, local) else { continue };
-        cloud.attached = true;
-        cloud.doc = doc;
-        s.clouds.push(cloud);
+    for r in clouds {
+        match ref_to_cloud(&r) {
+            Ok(mut cloud) => {
+                cloud.attached = true;
+                cloud.doc = doc;
+                s.clouds.push(cloud);
+            }
+            Err(e) => {
+                // A scan that cannot be read is named and skipped; the rest of the drawing opens.
+                let what = if r.is_empty() { r.name.clone() } else { r.path.clone() };
+                s.echo(format!("{what}: the scan could not be loaded: {e}"));
+            }
+        }
     }
 }
 
@@ -279,7 +245,8 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
         .map(str::to_string)
         .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("Point cloud").to_string());
     let cloud = cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, decimate, max_points, color).map_err(oops)?;
-    // `attach` ties the cloud to the drawing: it is written into the file and comes back with it.
+    // `attach` ties the cloud to the drawing: its reference is written into the file and the scan
+    // is loaded again with it.
     let attach = p.get("attach").and_then(Value::as_bool).unwrap_or(false);
     let doc = s.active;
     let b = cloud.bounds;
@@ -298,6 +265,9 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let mut cloud = cloud;
+    // The site's frame: the world point that is the drawing's (0, 0, 0), so the cloud lands where
+    // the drawing expects it, and a reference written from it lands there again.
+    cloud.offset = s.local_origin;
     cloud.attached = attach;
     cloud.doc = doc;
     s.clouds.push(cloud);
@@ -376,8 +346,9 @@ fn cloud_index(s: &Session, p: &Value) -> Result<usize> {
 
 /// Attach a cloud to the drawing, or let it go.
 ///
-/// An attached cloud is written into the file the drawing is saved as — the points travel with
-/// the drawing, and the drawing is what the file is. A cloud that is not attached is an overlay:
+/// An attached cloud is written into the file the drawing is saved as — a reference to the scan,
+/// not its points: the file names the scan and the place it sits in the drawing, and the scan is
+/// loaded from the disk when the drawing is opened. A cloud that is not attached is an overlay:
 /// it is looked at, and it is not written.
 fn lasattach(s: &mut Session, p: &Value) -> Result<Value> {
     let i = cloud_index(s, p)?;
@@ -459,14 +430,19 @@ fn lasdecimate(s: &mut Session, p: &Value) -> Result<Value> {
         .filter(|c| *c >= 0.0)
         .ok_or_else(|| EngineError::Other("`cell` must be 0 (every point) or a positive number of metres".into()))?;
     let i = cloud_index(s, p)?;
-    let (path, name, z0, z1, color, clip) = {
+    let (path, name, z0, z1, color, clip, offset, spectrum, attached, doc) = {
         let c = s.clouds.get(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
-        (PathBuf::from(&c.path), c.name.clone(), c.z0, c.z1, c.color, c.clip)
+        (PathBuf::from(&c.path), c.name.clone(), c.z0, c.z1, c.color, c.clip, c.offset, c.spectrum, c.attached, c.doc)
     };
     let decimate = (cell > 0.0).then_some(cell);
     let max_points = if decimate.is_some() { cadcraft_pointcloud::DEFAULT_MAX_POINTS } else { 0 };
     let mut cloud = cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, decimate, max_points, color).map_err(oops)?;
     cloud.clip = clip;
+    // Re-reading the file keeps what the cloud is in the drawing: its place, its scale, its tie.
+    cloud.offset = offset;
+    cloud.spectrum = spectrum;
+    cloud.attached = attached;
+    cloud.doc = doc;
     let points = cloud.points();
     let levels = cloud.levels.len();
     let shown = cloud.levels.first().map_or(0.0, |l| l.cell);
@@ -686,6 +662,7 @@ fn lascluster(s: &mut Session, p: &Value) -> Result<Value> {
 fn lasorigin(s: &mut Session, p: &Value) -> Result<Value> {
     if p.get("reset").and_then(Value::as_bool).unwrap_or(false) {
         s.local_origin = [0.0; 3];
+        move_clouds(s, s.local_origin);
         return Ok(json!({
             "message": "the site origin is back at the drawing's (0, 0, 0)",
             "origin": s.local_origin,
@@ -705,6 +682,8 @@ fn lasorigin(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
     s.local_origin = origin;
+    // The clouds of the drawing follow the site: they are in the site's frame.
+    move_clouds(s, origin);
     Ok(json!({
         "message": format!(
             "the site origin is at {:.3}, {:.3}, {:.3}: the drawing's (0, 0, 0) is that point in the world",
@@ -713,6 +692,16 @@ fn lasorigin(s: &mut Session, p: &Value) -> Result<Value> {
         "origin": origin,
         "clouds": s.clouds.len(),
     }))
+}
+
+/// Put the clouds of the active drawing in the site's frame.
+///
+/// A cloud is placed by its own offset (the world point that is the drawing's (0, 0, 0)), so
+/// moving the site moves the clouds with it.
+fn move_clouds(s: &mut Session, origin: [f64; 3]) {
+    for c in s.clouds.iter_mut().filter(|c| c.doc == s.active) {
+        c.offset = origin;
+    }
 }
 
 /// The coordinate reference system of the project, for the files that do not name one.
@@ -1165,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn an_attached_cloud_travels_with_the_drawing() {
+    fn an_attached_cloud_travels_with_the_drawing_as_a_reference() {
         use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
         let mut b = Bounds3::EMPTY;
         b.add(0.0, 0.0, 0.0);
@@ -1177,22 +1166,56 @@ mod tests {
         let mut cloud = Cloud::from_slice("t".into(), "D:/scan.las".into(), 0.0, 1.0, Some(0.01), slice, 1000, CloudColor::Rgb);
         cloud.attached = true;
         cloud.doc = 0;
+        cloud.offset = [10.0, 20.0, 0.5];
         s.clouds.push(cloud);
-        // The file's form of the cloud: the points, in the drawing's own units.
+        // The file's form of the cloud: a reference to the scan, not the points.
         let file = clouds_for_file(&s, "x.dxf");
         assert_eq!(file.len(), 1, "the attached cloud is written with the drawing");
         assert_eq!(file[0].name, "t");
-        assert_eq!(file[0].layer, "PCLOUD-t");
-        assert_eq!(file[0].source, "D:/scan.las");
-        assert!(!file[0].points.is_empty());
-        // And back again.
-        let back = cloud_from_file(&file[0], s.local_origin);
-        assert!(back.is_some(), "the cloud comes back");
-        let back = back.unwrap_or_else(|| s.clouds[0].clone());
-        assert_eq!(back.levels.first().map(|l| l.pts.len()), Some(file[0].points.len()));
+        assert_eq!(file[0].path, "D:/scan.las", "the reference points at the file the cloud came from");
+        assert_eq!(file[0].cell, 0.01, "the grid cell is kept");
+        assert_eq!(file[0].offset, [10.0, 20.0, 0.5], "the place of the scan in the drawing is kept");
+        assert_eq!(file[0].color, "rgb");
+        assert_eq!(file[0].spectrum, "bluered");
+        // Loading the reference reads the file: a scan that is not there is an error, not a panic.
+        assert!(ref_to_cloud(&file[0]).is_err(), "D:/scan.las is not on this machine");
         // A cloud that is not attached is not written.
         s.clouds[0].attached = false;
         assert!(clouds_for_file(&s, "x.dxf").is_empty());
+    }
+
+    /// A reference whose scan is gone is reported on the command line and skipped: the clouds that
+    /// do load still come in, and nothing panics.
+    #[test]
+    fn a_missing_scan_is_reported_and_does_not_stop_the_others() {
+        let mut s = Session::new();
+        let a = cadcraft_doc::PointCloud::new("Ap 1", "no-such-scan.las");
+        let b = cadcraft_doc::PointCloud::new("Ap 2", "no-such-scan-2.laz");
+        add_clouds(&mut s, 0, vec![a, b]);
+        assert!(s.clouds.is_empty(), "nothing loads from a file that is not there");
+        assert!(s.log.iter().any(|l| l.contains("no-such-scan.las")), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l.contains("no-such-scan-2.laz")), "{:?}", s.log);
+    }
+
+    #[test]
+    fn moving_the_site_moves_the_clouds_with_it() {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let mut b = Bounds3::EMPTY;
+        b.add(0.0, 0.0, 0.0);
+        b.add(1.0, 1.0, 1.0);
+        let pts = vec![Pt { x: 0.5, y: 0.5, z: 0.5, rgb: None, intensity: 0, class: 1 }];
+        let slice = Slice { points: pts, total: 1, in_band: 1, bounds: b };
+        let mut s = Session::new();
+        let mut cloud = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, Some(0.05), slice, 1000, CloudColor::Rgb);
+        cloud.doc = s.active;
+        cloud.attached = true;
+        s.clouds.push(cloud);
+        // The site moves: the cloud follows, because it is in the site's frame.
+        assert!(lasorigin(&mut s, &json!({ "x": 100.0, "y": 200.0, "z": 0.0 })).is_ok());
+        assert_eq!(s.clouds[0].offset, [100.0, 200.0, 0.0]);
+        // And the reference written from it carries the new place.
+        let refs = clouds_for_file(&s, "x.dxf");
+        assert_eq!(refs[0].offset, [100.0, 200.0, 0.0]);
     }
 
     #[test]

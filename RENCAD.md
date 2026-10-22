@@ -36,7 +36,7 @@ selecția, undo-ul și salvarea văd doar ce a desenat utilizatorul.
 | **Comparație nor–nor (C2C)**: distanțe, RMS/mean/σ/p95, scară deviații | gata |
 | **Clasificare automată**: înălțime peste teren + forma suprafeței (vegetație, pereți, zgomot) | gata |
 | **Clasificare cu învățare**: k-means pe (înălțime, intensitate, rugozitate, verticalitate) + omul în buclă | gata |
-| **Norul în fișier**: `LASOPEN {attach}` / `LASATTACH` — punctele se scriu în DWG/DXF (entități POINT + XRECORD) și revin la deschidere | gata |
+| **Norul în fișier**: `LASOPEN {attach}` / `LASATTACH` — desenul *referă* scanarea (fișierul LAS + poziția în desen) într-un `XRECORD`; DWG-ul rămâne mic (22 kB), norul e încărcat de pe PC la deschidere | gata |
 | **Transparență / x-ray**: `LASOPACITY` + mască deterministă în shader | gata |
 | **Contrast robust**: rampele folosesc percentilele 2%–98% | gata |
 | Layere pe stroke (DXF per layer) + închidere polilinie | gata |

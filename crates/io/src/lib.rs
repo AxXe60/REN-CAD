@@ -65,10 +65,10 @@ pub fn read(bytes: &[u8], name: &str) -> Result<Drawing> {
     read_clouds(bytes, name).map(|(drawing, _)| drawing)
 }
 
-/// Read a drawing and the point clouds it carries.
+/// Read a drawing and the references to the point clouds it carries.
 ///
-/// The clouds come out of the drawing: their points are `POINT` entities on their own layers, and
-/// the header variable says which layers they are.
+/// The points are not in the drawing: the header variable says which file each scan is in and
+/// where the scan sits in the drawing, and the scan is loaded from the disk when it is needed.
 pub fn read_clouds(bytes: &[u8], name: &str) -> Result<(Drawing, Vec<cadcraft_doc::PointCloud>)> {
     if cadcraft_dwg::is_dwg(bytes) {
         let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, cadcraft_dwg::Limits::DEFAULT).map_err(IoError::Format)?;
@@ -100,15 +100,17 @@ pub fn write(d: &Drawing, name: &str) -> Result<Vec<u8>> {
     write_framed(d, name, None)
 }
 
-/// Write a drawing with the point clouds it carries.
+/// Write a drawing with the references to the point clouds it carries.
 ///
-/// The clouds are written as `POINT` entities on their own layers, with a header variable that
-/// says what they are: any program reads the points, RENCAD reads the cloud back.
+/// The scan is not written into the file: the drawing carries each cloud's reference (the scan's
+/// file, the band, the grid, the colour, the coordinate system, the place) as a header variable,
+/// and the program loads the scan from the disk when the drawing is opened.
 pub fn write_clouds(d: &Drawing, clouds: &[cadcraft_doc::PointCloud], name: &str) -> Result<Vec<u8>> {
     write_clouds_with(d, clouds, name, &SaveOptions::default())
 }
 
-/// Like [`write_clouds`], with the DXF/DWG version and binary DXF chosen by `opts`.
+/// Like [`write_clouds`], with the DXF/DWG version and binary DXF chosen by `opts`. The clouds
+/// are written as references to the scans on the disk, not as points in the file.
 pub fn write_clouds_with(d: &Drawing, clouds: &[cadcraft_doc::PointCloud], name: &str, opts: &SaveOptions) -> Result<Vec<u8>> {
     let version = opts.version.unwrap_or_else(|| save_version(d));
     match ext(name).as_str() {

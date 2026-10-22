@@ -101,6 +101,15 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             if !c.visible {
                 row.on_hover_text("Hidden");
             }
+            // The drawing refers to a scan on the disk: name the file the scan is loaded from,
+            // with the whole path on hover.
+            if !c.path.is_empty() {
+                let file = std::path::Path::new(&c.path).file_name().map_or(c.path.as_str(), |n| n.to_str().unwrap_or(c.path.as_str()));
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    ui.label(egui::RichText::new(format!("Scan file: {file}")).color(t.text_dim).size(10.0)).on_hover_text(&c.path);
+                });
+            }
         }
     });
     if let Some(i) = pick {
@@ -290,7 +299,9 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         let mut attached = app.session.clouds[selected].attached;
         if ui
             .checkbox(&mut attached, "Attach to the drawing")
-            .on_hover_text("The cloud is written into the file the drawing is saved as: the points travel with the drawing, not over it")
+            .on_hover_text(
+                "The drawing refers to the scan on the disk, it does not carry the points: the file records where the scan sits, and the scan is loaded from that file when the drawing is opened",
+            )
             .changed()
         {
             run(app, "lasattach", json!({ "index": selected, "attach": attached }));

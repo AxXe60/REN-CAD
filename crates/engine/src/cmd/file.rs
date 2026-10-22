@@ -33,8 +33,10 @@ pub type PlotHook = fn(&Drawing, &cadcraft_doc::Space, &Value) -> std::result::R
 
 /// File format hooks (installed by the app so the engine stays I/O-agnostic and wasm-safe).
 ///
-/// The point clouds travel with the drawing: reading gives back the clouds the file carries,
-/// writing takes the clouds that belong to the drawing being written.
+/// The point clouds are not in the drawing: the file carries a reference to each attached scan
+/// (where the scan is on the disk, and where it sits in the drawing). Reading gives back those
+/// references, and the scans are loaded from the disk when the file is opened; writing takes the
+/// references of the clouds that belong to the drawing being written.
 pub struct IoHooks {
     pub read: fn(&[u8], &str) -> std::result::Result<(Drawing, Vec<PointCloud>), String>,
     pub write: fn(&Drawing, &[PointCloud], &str) -> std::result::Result<Vec<u8>, String>,
@@ -151,7 +153,8 @@ fn write_bytes(s: &Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<Vec<
     }
     // A drawing file is the drawing outside the Block Editor; an image is what is shown.
     let d: &cadcraft_doc::Drawing = if is_drawing_file(path) { s.state()?.drawing() } else { s.doc()? };
-    // The point clouds that belong to this drawing travel with it.
+    // The scans attached to this drawing: the file carries only their references (where the scan
+    // is on the disk, and where it sits in the drawing), and they are loaded again when it opens.
     let clouds = super::pointcloud::clouds_for_file(s, path);
     let r = if *opts == SaveAs::default() {
         (hooks.write)(d, &clouds, path)
@@ -271,7 +274,7 @@ fn file_name(path: &str) -> String {
 /// [`finish_open`] on the thread that owns the session.
 pub struct ReadFile {
     drawing: Drawing,
-    /// The point clouds the file carries.
+    /// The references to the scans the file carries: each scan is loaded from its path.
     clouds: Vec<PointCloud>,
     binary_dxf: bool,
     name: String,
@@ -323,7 +326,8 @@ fn add_read(s: &mut Session, drawing: Drawing, clouds: Vec<PointCloud>, binary_d
         // QSAVE keeps a binary DXF binary.
         st.binary_dxf = binary_dxf;
     }
-    // The clouds the file carries belong to the drawing they came with.
+    // The scans the file refers to are loaded from the disk and belong to the drawing they came
+    // with; a scan that is missing is reported and the rest of the drawing opens.
     super::pointcloud::add_clouds(s, i, clouds);
     for note in notes {
         s.echo(note);

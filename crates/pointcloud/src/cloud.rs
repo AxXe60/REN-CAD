@@ -160,6 +160,10 @@ pub struct Cloud {
     pub attached: bool,
     /// The drawing the cloud belongs to (the index of the session's document).
     pub doc: usize,
+    /// Where the cloud sits in the drawing: the world point that is the drawing's (0, 0, 0). The
+    /// cloud is drawn relative to it, so a scan loaded from another computer lands in the same
+    /// place in the drawing.
+    pub offset: [f64; 3],
     /// The band's heights in 64 bins, so the palette can draw the scan's profile and the user can
     /// see where the floor and the ceiling are.
     pub zhisto: [u32; 64],
@@ -255,6 +259,7 @@ impl Cloud {
             spectrum: crate::spectrum::Spectrum::BlueRed,
             attached: false,
             doc: 0,
+            offset: [0.0; 3],
             zhisto: heights(&slice.points, zmin, zmax),
             crs: None,
             levels,

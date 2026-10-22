@@ -622,30 +622,6 @@ fn text_tags(w: &mut W, d: &Drawing, t: &Text, attrib: Option<(&Attrib, Version)
     }
 }
 
-/// The points of a cloud, as ordinary `POINT` entities on the cloud's own layer.
-///
-/// AutoCAD reads them as points — which is what a point is — and RENCAD reads the header
-/// variable and knows they were a cloud.
-fn cloud_points(w: &mut W, cloud: &PointCloud, owner: &str) {
-    let layer = if cloud.layer.is_empty() { "0" } else { cloud.layer.as_str() };
-    for (i, p) in cloud.points.iter().enumerate() {
-        let handle = w.h();
-        w.s(0, "POINT");
-        w.s(5, &handle);
-        w.s(330, owner);
-        w.s(100, "AcDbEntity");
-        w.s(8, layer);
-        w.s(100, "AcDbPoint");
-        w.f(10, p[0]);
-        w.f(20, p[1]);
-        w.f(30, p[2]);
-        // The colour the scanner gave, when the cloud has one.
-        if let Some(c) = cloud.colors.get(i) {
-            w.i(420, i64::from((u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])));
-        }
-    }
-}
-
 fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx) {
     match &e.kind {
         EntityKind::Line(l) => {
@@ -2146,15 +2122,7 @@ fn tags_for(d: &Drawing, version: Version, target: Version, clouds: &[PointCloud
     }
     w.s(0, "ENDTAB");
     // LAYER
-    // The clouds bring their own layers: a file whose cloud sits on a layer that is not in the
-    // table is a file other programs cannot read.
-    let extra_layers: Vec<&str> = clouds
-        .iter()
-        .map(|c| c.layer.as_str())
-        .filter(|l| !l.is_empty())
-        .filter(|l| !d.layers.iter().any(|e| e.name.eq_ignore_ascii_case(l)))
-        .collect();
-    let th = table_head(&mut w, "LAYER", d.layers.len() + extra_layers.len());
+    let th = table_head(&mut w, "LAYER", d.layers.len());
     for l in &d.layers {
         let lh = record_head(&mut w, "LAYER", &th, "AcDbLayerTableRecord");
         w.layers.insert(l.name.to_ascii_uppercase(), lh);
@@ -2188,19 +2156,6 @@ fn tags_for(d: &Drawing, version: Version, target: Version, clouds: &[PointCloud
             w.s(1001, dxf_ext::LAYER_DESCRIPTION_APP);
             w.s(1000, "");
             w.s(1000, dxf_ext::xdata_str(&l.description));
-        }
-    }
-    for name in extra_layers {
-        let lh = record_head(&mut w, "LAYER", &th, "AcDbLayerTableRecord");
-        w.layers.insert(name.to_ascii_uppercase(), lh);
-        w.s(2, name);
-        w.i(70, 0);
-        w.i(62, 7);
-        w.s(6, "Continuous");
-        w.i(370, 0);
-        let normal = w.pstyles.get(&cadcraft_doc::NORMAL_STYLE.to_ascii_uppercase()).cloned();
-        if let Some(h) = normal {
-            w.s(390, h);
         }
     }
     w.s(0, "ENDTAB");
@@ -2482,10 +2437,8 @@ fn tags_for(d: &Drawing, version: Version, target: Version, clouds: &[PointCloud
             entity(&mut w, d, e, h, true, &cx);
         }
     }
-    // The point clouds: ordinary POINT entities, so any program reads them.
-    for cloud in clouds {
-        cloud_points(&mut w, cloud, &ms_br);
-    }
+    // The clouds are not in the file any more: it carries the reference (the header variable),
+    // and the scan stays on the disk.
     w.s(0, "ENDSEC");
 
     // ---------------- OBJECTS ----------------
