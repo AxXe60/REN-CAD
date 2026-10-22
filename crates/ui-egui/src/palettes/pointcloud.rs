@@ -426,7 +426,64 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
     if app.view3d.active {
         // Tighten the row pitch: the clarity sliders must stay on screen without scrolling.
         ui.spacing_mut().item_spacing.y = 5.0;
-        // ---------- 3D drafting (first: it is what the view is for) ----------
+
+        // ---------- camera ----------
+        // Sliders first: they are the controls checked all the time, the drafting row can wait below.
+        // The projection and the standard views live in the floating bar of the 3D view; here remain
+        // only the sliders that have no room there.
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Lens").color(t.text_dim).size(12.0));
+            let mut lens = app.view3d.fov_y.to_degrees();
+            let slider = egui::Slider::new(&mut lens, 15.0..=90.0).suffix("°").fixed_decimals(0);
+            let width = (ui.available_width() - 4.0).max(80.0);
+            if ui
+                .add_sized([width, 18.0], slider)
+                .on_hover_text("Vertical field of view: 35° is a normal lens, 15° a telephoto, 90° wide angle")
+                .changed()
+            {
+                app.view3d.fov_y = lens.to_radians();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Size").color(t.text_dim).size(12.0));
+            let mut size = app.view3d.point_size;
+            let width = (ui.available_width() - 4.0).max(80.0);
+            if ui.add_sized([width, 18.0], egui::Slider::new(&mut size, 0.5..=4.0).fixed_decimals(1).suffix(" pt")).changed() {
+                app.view3d.point_size = size;
+            }
+        });
+
+        // ---------- clarity without a depth buffer ----------
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Cut").color(t.text_dim).size(12.0));
+            let mut cut = app.view3d.front_cut;
+            let width = (ui.available_width() - 4.0).max(80.0);
+            if ui
+                .add_sized([width, 18.0], egui::Slider::new(&mut cut, 0.0..=0.9).fixed_decimals(2).suffix(" d"))
+                .on_hover_text("Front wall cut: drop the points between the camera and this fraction of the distance to the target, so you can look into a room without cropping the walls out of the cloud")
+                .changed()
+            {
+                app.view3d.front_cut = cut;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Cue").color(t.text_dim).size(12.0));
+            let mut cue = app.view3d.depth_cue;
+            let width = (ui.available_width() - 4.0).max(80.0);
+            if ui
+                .add_sized([width, 18.0], egui::Slider::new(&mut cue, 0.0..=1.0).fixed_decimals(2).suffix(" ×"))
+                .on_hover_text("Depth cue: the further a point is behind the target, the more it fades into the background")
+                .changed()
+            {
+                app.view3d.depth_cue = cue;
+            }
+        });
+
+        // ---------- 3D drafting: click vertices into the cloud, then Finish writes DXF lines ----------
         let strokes = app.session.sketch.count();
         ui.horizontal(|ui| {
             ui.add_space(8.0);
@@ -516,61 +573,6 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
                 }
             });
         }
-
-        // ---------- camera ----------
-        // The projection and the standard views live in the floating bar of the 3D view; here remain
-        // only the sliders that have no room there.
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Lens").color(t.text_dim).size(12.0));
-            let mut lens = app.view3d.fov_y.to_degrees();
-            let slider = egui::Slider::new(&mut lens, 15.0..=90.0).suffix("°").fixed_decimals(0);
-            let width = (ui.available_width() - 4.0).max(80.0);
-            if ui
-                .add_sized([width, 18.0], slider)
-                .on_hover_text("Vertical field of view: 35° is a normal lens, 15° a telephoto, 90° wide angle")
-                .changed()
-            {
-                app.view3d.fov_y = lens.to_radians();
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Size").color(t.text_dim).size(12.0));
-            let mut size = app.view3d.point_size;
-            let width = (ui.available_width() - 4.0).max(80.0);
-            if ui.add_sized([width, 18.0], egui::Slider::new(&mut size, 0.5..=4.0).fixed_decimals(1).suffix(" pt")).changed() {
-                app.view3d.point_size = size;
-            }
-        });
-
-        // ---------- clarity without a depth buffer ----------
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Cut").color(t.text_dim).size(12.0));
-            let mut cut = app.view3d.front_cut;
-            let width = (ui.available_width() - 4.0).max(80.0);
-            if ui
-                .add_sized([width, 18.0], egui::Slider::new(&mut cut, 0.0..=0.9).fixed_decimals(2).suffix(" d"))
-                .on_hover_text("Front wall cut: drop the points between the camera and this fraction of the distance to the target, so you can look into a room without cropping the walls out of the cloud")
-                .changed()
-            {
-                app.view3d.front_cut = cut;
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Cue").color(t.text_dim).size(12.0));
-            let mut cue = app.view3d.depth_cue;
-            let width = (ui.available_width() - 4.0).max(80.0);
-            if ui
-                .add_sized([width, 18.0], egui::Slider::new(&mut cue, 0.0..=1.0).fixed_decimals(2).suffix(" ×"))
-                .on_hover_text("Depth cue: the further a point is behind the target, the more it fades into the background")
-                .changed()
-            {
-                app.view3d.depth_cue = cue;
-            }
-        });
     }
 }
 
