@@ -68,7 +68,7 @@ pub(super) fn run_new(s: &mut Session, p: &Value) -> Result<Option<Value>> {
 fn read_template(path: &str) -> Result<Drawing> {
     let hooks = io().ok_or_else(|| bad("new", "file formats are not available in this build"))?;
     let bytes = read_bytes(path)?;
-    (hooks.read)(&bytes, path).map_err(|e| bad("new", format!("template {path}: {e}")))
+    (hooks.read)(&bytes, path).map(|(d, _)| d).map_err(|e| bad("new", format!("template {path}: {e}")))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

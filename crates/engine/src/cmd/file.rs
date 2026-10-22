@@ -7,7 +7,7 @@ mod template;
 
 use std::sync::OnceLock;
 
-use cadcraft_doc::Drawing;
+use cadcraft_doc::{Drawing, PointCloud};
 pub use cadcraft_dxf::Version;
 use serde_json::{Value, json};
 
@@ -32,9 +32,12 @@ const MAX_SCRIPT_BYTES: usize = 64 << 20;
 pub type PlotHook = fn(&Drawing, &cadcraft_doc::Space, &Value) -> std::result::Result<Vec<u8>, String>;
 
 /// File format hooks (installed by the app so the engine stays I/O-agnostic and wasm-safe).
+///
+/// The point clouds travel with the drawing: reading gives back the clouds the file carries,
+/// writing takes the clouds that belong to the drawing being written.
 pub struct IoHooks {
-    pub read: fn(&[u8], &str) -> std::result::Result<Drawing, String>,
-    pub write: fn(&Drawing, &str) -> std::result::Result<Vec<u8>, String>,
+    pub read: fn(&[u8], &str) -> std::result::Result<(Drawing, Vec<PointCloud>), String>,
+    pub write: fn(&Drawing, &[PointCloud], &str) -> std::result::Result<Vec<u8>, String>,
     /// PLOT / EXPORTPDF (optional: builds without a plotter report "not available").
     pub plot: Option<PlotHook>,
 }
@@ -93,7 +96,7 @@ pub struct SaveAs {
 }
 
 /// Write a drawing with [`SaveAs`] options (installed by hosts whose writer supports them).
-pub type WriteAsHook = fn(&Drawing, &str, &SaveAs) -> std::result::Result<Vec<u8>, String>;
+pub type WriteAsHook = fn(&Drawing, &[PointCloud], &str, &SaveAs) -> std::result::Result<Vec<u8>, String>;
 
 static WRITE_AS: OnceLock<WriteAsHook> = OnceLock::new();
 
@@ -148,11 +151,13 @@ fn write_bytes(s: &Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<Vec<
     }
     // A drawing file is the drawing outside the Block Editor; an image is what is shown.
     let d: &cadcraft_doc::Drawing = if is_drawing_file(path) { s.state()?.drawing() } else { s.doc()? };
+    // The point clouds that belong to this drawing travel with it.
+    let clouds = super::pointcloud::clouds_for_file(s, path);
     let r = if *opts == SaveAs::default() {
-        (hooks.write)(d, path)
+        (hooks.write)(d, &clouds, path)
     } else {
         let w = write_as().ok_or_else(|| bad(cmd, "saving at a chosen version or as binary DXF is not available in this build"))?;
-        w(d, path, opts)
+        w(d, &clouds, path, opts)
     };
     r.map_err(|e| bad(cmd, e))
 }
@@ -266,6 +271,8 @@ fn file_name(path: &str) -> String {
 /// [`finish_open`] on the thread that owns the session.
 pub struct ReadFile {
     drawing: Drawing,
+    /// The point clouds the file carries.
+    clouds: Vec<PointCloud>,
     binary_dxf: bool,
     name: String,
     path: Option<String>,
@@ -294,28 +301,30 @@ pub fn read_file(path: &str) -> std::result::Result<ReadFile, String> {
 
 /// Add a [`read_file`] result to the session as the active drawing: the fast half of OPEN.
 pub fn finish_open(s: &mut Session, f: ReadFile) -> Result<Value> {
-    let ReadFile { drawing, binary_dxf, name, path } = f;
-    let i = add_read(s, drawing, binary_dxf, &name, path);
+    let ReadFile { drawing, clouds, binary_dxf, name, path } = f;
+    let i = add_read(s, drawing, clouds, binary_dxf, &name, path);
     super::blocks::xref::after_open(s, i);
     Ok(opened(s, i, true))
 }
 
 fn read_bytes(bytes: &[u8], name: &str, path: Option<String>) -> Result<ReadFile> {
     let hooks = io().ok_or_else(|| bad("open", "file formats are not available in this build"))?;
-    let drawing = (hooks.read)(bytes, name).map_err(|e| bad("open", e))?;
+    let (drawing, clouds) = (hooks.read)(bytes, name).map_err(|e| bad("open", e))?;
     // A file that isn't a drawing (an imported SVG) gives the drawing no file name: QSAVE then
     // asks where to save instead of exporting over the original.
     let path = path.filter(|p| is_drawing_file(p));
-    Ok(ReadFile { drawing, binary_dxf: cadcraft_dxf::is_binary(bytes), name: name.to_string(), path })
+    Ok(ReadFile { drawing, clouds, binary_dxf: cadcraft_dxf::is_binary(bytes), name: name.to_string(), path })
 }
 
-fn add_read(s: &mut Session, drawing: Drawing, binary_dxf: bool, name: &str, path: Option<String>) -> usize {
+fn add_read(s: &mut Session, drawing: Drawing, clouds: Vec<PointCloud>, binary_dxf: bool, name: &str, path: Option<String>) -> usize {
     let notes = drawing.read_notes.clone();
     let i = s.open_drawing(drawing, &file_name(name), path);
     if let Some(st) = s.docs.get_mut(i) {
         // QSAVE keeps a binary DXF binary.
         st.binary_dxf = binary_dxf;
     }
+    // The clouds the file carries belong to the drawing they came with.
+    super::pointcloud::add_clouds(s, i, clouds);
     for note in notes {
         s.echo(note);
     }
@@ -323,8 +332,8 @@ fn add_read(s: &mut Session, drawing: Drawing, binary_dxf: bool, name: &str, pat
 }
 
 pub(crate) fn open_bytes(s: &mut Session, bytes: &[u8], name: &str, path: Option<String>) -> Result<usize> {
-    let ReadFile { drawing, binary_dxf, name, path } = read_bytes(bytes, name, path)?;
-    Ok(add_read(s, drawing, binary_dxf, &name, path))
+    let ReadFile { drawing, clouds, binary_dxf, name, path } = read_bytes(bytes, name, path)?;
+    Ok(add_read(s, drawing, clouds, binary_dxf, &name, path))
 }
 
 /// OPEN's reply: the drawing's index and what reading it left out.

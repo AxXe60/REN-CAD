@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod array;
+mod cloud;
 mod constraint;
 mod entity;
 mod extents;
@@ -24,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub use array::*;
 pub use cadcraft_color as color;
 pub use cadcraft_geom as geom;
+pub use cloud::{CLOUD_HEADER_VAR, PointCloud};
 pub use constraint::*;
 pub use entity::*;
 pub use extents::{MAX_BLOCK_DEPTH, entity_bounds};

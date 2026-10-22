@@ -75,7 +75,7 @@ fn read_drawing(path: &str) -> Result<Drawing> {
     let mut last = None;
     for p in candidates {
         match read_file(&p) {
-            Ok(bytes) => return (hooks.read)(&bytes, &p).map_err(|e| bad("insert", format!("{p}: {e}"))),
+            Ok(bytes) => return (hooks.read)(&bytes, &p).map(|(d, _)| d).map_err(|e| bad("insert", format!("{p}: {e}"))),
             Err(e) => last = Some(e),
         }
     }

@@ -10,7 +10,7 @@ use serde_json::json;
 
 /// A drawing file in a test format: its bytes are "x,y", the $INSBASE. Model space: a line from
 /// 10,10 to 20,10 on layer PARTS (colour 1), and a reference to block NUT (a circle) at 10,10.
-fn read(bytes: &[u8], _name: &str) -> Result<Drawing, String> {
+fn read(bytes: &[u8], _name: &str) -> Result<(Drawing, Vec<cadcraft_doc::PointCloud>), String> {
     let text = String::from_utf8_lossy(bytes);
     let (x, y) = text.trim().split_once(',').ok_or("bad test file")?;
     let (x, y): (f64, f64) = (x.parse().map_err(|_| "x")?, y.parse().map_err(|_| "y")?);
@@ -37,11 +37,11 @@ fn read(bytes: &[u8], _name: &str) -> Result<Drawing, String> {
         row_spacing: 0.0,
     };
     d.model.push(Entity::new(Handle(0x61), EntityKind::Insert(ins)));
-    Ok(d)
+    Ok((d, Vec::new()))
 }
 
 fn hooks() {
-    set_io(IoHooks { read, write: |_, _| Err("no writer in this test".into()), plot: None });
+    set_io(IoHooks { read, write: |_, _, _| Err("no writer in this test".into()), plot: None });
 }
 
 /// Write a test drawing file with $INSBASE `base`; returns its path.

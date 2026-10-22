@@ -107,13 +107,13 @@ fn navigates_areas_and_closes() {
 #[test]
 fn compares_a_file_read_through_the_io_hooks() {
     // Test file format: the bytes are "x" — a drawing holding a line from 0,0 to x,0.
-    fn read(bytes: &[u8], _name: &str) -> Result<Drawing, String> {
+    fn read(bytes: &[u8], _name: &str) -> Result<(Drawing, Vec<cadcraft_doc::PointCloud>), String> {
         let x: f64 = String::from_utf8_lossy(bytes).trim().parse().map_err(|_| "bad test file")?;
         let mut d = Drawing::new_imperial();
         d.add(&Space::Model, Common::default(), line(0.0, 0.0, x, 0.0)).map_err(|e| e.to_string())?;
-        Ok(d)
+        Ok((d, Vec::new()))
     }
-    set_io(IoHooks { read, write: |_, _| Err("no writer in this test".into()), plot: None });
+    set_io(IoHooks { read, write: |_, _, _| Err("no writer in this test".into()), plot: None });
     let dir = std::env::temp_dir().join(format!("cadcraft-compare-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("other.dxf");

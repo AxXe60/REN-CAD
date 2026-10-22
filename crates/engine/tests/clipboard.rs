@@ -178,12 +178,12 @@ fn clipboard_travels_as_text() {
     set_io(IoHooks {
         read: |bytes, _| {
             if bytes.starts_with(b"0\nSECTION") {
-                WRITTEN.lock().unwrap().clone().ok_or_else(|| "nothing written".into())
+                WRITTEN.lock().unwrap().clone().map(|d| (d, Vec::new())).ok_or_else(|| "nothing written".into())
             } else {
                 Err("not DXF".into())
             }
         },
-        write: |d, name| {
+        write: |d, _, name| {
             assert!(name.ends_with(".dxf"));
             *WRITTEN.lock().unwrap() = Some(d.clone());
             Ok(b"0\nSECTION\n2\nHEADER\n0\nENDSEC\n0\nEOF\n".to_vec())

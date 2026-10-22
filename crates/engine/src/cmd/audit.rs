@@ -105,7 +105,7 @@ fn run_recover(s: &mut Session, p: &Value) -> Result<Value> {
         (None, None) => return Err(bad("recover", "`path` or `data` (base64) is required")),
     };
     let hooks = file::io().ok_or_else(|| bad("recover", "file formats are not available in this build"))?;
-    let d = (hooks.read)(&bytes, &name).map_err(|e| bad("recover", format!("{name} can't be read: {e}")))?;
+    let d = (hooks.read)(&bytes, &name).map(|(d, _)| d).map_err(|e| bad("recover", format!("{name} can't be read: {e}")))?;
     let title = match str_param(p, "title") {
         Some(t) => t.to_string(),
         None => std::path::Path::new(&name).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| name.clone()),

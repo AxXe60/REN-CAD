@@ -50,17 +50,17 @@ fn new_ends_the_command_of_the_previous_drawing() {
     first_drawing_keeps_its_line(&mut s);
 }
 
-fn two_circles(_: &[u8], _: &str) -> Result<Drawing, String> {
+fn two_circles(_: &[u8], _: &str) -> Result<(Drawing, Vec<cadcraft_doc::PointCloud>), String> {
     let mut s = Session::new();
     for x in [0, 10] {
         s.execute("circle", &json!({"center": [x, 0], "radius": 1})).unwrap();
     }
-    Ok(s.doc().unwrap().clone())
+    Ok((s.doc().unwrap().clone(), Vec::new()))
 }
 
 #[test]
 fn open_ends_the_command_of_the_previous_drawing() {
-    set_io(IoHooks { read: two_circles, write: |_, _| Err("no writer in tests".into()), plot: None });
+    set_io(IoHooks { read: two_circles, write: |_, _, _| Err("no writer in tests".into()), plot: None });
     let mut s = Session::new();
     line_running(&mut s);
     s.execute("open", &json!({"data": "AA==", "name": "Circles.dxf"})).unwrap();

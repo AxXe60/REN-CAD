@@ -244,7 +244,7 @@ fn read(file: &Path, cx: &mut Ctx) -> Result<Drawing, String> {
             return Err(too_big());
         }
         cx.bytes = cx.bytes.saturating_add(n);
-        (hooks.read)(&bytes, &file.to_string_lossy())
+        (hooks.read)(&bytes, &file.to_string_lossy()).map(|(d, _)| d)
     }
     #[cfg(target_arch = "wasm32")]
     {

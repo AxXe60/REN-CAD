@@ -90,13 +90,13 @@ fn other_drawing(s: &Session, p: &Value) -> Result<(Arc<Drawing>, String)> {
     if let Some(path) = str_param(p, "path") {
         let bytes = read_path(path)?;
         let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
-        let d = (hooks.read)(&bytes, path).map_err(|e| bad(CMD, format!("{name}: {e}")))?;
+        let d = (hooks.read)(&bytes, path).map(|(d, _)| d).map_err(|e| bad(CMD, format!("{name}: {e}")))?;
         return Ok((Arc::new(d), name));
     }
     let data = str_param(p, "data").ok_or_else(|| bad(CMD, "`path`, `data` (base64) or `document` is required"))?;
     let bytes = base64_decode(data).ok_or_else(|| bad(CMD, "invalid base64"))?;
     let name = str_param(p, "name").unwrap_or("Drawing.dxf").to_string();
-    let d = (hooks.read)(&bytes, &name).map_err(|e| bad(CMD, format!("{name}: {e}")))?;
+    let d = (hooks.read)(&bytes, &name).map(|(d, _)| d).map_err(|e| bad(CMD, format!("{name}: {e}")))?;
     Ok((Arc::new(d), name))
 }
 

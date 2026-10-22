@@ -33,6 +33,8 @@ pub(crate) const ANNOTATION_KEY: &str = "CADCRAFT_ANNOTATION";
 pub(crate) const PLOT_STYLE_NAMES_KEY: &str = "ACAD_PLOTSTYLENAME";
 /// Named-object-dictionary key of the XRECORD holding the drawing's next entity handle (hex).
 pub(crate) const HANDSEED_KEY: &str = "CADCRAFT_HANDSEED";
+/// The key of the XRECORD that describes the point clouds a file carries.
+pub(crate) const CLOUD_KEY: &str = "CADCRAFT_CLOUDS";
 /// Named-object-dictionary key of the XRECORD holding the current multileader style.
 pub(crate) const MLEADER_STYLE_KEY: &str = "CADCRAFT_MLEADERSTYLE";
 /// Most plot style tables and plot style names read from a file.

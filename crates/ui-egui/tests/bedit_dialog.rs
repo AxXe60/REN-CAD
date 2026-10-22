@@ -108,7 +108,7 @@ fn a_selected_reference_and_json_calls_skip_the_dialog() {
 /// What the stand-in reader opens: for a file saying "authoring", a dynamic block's own drawing
 /// as AutoCAD saves one (model space's block record has an extension dictionary holding an
 /// `ACAD_ENHANCEDBLOCK` evaluation graph); otherwise a plain drawing. Both have one line.
-fn read(bytes: &[u8], _name: &str) -> Result<cadcraft_engine::doc::Drawing, String> {
+fn read(bytes: &[u8], _name: &str) -> Result<(cadcraft_engine::doc::Drawing, Vec<cadcraft_doc::PointCloud>), String> {
     use cadcraft_engine::doc::foreign::{Foreign, ForeignExtra, ForeignObject};
     use cadcraft_engine::doc::{Common, EntityKind, Handle, Line, RawTag, Space};
     use cadcraft_engine::geom::Vec3;
@@ -121,13 +121,13 @@ fn read(bytes: &[u8], _name: &str) -> Result<cadcraft_engine::doc::Drawing, Stri
         f.objects.push(ForeignObject { handle: Handle(0xF00), kind: "DICTIONARY".into(), tags: vec![tag(3, "ACAD_ENHANCEDBLOCK"), tag(360, "F01")] });
         d.foreign = std::sync::Arc::new(f);
     }
-    Ok(d)
+    Ok((d, Vec::new()))
 }
 
 #[test]
 fn opening_a_drawing_with_authoring_elements_offers_the_block_editor() {
     use cadcraft_engine::cmd::file::{IoHooks, set_io};
-    set_io(IoHooks { read, write: |_, _| Ok(Vec::new()), plot: None });
+    set_io(IoHooks { read, write: |_, _, _| Ok(Vec::new()), plot: None });
     let dir = std::env::temp_dir().join(format!("cadcraft-authoring-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let symbol = dir.join("Symbol.dxf");

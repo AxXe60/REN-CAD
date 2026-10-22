@@ -332,7 +332,7 @@ mod native {
         }
     }
 
-    type WriteHook = fn(&Drawing, &str) -> std::result::Result<Vec<u8>, String>;
+    type WriteHook = fn(&Drawing, &[cadcraft_doc::PointCloud], &str) -> std::result::Result<Vec<u8>, String>;
 
     /// Create the autosave folder `dir` and any missing parents. On Unix the folders made here are
     /// owner-only (`0o700`): autosave files are unsaved drawings, and with the default mode other
@@ -347,7 +347,7 @@ mod native {
     }
 
     fn write_file(write: WriteHook, doc: &Drawing, path: &str) -> std::result::Result<(), String> {
-        let bytes = write(doc, "autosave.dxf")?;
+        let bytes = write(doc, &[], "autosave.dxf")?;
         if let Some(dir) = Path::new(path).parent() {
             create_folder(dir).map_err(|e| e.to_string())?;
         }

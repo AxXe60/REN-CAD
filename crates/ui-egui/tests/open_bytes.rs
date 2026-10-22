@@ -10,8 +10,8 @@ use cadcraft_ui_egui::{CadApp, Services};
 fn open_bytes_opens_the_named_drawing_and_reports_failures() {
     // A reader that only accepts what a DXF starts with: proves the bytes arrive unchanged.
     set_io(IoHooks {
-        read: |b, _| if b.starts_with(b"0\nSECTION\n") { Ok(Drawing::new_imperial()) } else { Err("not a drawing".into()) },
-        write: |_, _| Ok(Vec::new()),
+        read: |b, _| if b.starts_with(b"0\nSECTION\n") { Ok((Drawing::new_imperial(), Vec::new())) } else { Err("not a drawing".into()) },
+        write: |_, _, _| Ok(Vec::new()),
         plot: None,
     });
     let mut app = CadApp::new(Session::empty(), Services::default());

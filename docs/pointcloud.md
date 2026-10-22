@@ -513,6 +513,43 @@ The user in the loop:
 The palette's **AI** button runs the grouping; every group gets a row with a list of the classes,
 and choosing one names the group.
 
+### The cloud belongs to the drawing, not over it
+
+A cloud opened with `LASOPEN` is an **overlay**: it is looked at, and it is not written. A cloud
+**attached** to the drawing travels with it — the points are written into the file the drawing is
+saved as, and they come back when the file is opened again.
+
+```json
+{"command":"lasopen","params":{"path":"D:/scan/Ap 1.las","decimate":0.05,"attach":true}}
+```
+
+```json
+{"command":"lasattach","params":{"index":0,"attach":true}}
+```
+
+The palette's **Attach to the drawing** box does the same, and it can be turned off again.
+
+How the cloud is written:
+
+* the points are ordinary **`POINT` entities**, on a layer of their own (`PCLOUD-<name>`), with
+  the scanner's true colour — so **any program reads the file**: AutoCAD shows the points, and
+  the drawing next to them;
+* the description of the cloud — its name, the file it came from, its coordinate system, how it is
+  coloured — goes into an `XRECORD` of the named object dictionary (`CADCRAFT_CLOUDS`). An
+  `XRECORD` and not a header variable, because the DWG keeps the records and drops the variables
+  it does not know.
+
+When the file is opened, the points are taken back out of the drawing and become the cloud again:
+the same name, the same path, the same bounds, the colour mode it was saved with. The drawing
+does not keep them twice.
+
+Measured: the Ap 1 scan decimated to a 5 cm grid (184 499 points) written as a **DWG** is
+4.9 MB, and opens back as the very same cloud.
+
+> The points that come back have no intensity and no class: the DXF `POINT` entity carries neither,
+> and the per-point data would need an extension dictionary per point. The classification can be
+> run again on the cloud that comes back (`LASCLASS`).
+
 ### The site frame
 A registered survey sits hundreds of kilometres from the drawing's origin — the factory at
 E 498 162, N 290 290 is 500 km from (0, 0) — so a scan in a projected system and a drawing in

@@ -12,13 +12,13 @@ use egui_kittest::kittest::Queryable;
 use serde_json::json;
 
 /// Test drawings: any file holds one line on layer Walls.
-fn read(_bytes: &[u8], _name: &str) -> Result<Drawing, String> {
+fn read(_bytes: &[u8], _name: &str) -> Result<(Drawing, Vec<cadcraft_doc::PointCloud>), String> {
     let mut d = Drawing::new_metric();
     d.layers.push(Layer { name: "Walls".into(), ..Layer::default() });
     let mut e = Entity::new(Handle(0x60), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(50.0, 20.0, 0.0) }));
     e.common.layer = "Walls".into();
     d.model.push(e);
-    Ok(d)
+    Ok((d, Vec::new()))
 }
 
 fn site_file() -> String {
@@ -35,7 +35,7 @@ fn status(app: &CadApp) -> Option<XrefStatus> {
 
 #[test]
 fn xref_opens_the_palette_and_its_buttons_manage_the_xref() {
-    set_io(IoHooks { read, write: |_, _| Err("no writer in this test".into()), plot: None });
+    set_io(IoHooks { read, write: |_, _, _| Err("no writer in this test".into()), plot: None });
     let mut app = CadApp::new(Session::default(), Services::default());
     app.run("xattach", json!({ "path": site_file(), "at": [10, 10] })).unwrap();
     assert_eq!(status(&app), Some(XrefStatus::Loaded));

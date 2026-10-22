@@ -256,19 +256,19 @@ fn a_long_block_cycle_is_broken_without_deep_recursion() {
     assert_eq!(s.execute("audit", &json!({})).unwrap()["errors"], 0);
 }
 
-fn read_corrupt(_: &[u8], name: &str) -> Result<Drawing, String> {
+fn read_corrupt(_: &[u8], name: &str) -> Result<(Drawing, Vec<cadcraft_doc::PointCloud>), String> {
     if name.ends_with(".bad") {
         return Err("not a drawing".into());
     }
     let mut d = Drawing::new_imperial();
     raw(&mut d, &Space::Model, on("Ghost"), line((0.0, 0.0), (1.0, 0.0)));
     raw(&mut d, &Space::Model, on("0"), EntityKind::Circle(Circle { center: Vec3::ZERO, radius: -1.0 }));
-    Ok(d)
+    Ok((d, Vec::new()))
 }
 
 #[test]
 fn recover_opens_the_file_with_the_fixes_applied() {
-    set_io(IoHooks { read: read_corrupt, write: |_, _| Ok(Vec::new()), plot: None });
+    set_io(IoHooks { read: read_corrupt, write: |_, _, _| Ok(Vec::new()), plot: None });
     let mut s = Session::new();
     let r = s.execute("recover", &json!({"data": base64_encode(b"0\nEOF\n"), "name": "plan.dxf"})).unwrap();
     assert_eq!(r["errors"], 2, "{r:#}");

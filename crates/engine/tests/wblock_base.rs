@@ -7,7 +7,7 @@ use cadcraft_engine::doc::{Drawing, EntityKind};
 use serde_json::json;
 
 /// Writes "INSBASE x,y;line ax,ay" for each line, so the test can read the written geometry.
-fn write(d: &Drawing, _path: &str) -> Result<Vec<u8>, String> {
+fn write(d: &Drawing, _: &[cadcraft_doc::PointCloud], _path: &str) -> Result<Vec<u8>, String> {
     let ins = d.header.point("INSBASE").ok_or("no INSBASE")?;
     let mut out = format!("{},{}", ins.x, ins.y);
     for e in d.model.iter() {

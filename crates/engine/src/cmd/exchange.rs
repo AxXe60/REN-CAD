@@ -116,7 +116,7 @@ fn run_export(s: &mut Session, p: &Value) -> Result<Value> {
     if !EXPORT_FORMATS.contains(&format.as_str()) {
         return Err(bad("export", "`format` must be dxf, dwg, svg, png or pdf (or give a `path` with one of those extensions)"));
     }
-    let bytes = (hooks.write)(s.doc()?, &format!("export.{format}")).map_err(|e| bad("export", e))?;
+    let bytes = (hooks.write)(s.doc()?, &[], &format!("export.{format}")).map_err(|e| bad("export", e))?;
     match path {
         Some(path) => {
             write_file("export", path, &bytes)?;
@@ -147,7 +147,7 @@ fn run_import(s: &mut Session, p: &Value) -> Result<Value> {
         let data = str_param(p, "data").ok_or_else(|| bad("import", "`path` or `data` (base64) is required"))?;
         (base64_decode(data).ok_or_else(|| bad("import", "invalid base64"))?, str_param(p, "name").unwrap_or("import.dxf").to_string())
     };
-    let src = (hooks.read)(&bytes, &name).map_err(|e| bad("import", e))?;
+    let src = (hooks.read)(&bytes, &name).map(|(d, _)| d).map_err(|e| bad("import", e))?;
     let file = std::path::Path::new(&name).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     import_drawing(s, &src, at, scale, &file)
 }
@@ -586,10 +586,10 @@ mod tests {
     fn our_hooks() -> bool {
         set_io(IoHooks {
             read: |_, _| Err("no reader in tests".into()),
-            write: |d, name| Ok(if name == "probe.test" { b"exchange".to_vec() } else { format!("{name}:{}", d.model.len()).into_bytes() }),
+            write: |d, _, name| Ok(if name == "probe.test" { b"exchange".to_vec() } else { format!("{name}:{}", d.model.len()).into_bytes() }),
             plot: Some(fake_plot),
         });
-        io().is_some_and(|h| (h.write)(&Drawing::new_imperial(), "probe.test").is_ok_and(|b| b == b"exchange"))
+        io().is_some_and(|h| (h.write)(&Drawing::new_imperial(), &[], "probe.test").is_ok_and(|b| b == b"exchange"))
     }
 
     fn session() -> Session {

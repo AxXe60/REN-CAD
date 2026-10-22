@@ -11,13 +11,13 @@ fn picked() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("cadcraft-ui-save-version-{}.dxf", std::process::id()))
 }
 
-fn with_options(_: &Drawing, _: &str, o: &SaveAs) -> Result<Vec<u8>, String> {
+fn with_options(_: &Drawing, _: &[cadcraft_doc::PointCloud], _: &str, o: &SaveAs) -> Result<Vec<u8>, String> {
     Ok(format!("{}|{}", o.version.map(|v| v.year()).unwrap_or("-"), o.binary).into_bytes())
 }
 
 #[test]
 fn default_save_version_applies_to_new_drawings_and_persists() {
-    set_io(IoHooks { read: |_, _| Ok(Drawing::new_metric()), write: |_, _| Ok(b"plain".to_vec()), plot: None });
+    set_io(IoHooks { read: |_, _| Ok((Drawing::new_metric(), Vec::new())), write: |_, _, _| Ok(b"plain".to_vec()), plot: None });
     set_write_as(with_options);
     let services = Services { pick_save: Some(Box::new(|_: &str| Some(picked().to_string_lossy().to_string()))), ..Services::default() };
     let mut app = CadApp::new(Session::new(), services);

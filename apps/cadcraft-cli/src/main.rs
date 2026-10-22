@@ -173,12 +173,12 @@ fn export_window(s: &Session, framing: Framing, before: Option<&[(u64, Option<Vi
 
 fn install_io() {
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
-        read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
-        write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
+        read: |b, name| cadcraft_io::read_clouds(b, name).map_err(|e| e.to_string()),
+        write: |d, clouds, name| cadcraft_io::write_clouds(d, clouds, name).map_err(|e| e.to_string()),
         plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
     });
-    cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
-        cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
+    cadcraft_engine::cmd::file::set_write_as(|d, clouds, name, o| {
+        cadcraft_io::write_clouds_with(d, clouds, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
     });
     // AutoLISP's entget, entmake and entmod see entities as DXF groups.
     cadcraft_engine::cmd::file::set_entity_codec(cadcraft_engine::cmd::file::EntityCodec {

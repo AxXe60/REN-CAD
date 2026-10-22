@@ -7,17 +7,17 @@ use cadcraft_engine::cmd::file::{IoHooks, SaveAs, base64_decode, base64_encode, 
 use serde_json::json;
 
 /// The plain writer (no options).
-fn plain(_: &Drawing, _: &str) -> Result<Vec<u8>, String> {
+fn plain(_: &Drawing, _: &[cadcraft_doc::PointCloud], _: &str) -> Result<Vec<u8>, String> {
     Ok(b"plain".to_vec())
 }
 
 /// The writer with options: the bytes name the options it got.
-fn with_options(_: &Drawing, _: &str, o: &SaveAs) -> Result<Vec<u8>, String> {
+fn with_options(_: &Drawing, _: &[cadcraft_doc::PointCloud], _: &str, o: &SaveAs) -> Result<Vec<u8>, String> {
     Ok(format!("{}|{}", o.version.map(|v| v.year()).unwrap_or("-"), o.binary).into_bytes())
 }
 
 fn install() {
-    set_io(IoHooks { read: |_, _| Ok(Drawing::new_metric()), write: plain, plot: None });
+    set_io(IoHooks { read: |_, _| Ok((Drawing::new_metric(), Vec::new())), write: plain, plot: None });
     set_write_as(with_options);
 }
 

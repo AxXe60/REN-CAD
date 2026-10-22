@@ -284,6 +284,18 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             run(app, "lasground", json!({ "index": selected, "show": only }));
         }
     });
+    // ---------- the cloud belongs to the drawing ----------
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let mut attached = app.session.clouds[selected].attached;
+        if ui
+            .checkbox(&mut attached, "Attach to the drawing")
+            .on_hover_text("The cloud is written into the file the drawing is saved as: the points travel with the drawing, not over it")
+            .changed()
+        {
+            run(app, "lasattach", json!({ "index": selected, "attach": attached }));
+        }
+    });
     // ---------- compare with another cloud ----------
     if app.session.clouds.len() > 1 {
         ui.horizontal(|ui| {

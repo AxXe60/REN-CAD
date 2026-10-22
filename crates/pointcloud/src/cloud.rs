@@ -155,6 +155,11 @@ pub struct Cloud {
     pub cluster_sample: Vec<[f64; 3]>,
     /// The colour scale the intensity and the elevation bands are read on.
     pub spectrum: crate::spectrum::Spectrum,
+    /// Whether the cloud belongs to the drawing it was opened in: an attached cloud is written
+    /// into the file and comes back with it.
+    pub attached: bool,
+    /// The drawing the cloud belongs to (the index of the session's document).
+    pub doc: usize,
     /// The band's heights in 64 bins, so the palette can draw the scan's profile and the user can
     /// see where the floor and the ceiling are.
     pub zhisto: [u32; 64],
@@ -248,6 +253,8 @@ impl Cloud {
             cluster_info: Vec::new(),
             cluster_sample: Vec::new(),
             spectrum: crate::spectrum::Spectrum::BlueRed,
+            attached: false,
+            doc: 0,
             zhisto: heights(&slice.points, zmin, zmax),
             crs: None,
             levels,

@@ -11,16 +11,16 @@ use serde_json::json;
 
 static FILES: Mutex<Vec<(String, Drawing)>> = Mutex::new(Vec::new());
 
-fn write(d: &Drawing, name: &str) -> Result<Vec<u8>, String> {
+fn write(d: &Drawing, _: &[cadcraft_doc::PointCloud], name: &str) -> Result<Vec<u8>, String> {
     let mut files = FILES.lock().unwrap();
     files.push((name.to_string(), d.clone()));
     Ok(format!("TEST {}", files.len() - 1).into_bytes())
 }
 
-fn read(bytes: &[u8], _name: &str) -> Result<Drawing, String> {
+fn read(bytes: &[u8], _name: &str) -> Result<(Drawing, Vec<cadcraft_doc::PointCloud>), String> {
     let text = String::from_utf8_lossy(bytes);
     let i: usize = text.strip_prefix("TEST ").and_then(|n| n.trim().parse().ok()).ok_or("not a drawing")?;
-    FILES.lock().unwrap().get(i).map(|f| f.1.clone()).ok_or_else(|| "no such drawing".into())
+    FILES.lock().unwrap().get(i).map(|f| (f.1.clone(), Vec::new())).ok_or_else(|| "no such drawing".into())
 }
 
 fn hooks() {

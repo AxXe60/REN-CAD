@@ -5,6 +5,7 @@
 /// What a DXF file holds that CADCraft doesn't model, kept and written back (#528).
 mod dxf_raw;
 
+mod cloud;
 mod dxf_ext;
 mod dxf_image;
 mod dxf_mleader;
@@ -24,6 +25,7 @@ use cadcraft_doc::{Drawing, Space};
 use cadcraft_geom::Bounds2;
 
 pub use cadcraft_dxf::Version;
+pub use cloud::{from_header, header_value};
 pub use dxf_read::entity_from_groups;
 pub use dxf_write::entity_groups;
 pub use pdf::{PdfOptions, pdf, plot};
@@ -60,16 +62,33 @@ fn ext(name: &str) -> String {
 /// Read a drawing; the format comes from the content (DXF ASCII/binary, DWG) or the name
 /// (SVG and gzip-compressed SVGZ).
 pub fn read(bytes: &[u8], name: &str) -> Result<Drawing> {
+    read_clouds(bytes, name).map(|(drawing, _)| drawing)
+}
+
+/// Read a drawing and the point clouds it carries.
+///
+/// The clouds come out of the drawing: their points are `POINT` entities on their own layers, and
+/// the header variable says which layers they are.
+pub fn read_clouds(bytes: &[u8], name: &str) -> Result<(Drawing, Vec<cadcraft_doc::PointCloud>)> {
     if cadcraft_dwg::is_dwg(bytes) {
         let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, cadcraft_dwg::Limits::DEFAULT).map_err(IoError::Format)?;
         let mut d = dxf_read::read(&dxf).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
         d.read_notes = notes;
-        return Ok(d);
+        let clouds = cloud::take_from(&mut d);
+        return Ok((d, clouds));
     }
     match ext(name).as_str() {
-        "svg" | "svgz" => svg_read::read(bytes),
-        "dxf" | "" => dxf_read::read(bytes),
-        e if bytes.len() > 4 => dxf_read::read(bytes).map_err(|_| IoError::Unsupported(e.to_string())),
+        "svg" | "svgz" => Ok((svg_read::read(bytes)?, Vec::new())),
+        "dxf" | "" => {
+            let mut d = dxf_read::read(bytes)?;
+            let clouds = cloud::take_from(&mut d);
+            Ok((d, clouds))
+        }
+        e if bytes.len() > 4 => {
+            let mut d = dxf_read::read(bytes).map_err(|_| IoError::Unsupported(e.to_string()))?;
+            let clouds = cloud::take_from(&mut d);
+            Ok((d, clouds))
+        }
         e => Err(IoError::Unsupported(e.to_string())),
     }
 }
@@ -79,6 +98,35 @@ pub fn read(bytes: &[u8], name: &str) -> Result<Drawing> {
 /// ([`save_version`]), DXF as ASCII.
 pub fn write(d: &Drawing, name: &str) -> Result<Vec<u8>> {
     write_framed(d, name, None)
+}
+
+/// Write a drawing with the point clouds it carries.
+///
+/// The clouds are written as `POINT` entities on their own layers, with a header variable that
+/// says what they are: any program reads the points, RENCAD reads the cloud back.
+pub fn write_clouds(d: &Drawing, clouds: &[cadcraft_doc::PointCloud], name: &str) -> Result<Vec<u8>> {
+    write_clouds_with(d, clouds, name, &SaveOptions::default())
+}
+
+/// Like [`write_clouds`], with the DXF/DWG version and binary DXF chosen by `opts`.
+pub fn write_clouds_with(d: &Drawing, clouds: &[cadcraft_doc::PointCloud], name: &str, opts: &SaveOptions) -> Result<Vec<u8>> {
+    let version = opts.version.unwrap_or_else(|| save_version(d));
+    match ext(name).as_str() {
+        "dxf" | "" => {
+            let tags = dxf_write::tags_with_clouds(d, version, clouds);
+            Ok(if opts.binary {
+                cadcraft_dxf::write_binary(&tags, version.utf8())
+            } else {
+                cadcraft_dxf::write_ascii_as(&tags, version.utf8()).into_bytes()
+            })
+        }
+        "dwg" if !opts.binary => {
+            let version = opts.version.unwrap_or_else(|| version.max(Version::R2004));
+            cadcraft_dwg::dxf_to_dwg_as(dxf_write::dwg_bridge_with_clouds(d, version, clouds).as_bytes(), version.code()).map_err(IoError::Format)
+        }
+        e if opts.binary => Err(IoError::Format(format!("binary output is for DXF files, not `{e}`"))),
+        _ => write_framed(d, name, None),
+    }
 }
 
 /// Like [`write`], with the DXF/DWG version and binary DXF chosen by `opts`. Binary applies to

@@ -2050,6 +2050,11 @@ impl Objects {
         if let Some(style) = self.xrecord_text(crate::dxf_ext::MLEADER_STYLE_KEY).filter(|s| !s.trim().is_empty()) {
             d.header.set_str("CMLEADERSTYLE", &style);
         }
+        // The point clouds the file carries: their description, so the clouds can be taken out of
+        // the drawing afterwards.
+        if let Some(text) = self.xrecord_text(crate::dxf_ext::CLOUD_KEY) {
+            d.header.set_str(cadcraft_doc::CLOUD_HEADER_VAR, &text);
+        }
         // Table styles (named by their ACAD_TABLESTYLE dictionary entries).
         for (h, tags) in &self.table_styles {
             let Some(name) = self.names.get(h).filter(|n| !n.is_empty()) else { continue };

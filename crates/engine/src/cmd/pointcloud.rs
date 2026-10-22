@@ -19,9 +19,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo(),
         CommandSpec::new("lasopen", "Open Point Cloud", lasopen)
-            .params("{path: string, z0?: number, z1?: number, decimate?: number, maxPoints?: int, color?: string, name?: string}")
+            .params("{path: string, z0?: number, z1?: number, decimate?: number, maxPoints?: int, color?: string, name?: string, attach?: bool}")
             .enabled(always)
             .noundo(),
+        CommandSpec::new("lasattach", "Attach Point Cloud to Drawing", lasattach).params("{attach?: bool, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lascolor", "Colour Point Cloud", lascolor).params("{mode: string, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasdecimate", "Decimate Point Cloud", lasdecimate)
             .params("{cell: number, index?: int} (0 = every point of the band)")
@@ -162,6 +163,97 @@ fn lasexport(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// The layer a cloud's points are written on: `PCLOUD-<name>`, with the characters a DXF layer
+/// name cannot hold replaced.
+pub fn cloud_layer(name: &str) -> String {
+    let mut out = String::from("PCLOUD-");
+    for c in name.chars() {
+        if out.len() >= 60 {
+            break;
+        }
+        if matches!(c, '<' | '>' | '/' | '\\' | '"' | ':' | ';' | '?' | '*' | '|' | '=' | '\'') {
+            out.push('_');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The cloud as the file carries it: the points in the drawing's own units.
+///
+/// The drawing's frame is the site's: the world point that sits at the drawing's (0, 0, 0) is
+/// the local origin, so the cloud's points are written relative to it.
+pub fn cloud_to_file(c: &cadcraft_pointcloud::Cloud, local: [f64; 3]) -> cadcraft_doc::PointCloud {
+    let mut out = cadcraft_doc::PointCloud::new(c.name.clone(), cloud_layer(&c.name));
+    out.source = c.path.clone();
+    out.crs = c.crs.as_ref().and_then(|crs| crs.epsg).map(|e| format!("EPSG:{e}"));
+    out.color = c.color.name().to_string();
+    if let Some(level) = c.levels.first() {
+        for v in level.pts.iter() {
+            out.points.push([f64::from(v.x) + c.origin[0] - local[0], f64::from(v.y) + c.origin[1] - local[1], f64::from(v.z) - local[2]]);
+            out.colors.push(v.rgb);
+            out.intensities.push(u16::from(v.intensity) * 257);
+        }
+    }
+    out
+}
+
+/// The cloud a file carries, as the session's cloud: the points in the world's units again.
+pub fn cloud_from_file(c: &cadcraft_doc::PointCloud, local: [f64; 3]) -> Option<cadcraft_pointcloud::Cloud> {
+    if c.points.is_empty() {
+        return None;
+    }
+    let mut b = cadcraft_pointcloud::Bounds3::EMPTY;
+    let points: Vec<cadcraft_pointcloud::Pt> = c
+        .points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let w = [p[0] + local[0], p[1] + local[1], p[2] + local[2]];
+            b.add(w[0], w[1], w[2]);
+            cadcraft_pointcloud::Pt {
+                x: w[0],
+                y: w[1],
+                z: w[2],
+                rgb: c.colors.get(i).copied(),
+                intensity: c.intensities.get(i).copied().unwrap_or(0),
+                class: 1,
+            }
+        })
+        .collect();
+    let n = points.len() as u64;
+    let slice = cadcraft_pointcloud::Slice { points, total: n, in_band: n, bounds: b };
+    let color = cadcraft_pointcloud::CloudColor::parse(&c.color).unwrap_or(cadcraft_pointcloud::CloudColor::Rgb);
+    Some(cadcraft_pointcloud::Cloud::from_slice(
+        c.name.clone(),
+        c.source.clone(),
+        b.min[2],
+        b.max[2],
+        None,
+        slice,
+        cadcraft_pointcloud::DEFAULT_MAX_POINTS,
+        color,
+    ))
+}
+
+/// The clouds that belong to the drawing being written, as the file carries them.
+pub fn clouds_for_file(s: &Session, _path: &str) -> Vec<cadcraft_doc::PointCloud> {
+    let local = s.local_origin;
+    s.clouds.iter().filter(|c| c.attached && c.doc == s.active).map(|c| cloud_to_file(c, local)).collect()
+}
+
+/// The clouds a file carries, added to the session: they belong to the drawing they came with.
+pub fn add_clouds(s: &mut Session, doc: usize, clouds: Vec<cadcraft_doc::PointCloud>) {
+    let local = s.local_origin;
+    for c in clouds {
+        let Some(mut cloud) = cloud_from_file(&c, local) else { continue };
+        cloud.attached = true;
+        cloud.doc = doc;
+        s.clouds.push(cloud);
+    }
+}
+
 /// Keep a band in the session for the canvas. Without `decimate` the finest level holds every
 /// point of the band (up to `maxPoints`); `maxPoints: 0` means the whole band. `color` picks the
 /// shading.
@@ -187,6 +279,9 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
         .map(str::to_string)
         .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("Point cloud").to_string());
     let cloud = cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, decimate, max_points, color).map_err(oops)?;
+    // `attach` ties the cloud to the drawing: it is written into the file and comes back with it.
+    let attach = p.get("attach").and_then(Value::as_bool).unwrap_or(false);
+    let doc = s.active;
     let b = cloud.bounds;
     let count = cloud.points();
     let levels = cloud.levels.len();
@@ -202,11 +297,15 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
             st.set_view(View { center, height: w.max(h).max(1.0) * 1.2 });
         }
     }
+    let mut cloud = cloud;
+    cloud.attached = attach;
+    cloud.doc = doc;
     s.clouds.push(cloud);
     Ok(json!({
         "message": format!(
-            "{name}: {count} points{} from {full} in the band ({levels} levels)",
-            if cell > 0.0 { format!(" on a {cell} m grid") } else { " (all band points)".into() }
+            "{name}: {count} points{} from {full} in the band ({levels} levels){}",
+            if cell > 0.0 { format!(" on a {cell} m grid") } else { " (all band points)".into() },
+            if attach { " — attached to the drawing".to_string() } else { String::new() }
         ),
         "name": name,
         "points": count,
@@ -273,6 +372,35 @@ fn cloud_index(s: &Session, p: &Value) -> Result<usize> {
         return Err(EngineError::Other(format!("no point cloud {i}; {} open", s.clouds.len())));
     }
     Ok(i)
+}
+
+/// Attach a cloud to the drawing, or let it go.
+///
+/// An attached cloud is written into the file the drawing is saved as — the points travel with
+/// the drawing, and the drawing is what the file is. A cloud that is not attached is an overlay:
+/// it is looked at, and it is not written.
+fn lasattach(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let attach = p.get("attach").and_then(Value::as_bool).unwrap_or(true);
+    let doc = s.active;
+    let name = {
+        let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+        c.attached = attach;
+        if attach {
+            c.doc = doc;
+        }
+        c.name.clone()
+    };
+    Ok(json!({
+        "message": if attach {
+            format!("{name} is attached to the drawing: it is written into the file")
+        } else {
+            format!("{name} is an overlay only: it is not written into the file")
+        },
+        "index": i,
+        "attached": attach,
+        "doc": doc,
+    }))
 }
 
 fn lascolor(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1034,6 +1162,37 @@ mod tests {
         // A group that is not there is an error, not a panic.
         assert!(lascluster(&mut s, &json!({ "cluster": 99, "class": "building" })).is_err());
         assert!(lascluster(&mut s, &json!({ "cluster": 0, "class": "nonsense" })).is_err());
+    }
+
+    #[test]
+    fn an_attached_cloud_travels_with_the_drawing() {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let mut b = Bounds3::EMPTY;
+        b.add(0.0, 0.0, 0.0);
+        b.add(1.0, 1.0, 1.0);
+        let pts: Vec<Pt> = (0..20).map(|i| Pt { x: i as f64 * 0.05, y: 0.0, z: 0.0, rgb: Some([10, 20, 30]), intensity: 100, class: 1 }).collect();
+        let n = pts.len() as u64;
+        let slice = Slice { points: pts, total: n, in_band: n, bounds: b };
+        let mut s = Session::new();
+        let mut cloud = Cloud::from_slice("t".into(), "D:/scan.las".into(), 0.0, 1.0, Some(0.01), slice, 1000, CloudColor::Rgb);
+        cloud.attached = true;
+        cloud.doc = 0;
+        s.clouds.push(cloud);
+        // The file's form of the cloud: the points, in the drawing's own units.
+        let file = clouds_for_file(&s, "x.dxf");
+        assert_eq!(file.len(), 1, "the attached cloud is written with the drawing");
+        assert_eq!(file[0].name, "t");
+        assert_eq!(file[0].layer, "PCLOUD-t");
+        assert_eq!(file[0].source, "D:/scan.las");
+        assert!(!file[0].points.is_empty());
+        // And back again.
+        let back = cloud_from_file(&file[0], s.local_origin);
+        assert!(back.is_some(), "the cloud comes back");
+        let back = back.unwrap_or_else(|| s.clouds[0].clone());
+        assert_eq!(back.levels.first().map(|l| l.pts.len()), Some(file[0].points.len()));
+        // A cloud that is not attached is not written.
+        s.clouds[0].attached = false;
+        assert!(clouds_for_file(&s, "x.dxf").is_empty());
     }
 
     #[test]

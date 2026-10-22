@@ -144,7 +144,7 @@ pub fn system_text(s: &Session) -> Option<String> {
         d.ensure_layer(&e.common.layer);
         d.model.push(e);
     }
-    let bytes = (hooks.write)(&d, "clipboard.dxf").ok()?;
+    let bytes = (hooks.write)(&d, &[], "clipboard.dxf").ok()?;
     String::from_utf8(bytes).ok()
 }
 
@@ -157,7 +157,7 @@ pub fn load_system_text(s: &mut Session, text: &str) -> bool {
         return false;
     }
     let Some(hooks) = super::file::io() else { return false };
-    let Ok(src) = (hooks.read)(text.as_bytes(), "clipboard.dxf") else { return false };
+    let Ok((src, _)) = (hooks.read)(text.as_bytes(), "clipboard.dxf") else { return false };
     if src.model.is_empty() || src.model.len() > MAX_SYSTEM_OBJECTS {
         return false;
     }

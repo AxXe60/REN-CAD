@@ -1088,7 +1088,7 @@ mod tests {
     fn plot_goes_through_the_hook() {
         super::super::file::set_io(super::super::file::IoHooks {
             read: |_, _| Err("no reader in tests".into()),
-            write: |_, _| Err("no writer in tests".into()),
+            write: |_, _, _| Err("no writer in tests".into()),
             plot: Some(fake_plot),
         });
         let mut s = session_with_model();
