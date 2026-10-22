@@ -173,6 +173,8 @@ pub struct Cloud {
     pub levels: Vec<CloudLevel>,
     /// Points the band held before the `maxPoints` cap.
     pub full_points: usize,
+    /// The points the file holds, band or no band: the header's own count.
+    pub file_points: usize,
 }
 
 /// Points per cloud by default: a 6-million-point band is 96 MB of 16-byte vertices and still
@@ -203,33 +205,55 @@ impl Cloud {
         let b = slice.bounds;
         let origin = [b.min[0], b.min[1]];
         let (zmin, zmax) = (b.min[2], b.max[2]);
-        let (imin, imax) = slice.points.iter().fold((u16::MAX, 0u16), |(lo, hi), p| (lo.min(p.intensity), hi.max(p.intensity)));
-        let (imin, imax) = if slice.points.is_empty() { (0, 65535) } else { (imin, imax) };
+        // The four colour and profile windows in one walk: the intensity range, both 2%-98%
+        // window histograms and the height profile. The u8 stretch of the intensity comes after,
+        // because the stretch is defined by the range this walk produces.
+        let windows = band_windows(&slice.points, zmin, zmax);
+        let (imin, imax) = if slice.points.is_empty() { (0, 65535) } else { (windows.imin, windows.imax) };
         let norm = Norm { lo: imin, span: u32::from(imax.saturating_sub(imin)) };
         // The 2%–98% window of the Z and of the intensity: the colour ramps use it, so a handful
         // of outliers (a spike through the ceiling, a hot return) cannot flatten the contrast of
         // the other 99% of the points.
-        let (zp02, zp98) = z_percentiles(&slice.points, zmin, zmax);
-        let (ip02, ip98) = intensity_percentiles(&slice.points, norm);
+        let (zp02, zp98) = bin_percentiles(&windows.zhist, zmin, zmax, slice.points.len());
+        let (ip02, ip98) = intensity_percentiles(&windows.ihist, norm);
         // No `decimate` (or `0`) means the source points themselves: the finest level keeps every
         // point of the band, up to the memory cap. A cell is the drafting answer for huge scans.
         let asked = decimate.filter(|c| *c > 0.0);
         let mut cell = asked.unwrap_or(0.0);
         let cap = if max_points == 0 { ALL_POINTS_LIMIT } else { max_points.max(10_000) };
-        let (mut base, mut base_classes) = grid(&slice.points, cell, origin, norm);
+        let (mut base, mut base_classes, mut band_idx) = grid(&slice.points, cell, origin, norm);
         // Fit the cap, then keep coarsening: 1.6x cells make the next level ~2.5x lighter.
         while base.len() > cap && cell < 1e4 {
             cell = if cell > 0.0 { cell * 1.5 } else { 0.002 };
-            (base, base_classes) = grid(&slice.points, cell, origin, norm);
+            (base, base_classes, band_idx) = grid(&slice.points, cell, origin, norm);
         }
         let mut levels = vec![CloudLevel { cell, pts: base, classes: base_classes, clusters: Vec::new(), dev: Vec::new() }];
-        while levels.last().is_some_and(|l| l.pts.len() > 20_000) && levels.len() < 16 {
-            let c = if levels.last().is_some_and(|l| l.cell <= 0.0) { 0.005 } else { levels.last().map_or(0.01, |l| l.cell) * 1.6 };
-            let (pts, classes) = grid(&slice.points, c, origin, norm);
-            if pts.len() >= levels.last().map_or(0, |l| l.pts.len()) {
+        // Each coarser level is decimated from the level below it, not from the band again: the
+        // walk shrinks with every step. The cell doubles each step, because that is what makes the
+        // two ways agree: every cube of the level below then sits inside one cube of the new
+        // level, so the band's first point of a coarse cube has no earlier band point in its own
+        // finer cube (an earlier one would sit in the same coarse cube and contradict its
+        // firstness), and walking the level below keeps it first of its coarse cube exactly as
+        // walking the band would. A cell that is not a whole multiple of the one below lets a fine
+        // cube straddle a coarse boundary; the band's first point of the coarse cube is then a
+        // point the level below may have dropped (an earlier point took its fine cube while
+        // landing in the neighbouring coarse cube), and the levels drift apart.
+        //
+        // The pyramid goes on while the coarsest level is too heavy for a screen, and at least to
+        // a third level, so a medium band still zooms out in steps; a band of one point has
+        // nothing left to coarsen.
+        while levels.len() < 16 && levels.last().is_some_and(|l| l.pts.len() > 20_000 || (levels.len() < 3 && l.pts.len() > 1)) {
+            let last = match levels.last() {
+                Some(l) => l,
+                None => break,
+            };
+            let c = if last.cell <= 0.0 { 0.005 } else { last.cell * 2.0 };
+            let (pts, classes, kept) = grid_below(&slice.points, &band_idx, &last.pts, &last.classes, c, origin);
+            if pts.len() >= last.pts.len() {
                 break;
             }
             levels.push(CloudLevel { cell: c, pts, classes, clusters: Vec::new(), dev: Vec::new() });
+            band_idx = kept;
         }
         Self {
             name,
@@ -260,10 +284,11 @@ impl Cloud {
             attached: false,
             doc: 0,
             offset: [0.0; 3],
-            zhisto: heights(&slice.points, zmin, zmax),
+            zhisto: windows.profile,
             crs: None,
             levels,
             full_points: slice.in_band as usize,
+            file_points: slice.total as usize,
         }
     }
 
@@ -480,10 +505,13 @@ impl Cloud {
     pub fn compare_with_points(&mut self, reference_points: &[[f64; 3]], cell: f64) -> crate::compare::DeviationStats {
         let cell = if cell > 0.0 { cell } else { 0.05 };
         let mut stats = crate::compare::DeviationStats::default();
+        // One grid over the reference, for every level: the reference does not change from one
+        // level of the tested cloud to the next.
+        let grid = crate::grid::Grid::new(reference_points, cell);
         for level in &mut self.levels {
             let tested: Vec<[f64; 3]> =
                 level.pts.iter().map(|v| [f64::from(v.x) + self.origin[0], f64::from(v.y) + self.origin[1], f64::from(v.z)]).collect();
-            level.dev = crate::compare::distances(&tested, reference_points, cell);
+            level.dev = crate::compare::distances_with_grid(&tested, reference_points, &grid);
         }
         if let Some(finest) = self.levels.first() {
             stats = crate::compare::stats(&finest.dev);
@@ -503,13 +531,54 @@ impl Cloud {
     }
 }
 
-/// The bins of the Z histogram: 65536 keeps a half-metre wall resolvable even when one outlier
-/// stretches the range over a kilometre.
+/// The four colour and profile windows of the band, read in one walk of the points: the
+/// intensity range, the 2%-98% window histograms of the Z and of the intensity (in the 16-bit
+/// scale the u8 stretch comes afterwards, from the same counts), and the 64-bin height profile
+/// the palette draws.
+struct BandWindows {
+    imin: u16,
+    imax: u16,
+    /// The Z counts over `[zmin, zmax]` in `Z_BINS` bins: the percentiles read them.
+    zhist: Vec<u32>,
+    /// The intensity counts in the 16-bit scale: the u8 counts come from these after the walk,
+    /// because the band's range (which the stretch needs) is only known once it is over.
+    ihist: Vec<u32>,
+    /// The same heights in 64 bins, so the palette can draw the scan's profile: the floor and
+    /// the ceiling show up as two wide humps, a wall as a thin one.
+    profile: [u32; 64],
+}
+
+/// The Z bins of the percentile histogram: 65536 keeps a half-metre wall resolvable even when one
+/// outlier stretches the range over a kilometre.
 const Z_BINS: usize = 65_536;
 /// The bins of the intensity histogram, in the 0..255 scale the vertices use.
 const INTENSITY_BINS: usize = 256;
 
-/// The 2nd and 98th percentile of a histogram over `[lo, hi]`, as values in the same range.
+/// The 2nd and 98th percentile of the band's Z and of its intensity, the intensity range and the
+/// 64-bin height profile, all from one walk of the points (no sorting of four million points, no
+/// four walks of them).
+fn band_windows(points: &[crate::Pt], zmin: f64, zmax: f64) -> BandWindows {
+    let mut out = BandWindows { imin: u16::MAX, imax: 0, zhist: vec![0u32; Z_BINS], ihist: vec![0u32; Z_BINS], profile: [0u32; 64] };
+    // One guard serves both Z histograms: a band that lives in one height has no window, and a
+    // non-finite bound stretches the range without end.
+    let span = zmax - zmin;
+    let bin_z = span > 0.0 && span.is_finite();
+    for p in points {
+        out.imin = out.imin.min(p.intensity);
+        out.imax = out.imax.max(p.intensity);
+        out.ihist[usize::from(p.intensity)] += 1;
+        if bin_z {
+            let i = (((p.z - zmin) / span) * (Z_BINS - 1) as f64).round();
+            let i = (i as usize).min(Z_BINS - 1);
+            out.zhist[i] = out.zhist[i].saturating_add(1);
+            let j = (((p.z - zmin) / span) * 63.0).round().clamp(0.0, 63.0) as usize;
+            out.profile[j] = out.profile[j].saturating_add(1);
+        }
+    }
+    out
+}
+
+/// The 2%–98% percentile pairs of a histogram over `[lo, hi]`, as values in the same range.
 fn bin_percentiles(counts: &[u32], lo: f64, hi: f64, total: usize) -> (f64, f64) {
     if total == 0 || counts.len() < 2 {
         return (lo, hi);
@@ -537,34 +606,23 @@ fn bin_percentiles(counts: &[u32], lo: f64, hi: f64, total: usize) -> (f64, f64)
     }
 }
 
-/// The 2nd and 98th percentile of the band's Z, from a histogram (no sorting of four million
-/// points).
-fn z_percentiles(points: &[crate::Pt], zmin: f64, zmax: f64) -> (f64, f64) {
-    if points.is_empty() || !zmin.is_finite() || !zmax.is_finite() {
-        return (zmin, zmax);
-    }
-    let mut hist = vec![0u32; Z_BINS];
-    let span = zmax - zmin;
-    for p in points {
-        let i = if span > 0.0 { (((p.z - zmin) / span) * (Z_BINS - 1) as f64).round() } else { 0.0 };
-        let i = (i as usize).min(Z_BINS - 1);
-        hist[i] = hist[i].saturating_add(1);
-    }
-    bin_percentiles(&hist, zmin, zmax, points.len())
-}
-
 /// The same window for the intensity, in the 0..255 scale the vertices store: a hot return
 /// cannot stretch the ramp and flatten the wall behind it.
-fn intensity_percentiles(points: &[crate::Pt], norm: Norm) -> (u8, u8) {
-    if points.is_empty() {
-        return (0, 255);
-    }
+///
+/// The counts arrive from the walk in the 16-bit scale, and the stretch that folds them into the
+/// 0..255 bins needs the band's range, which only the walk produces: so the fold happens after
+/// it, bin by bin, over the same numbers the per-point stretch would have histogrammed.
+fn intensity_percentiles(raw: &[u32], norm: Norm) -> (u8, u8) {
+    let total: usize = raw.iter().map(|c| *c as usize).sum();
     let mut hist = vec![0u32; INTENSITY_BINS];
-    for p in points {
-        let v = norm.u8(p.intensity) as usize;
-        hist[v.min(INTENSITY_BINS - 1)] = hist[v.min(INTENSITY_BINS - 1)].saturating_add(1);
+    for (v, n) in raw.iter().enumerate() {
+        if *n == 0 {
+            continue;
+        }
+        let b = usize::from(norm.u8(v as u16)).min(INTENSITY_BINS - 1);
+        hist[b] = hist[b].saturating_add(*n);
     }
-    let (lo, hi) = bin_percentiles(&hist, 0.0, 255.0, points.len());
+    let (lo, hi) = bin_percentiles(&hist, 0.0, 255.0, total);
     (lo as u8, hi as u8)
 }
 
@@ -583,30 +641,19 @@ impl Norm {
     }
 }
 
-/// The band's heights in 64 bins, so the palette can draw the scan's profile: the floor and the
-/// ceiling show up as two wide humps, a wall as a thin one.
-fn heights(points: &[crate::Pt], zmin: f64, zmax: f64) -> [u32; 64] {
-    let mut bins = [0u32; 64];
-    let span = zmax - zmin;
-    if span <= 0.0 || !span.is_finite() {
-        return bins;
-    }
-    for p in points {
-        let i = (((p.z - zmin) / span) * 63.0).round().clamp(0.0, 63.0) as usize;
-        bins[i] = bins[i].saturating_add(1);
-    }
-    bins
-}
-
 /// One point per `cell`-metre cube, keeping the first in file order; `cell` 0 keeps every point.
 ///
 /// The cube is three-dimensional on purpose: an XY-only grid keeps one point per column, so a
 /// vertical wall loses every point but one and the walls disappear from the 3D view.
 ///
-/// The classification of the point that was kept travels with it.
-fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> (Vec<CloudVtx>, Vec<u8>) {
-    let mut out = Vec::with_capacity(points.len().min(4_000_000));
-    let mut classes = Vec::with_capacity(points.len().min(4_000_000));
+/// The classification of the point that was kept travels with it, and so does the point's place
+/// in the band: the coarser levels are decimated from the levels below them and need the band
+/// coordinates of the kept points to compute the same cells the band would give.
+fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> (Vec<CloudVtx>, Vec<u8>, Vec<usize>) {
+    let held = points.len().min(4_000_000);
+    let mut out = Vec::with_capacity(held);
+    let mut classes = Vec::with_capacity(held);
+    let mut indices = Vec::with_capacity(held);
     let mut vtx = |p: &crate::Pt| CloudVtx {
         x: (p.x - origin[0]) as f32,
         y: (p.y - origin[1]) as f32,
@@ -615,21 +662,71 @@ fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> (Vec<C
         intensity: norm.u8(p.intensity),
     };
     if cell <= 0.0 || !cell.is_finite() {
+        indices.extend(0..points.len());
         out.extend(points.iter().map(&mut vtx));
         classes.extend(points.iter().map(|p| p.class));
-        return (out, classes);
+        return (out, classes, indices);
     }
     let inv = 1.0 / cell;
-    let mut seen: HashSet<(i64, i64, i64)> = HashSet::with_capacity(points.len().min(4_000_000));
-    for p in points {
-        let key = (((p.x - origin[0]) * inv).floor() as i64, ((p.y - origin[1]) * inv).floor() as i64, (p.z * inv).floor() as i64);
-        if !seen.insert(key) {
+    // The set holds one key per cell kept, so it grows with the decimation result rather than the
+    // points it walks: a 4-million-point band on a 1 cm grid rarely keeps a million cells.
+    let mut seen: HashSet<(i64, i64, i64)> = HashSet::new();
+    for (at, p) in points.iter().enumerate() {
+        if !seen.insert(band_cell(p, origin, inv)) {
             continue;
         }
         out.push(vtx(p));
         classes.push(p.class);
+        indices.push(at);
     }
-    (out, classes)
+    (out, classes, indices)
+}
+
+/// The `cell`-metre cube a band point falls in. The keys are computed from the band coordinates,
+/// so a point gets the same cube whichever level is asking.
+fn band_cell(p: &crate::Pt, origin: [f64; 2], inv: f64) -> (i64, i64, i64) {
+    (((p.x - origin[0]) * inv).floor() as i64, ((p.y - origin[1]) * inv).floor() as i64, (p.z * inv).floor() as i64)
+}
+
+/// One coarser level, decimated from the level above it: walk the level's points in their band
+/// order and keep the first of every `cell`-metre cube.
+///
+/// The keys come from the band coordinates the level's points came from (the indices walk the
+/// band), so the cubes are the same the band itself would give. The cell must be a whole multiple
+/// of the cell below (the caller doubles it every step: a fine cube then never straddles a coarse
+/// boundary), so the band's first point of a coarse cube also survives the level below: any
+/// earlier band point in its own fine cube would sit in the same coarse cube and contradict its
+/// firstness. Walking that level in band order then keeps the first of its points per coarse
+/// cube, which is the first of the band's points in it, exactly what decimating the band again
+/// gives.
+///
+/// The classification the level above carries travels with the point, and the point's place in
+/// the band travels too, so the next step can do the same.
+fn grid_below(
+    band: &[crate::Pt],
+    indices: &[usize],
+    pts: &[CloudVtx],
+    classes: &[u8],
+    cell: f64,
+    origin: [f64; 2],
+) -> (Vec<CloudVtx>, Vec<u8>, Vec<usize>) {
+    let held = (indices.len() / 2).max(64);
+    let mut out = Vec::with_capacity(held);
+    let mut out_classes = Vec::with_capacity(held);
+    let mut kept = Vec::with_capacity(held);
+    let inv = 1.0 / cell;
+    // The set holds one key per cell kept, so it grows with the decimation result rather than the
+    // level it walks (see `grid`).
+    let mut seen: HashSet<(i64, i64, i64)> = HashSet::new();
+    for (i, &at) in indices.iter().enumerate() {
+        if !seen.insert(band_cell(&band[at], origin, inv)) {
+            continue;
+        }
+        out.push(pts[i]);
+        out_classes.push(classes[i]);
+        kept.push(at);
+    }
+    (out, out_classes, kept)
 }
 
 /// Blue → cyan → green → yellow → red, the drafting-friendly stand-in for a turbo ramp.
@@ -662,6 +759,35 @@ mod tests {
         }
         assert!(c.points() <= 100_000, "the max-points cap is honoured");
         assert!(c.levels.last().is_some_and(|l| l.pts.len() <= 20_000), "the coarsest level fits a screen");
+    }
+
+    /// The pyramid is built from the level below, not by decimating the band again: the kept
+    /// points must still be the ones the band itself would give at the same cells, whatever the
+    /// shape or the values of the point cloud.
+    #[test]
+    fn the_pyramid_from_the_level_below_holds_the_same_points() {
+        // A 3 x 2 m floor on a 1 cm grid, the shape the lighter-cells test uses, so the pyramid
+        // really builds several steps.
+        let band: Vec<_> = (0..300).flat_map(|i| (0..200).map(move |j| pt(f64::from(i) * 0.01, f64::from(j) * 0.01, 1.0))).collect();
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.01), slice_of(band.clone()), 100_000, CloudColor::Rgb);
+        let norm = Norm { lo: c.imin, span: u32::from(c.imax.saturating_sub(c.imin)) };
+        assert!(c.levels.len() >= 3, "the band builds several levels: {}", c.levels.len());
+        for level in &c.levels {
+            let (reference, reference_classes, _) = grid(&band, level.cell, c.origin, norm);
+            let sig = |pts: &[CloudVtx], classes: &[u8]| -> Vec<(f32, f32, f32, [u8; 3], u8, u8)> {
+                let mut v: Vec<_> = pts.iter().zip(classes).map(|(p, cl)| (p.x, p.y, p.z, p.rgb, p.intensity, *cl)).collect();
+                // Floats have no total order; the band's coordinates are positive, so the bit
+                // patterns sort like the values they hold.
+                v.sort_unstable_by_key(|p| (p.0.to_bits(), p.1.to_bits(), p.2.to_bits(), p.3, p.4, p.5));
+                v
+            };
+            assert_eq!(
+                sig(&level.pts, &level.classes),
+                sig(&reference, &reference_classes),
+                "the level on a {:.5} m grid is decimated again, not picked up",
+                level.cell
+            );
+        }
     }
 
     #[test]

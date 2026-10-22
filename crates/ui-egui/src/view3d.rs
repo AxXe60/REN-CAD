@@ -90,6 +90,9 @@ pub struct View3d {
     /// The scene last handed to the GPU, and how many points it holds.
     pub key: Option<u64>,
     pub drawn: usize,
+    /// How many of those points fell inside the visible ball: the count [`pick_levels`] took when
+    /// the scene was built, so a frame that re-uses the scene never walks the points again.
+    pub counted: usize,
     slot: SceneSlot,
 }
 
@@ -185,6 +188,7 @@ impl Default for View3d {
             draft: Draft3d::default(),
             key: None,
             drawn: 0,
+            counted: 0,
             slot: std::sync::Arc::new(Mutex::new(None)),
         }
     }
@@ -417,16 +421,21 @@ fn visible_points(c: &cadcraft_pointcloud::Cloud, level: &cadcraft_pointcloud::C
 }
 
 /// The level each visible cloud contributes at this density, coarsened until the points actually
-/// on screen fit the budget. Zoomed in on one wall the ball holds a small part of the scan, so the
-/// full-resolution level is affordable exactly when the detail would be visible.
+/// on screen fit the budget, and the number of points those levels hold inside the visible ball.
+/// Zoomed in on one wall the ball holds a small part of the scan, so the full-resolution level is
+/// affordable exactly when the detail would be visible.
+///
+/// The walk over the points is only paid for a scene that is actually built: the count comes back
+/// with the picks and is kept with the scene, for [`build_scene`] to reserve from.
 fn pick_levels(
     clouds: &[cadcraft_pointcloud::Cloud],
     px_per_m: f64,
     center: [f64; 3],
     radius: f64,
-) -> Vec<(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)> {
+) -> (Vec<(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)>, usize) {
     let mut picks = Vec::new();
     let mut budget = MAX_SCENE_POINTS;
+    let mut visible: usize = 0;
     for c in clouds.iter().filter(|c| c.visible) {
         let chosen = c.level_for(px_per_m);
         let mut i = c.levels.iter().position(|l| std::ptr::eq(l, chosen)).unwrap_or(0);
@@ -436,24 +445,34 @@ fn pick_levels(
             n = visible_points(c, &c.levels[i], center, radius);
         }
         budget = budget.saturating_sub(n);
+        visible = visible.saturating_add(n);
         picks.push((c, &c.levels[i]));
     }
-    picks
+    (picks, visible)
 }
 
-/// What the GPU buffer was built from: names, colour modes, level cells, the crop, the placement
-/// and the visible ball. Orbiting leaves every input alone, so a drag never re-uploads; zooming
-/// and panning enter in coarse steps (a quarter of the ball, half of an e-fold of its radius).
-fn scene_key(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)], center: [f64; 3], radius: f64) -> u64 {
+/// What the GPU buffer was built from: names, colour modes, shading scales, level cells, the crop,
+/// the placement and the visible ball. Orbiting leaves every input alone, so a drag never
+/// re-uploads; zooming and panning enter in coarse steps (a quarter of the ball, half of an e-fold
+/// of its radius).
+///
+/// It names each cloud's density level, not the one the budget may coarsen it to, so the key costs
+/// one pass over the clouds and never over their points.
+fn scene_key(clouds: &[cadcraft_pointcloud::Cloud], px_per_m: f64, center: [f64; 3], radius: f64) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (c, level) in picks {
+    for c in clouds.iter().filter(|c| c.visible) {
         c.name.hash(&mut hasher);
         c.color.name().hash(&mut hasher);
+        // The ramps read the intensity and the deviation through these two scales, so a new scale
+        // or a new comparison must repaint instead of leaving the old colours on the screen.
+        c.spectrum.name().hash(&mut hasher);
+        c.dev_scale.to_bits().hash(&mut hasher);
         c.ground_only.hash(&mut hasher);
         c.opacity.to_bits().hash(&mut hasher);
         if let CloudColor::Single([r, g, b]) = c.color {
             (r, g, b).hash(&mut hasher);
         }
+        let level = c.level_for(px_per_m);
         level.cell.to_bits().hash(&mut hasher);
         level.pts.len().hash(&mut hasher);
         if let Some(clip) = &c.clip {
@@ -471,11 +490,11 @@ fn scene_key(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudL
     hasher.finish()
 }
 
-/// Recolour the picked levels and pack the visible ones for upload.
-fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)], center: [f64; 3], radius: f64) -> Scene3d {
-    let total: usize = picks.iter().map(|(_, level)| level.pts.len()).sum();
+/// Recolour the picked levels and pack the visible ones for upload. `visible` is the count
+/// [`pick_levels`] took for these picks, so the buffer reserves what it will actually hold.
+fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)], center: [f64; 3], radius: f64, visible: usize) -> Scene3d {
     let r2 = radius * radius;
-    let mut scene = Scene3d { points: Vec::with_capacity(total.min(MAX_SCENE_POINTS)) };
+    let mut scene = Scene3d { points: Vec::with_capacity(visible.min(MAX_SCENE_POINTS)) };
     for (c, level) in picks {
         for (i, v) in level.pts.iter().enumerate() {
             // With the ground filter on, only the points it found are drawn.
@@ -651,14 +670,14 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     app.canvas.rect = Some(rect);
     app.session.viewport_px = (f64::from(rect.width()).max(1.0), f64::from(rect.height()).max(1.0));
 
+    let bounds = cloud_bounds(app);
     if !app.view3d.fitted {
-        let bounds = cloud_bounds(app);
         app.view3d.fit(bounds);
     }
 
     let height = f64::from(rect.height()).max(1.0);
     let aspect = f64::from(rect.width()) / height;
-    let radius = cloud_bounds(app).map_or(10.0, |(min, max)| {
+    let radius = bounds.map_or(10.0, |(min, max)| {
         let d = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
         0.5 * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(0.1)
     });
@@ -768,16 +787,19 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     // levels become affordable where their detail shows.
     let center = app.view3d.target;
     let radius = view_radius(app.view3d.dist);
-    let picks = pick_levels(&app.session.clouds, px_per_m, center, radius);
-    let key = scene_key(&picks, center, radius);
+    let key = scene_key(&app.session.clouds, px_per_m, center, radius);
     if app.view3d.key != Some(key) {
         let started = std::time::Instant::now();
-        let scene = build_scene(&picks, center, radius);
+        // The level walk is only paid here: an orbit re-uses the scene, the count and the colours
+        // already built for this key.
+        let (picks, counted) = pick_levels(&app.session.clouds, px_per_m, center, radius);
+        let scene = build_scene(&picks, center, radius, counted);
         let drawn = scene.points.len();
         if let Ok(mut slot) = app.view3d.slot.lock() {
             *slot = Some(scene);
         }
         app.view3d.key = Some(key);
+        app.view3d.counted = counted;
         app.view3d.drawn = drawn;
         log::info!("cloud 3d scene: {drawn} visible points in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
     }
@@ -1131,10 +1153,11 @@ mod tests {
 
     #[test]
     fn an_empty_cloud_selection_builds_an_empty_scene() {
-        let picks = pick_levels(&[], 50.0, [0.0; 3], 10.0);
-        let scene = build_scene(&picks, [0.0; 3], 10.0);
+        let (picks, counted) = pick_levels(&[], 50.0, [0.0; 3], 10.0);
+        let scene = build_scene(&picks, [0.0; 3], 10.0, counted);
         assert_eq!(scene.points.len(), 0);
-        assert_eq!(scene_key(&picks, [0.0; 3], 10.0), scene_key(&[], [0.0; 3], 10.0));
+        assert_eq!(counted, 0);
+        assert_eq!(scene_key(&[], 50.0, [0.0; 3], 10.0), scene_key(&[], 50.0, [0.0; 3], 10.0), "the key is stable");
     }
 
     /// A 10 m ball over a 100 m line: only the points inside it are counted and uploaded, which is
@@ -1153,17 +1176,43 @@ mod tests {
         let n = visible_points(&c, &c.levels[0], center, radius);
         assert!((90..=110).contains(&n), "a 10 m ball of a 0.1 m line: {n}");
         let clouds = [c];
-        let picks = pick_levels(&clouds, 4000.0, center, radius);
-        assert_eq!(build_scene(&picks, center, radius).points.len(), n);
+        let (picks, counted) = pick_levels(&clouds, 4000.0, center, radius);
+        assert_eq!(counted, n, "the scene is built from the count taken with it");
+        assert_eq!(build_scene(&picks, center, radius, counted).points.len(), n);
     }
 
     /// Orbiting changes no key input; zooming and panning do, in coarse steps.
     #[test]
     fn the_scene_key_follows_the_visible_ball_not_the_camera_angle() {
-        let k = scene_key(&[], [0.0; 3], 10.0);
-        assert_eq!(k, scene_key(&[], [0.0; 3], 10.0), "a drag re-uses the buffer");
-        assert_ne!(k, scene_key(&[], [5.0, 0.0, 0.0], 10.0), "panning far enough rebuilds");
-        assert_ne!(k, scene_key(&[], [0.0; 3], 4.0), "zooming rebuilds");
+        let k = scene_key(&[], 50.0, [0.0; 3], 10.0);
+        assert_eq!(k, scene_key(&[], 50.0, [0.0; 3], 10.0), "a drag re-uses the buffer");
+        assert_ne!(k, scene_key(&[], 50.0, [5.0, 0.0, 0.0], 10.0), "panning far enough rebuilds");
+        assert_ne!(k, scene_key(&[], 50.0, [0.0; 3], 4.0), "zooming rebuilds");
+    }
+
+    /// The shading scales are key inputs: a new intensity ramp or a new comparison repaints at
+    /// once, instead of waiting for the view to move.
+    #[test]
+    fn the_scene_key_follows_the_shading_scales() {
+        let pts: Vec<_> = (0..10).map(|i| cadcraft_pointcloud::Pt { x: f64::from(i), y: 0.0, z: 0.0, rgb: None, intensity: 0, class: 1 }).collect();
+        let mut b = cadcraft_pointcloud::Bounds3::EMPTY;
+        for p in &pts {
+            b.add(p.x, p.y, p.z);
+        }
+        let slice = cadcraft_pointcloud::Slice { points: pts, total: 10, in_band: 10, bounds: b };
+        let c = cadcraft_pointcloud::Cloud::from_slice("shade".into(), String::new(), 0.0, 1.0, None, slice, 1_000_000, CloudColor::Intensity);
+        let (center, radius) = ([0.0; 3], 10.0);
+        let key = scene_key(std::slice::from_ref(&c), 4000.0, center, radius);
+
+        let mut ramp = c.clone();
+        ramp.spectrum = cadcraft_pointcloud::Spectrum::Viridis;
+        assert_ne!(key, scene_key(&[ramp], 4000.0, center, radius), "a new intensity scale repaints");
+
+        let mut compared = c;
+        compared.color = CloudColor::Deviation;
+        let before = scene_key(&[compared.clone()], 4000.0, center, radius);
+        compared.dev_scale = 0.05;
+        assert_ne!(before, scene_key(&[compared], 4000.0, center, radius), "a new comparison scale repaints");
     }
 
     #[test]

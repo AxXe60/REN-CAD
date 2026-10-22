@@ -69,6 +69,10 @@ pub struct CanvasState {
     cloud_key: Option<u64>,
     cloud_slot: crate::gpu::MeshSlot,
     cloud_origin: Vec2,
+    /// The overlay list the key above built: cleared and refilled only when the key moves, so
+    /// the vectors' capacity is reused and a quiet frame costs the hash and the draw alone.
+    /// An empty result is not cached (the key is dropped with it, see [`draw_clouds`]).
+    cloud_list: DisplayList,
     /// The dragged objects of a MOVE/COPY/ROTATE/SCALE preview, uploaded once per drag (see
     /// [`draw_drag_gpu`]).
     drag_key: Option<u64>,
@@ -711,85 +715,100 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
     let area = xf.world_bounds();
     let span = area.width().max(area.height()).max(1e-6);
     let far = area.expand(span * 0.25);
-    let mut list = DisplayList::default();
+    // The hash of everything the cached list was built from: every visible cloud's state, then
+    // the view in coarse steps (below). A quiet frame costs the hash and the draw alone; the
+    // list is rebuilt only when this key moves.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for c in app.session.clouds.iter().filter(|c| c.visible) {
-        let level = c.level_for(xf.scale);
-        let start = list.verts.len() as u32;
-        (c.name.as_str(), c.color.name(), c.points()).hash(&mut hasher);
-        level.cell.to_bits().hash(&mut hasher);
-        c.ground_only.hash(&mut hasher);
-        c.opacity.to_bits().hash(&mut hasher);
-        if let cadcraft_pointcloud::CloudColor::Single([r, g, b]) = c.color {
-            (r, g, b).hash(&mut hasher);
-        }
-        if let Some(clip) = &c.clip {
-            clip.min.map(f64::to_bits).hash(&mut hasher);
-            clip.max.map(f64::to_bits).hash(&mut hasher);
-        }
-        c.offset.map(f64::to_bits).hash(&mut hasher);
-        for (i, v) in level.pts.iter().enumerate() {
-            // With the ground filter on, only the points it found are drawn.
-            if c.ground_only && level.classes.get(i).is_none_or(|k| *k != cadcraft_pointcloud::CLASS_GROUND) {
-                continue;
-            }
-            // Each cloud is placed at its own offset: the drawing's (0, 0, 0) is that world point.
-            let x = f64::from(v.x) + c.origin[0] - c.offset[0];
-            let y = f64::from(v.y) + c.origin[1] - c.offset[1];
-            if c.clip.is_some_and(|clip| !clip.contains(x + c.offset[0], y + c.offset[1], f64::from(v.z))) {
-                continue;
-            }
-            if x < far.min.x || x > far.max.x || y < far.min.y || y > far.max.y {
-                continue;
-            }
-            list.verts.push(Vec2::new(x, y));
-            let [r, g, b] = c.color_of(v, level.dev.get(i).copied(), level.classes.get(i).copied());
-            list.colors.push(Rgb(r, g, b));
-        }
-        let len = list.verts.len() as u32 - start;
-        if len > 0 {
-            // The transparency is a percentage; the cloud's opacity is the other way round.
-            let transparency = (((1.0 - c.opacity.clamp(0.05, 1.0)) * 100.0).round() as u8).min(90);
-            list.prims.push(cadcraft_render::DPrim {
-                handle: Handle(0),
-                color: Rgb(255, 255, 255),
-                aci7: false,
-                lw: 0.0,
-                transparency,
-                kind: Kind::Cloud,
-                start,
-                len,
-            });
-        }
+        cloud_state_key(c, c.level_for(xf.scale).cell).hash(&mut hasher);
     }
-    if list.verts.is_empty() {
-        // Nothing to draw: no cloud, every cloud hidden, or the crop removed every point. Drop
-        // the old buffer, or the last frame stays on the GPU.
-        if app.canvas.cloud_key.is_some() {
-            if let Ok(mut slot) = app.canvas.cloud_slot.lock() {
-                *slot = None;
-            }
-            app.canvas.cloud_key = None;
-        }
-        return;
-    }
-    list.bounds = Bounds2::from_points(list.verts.iter().copied());
     // Which ground the buffer covers: rebuild after panning a quarter screen or zooming a step.
     ((xf.center.x / (span * 0.25)).round() as i64).hash(&mut hasher);
     ((xf.center.y / (span * 0.25)).round() as i64).hash(&mut hasher);
     ((xf.scale.log2() * 4.0).round() as i64).hash(&mut hasher);
     let key = hasher.finish();
-
+    let rebuild = app.canvas.cloud_key != Some(key);
+    if rebuild {
+        let list = &mut app.canvas.cloud_list;
+        // The same vectors are cleared and refilled, so the capacity of the last rebuild is
+        // reused instead of reallocated.
+        list.verts.clear();
+        list.colors.clear();
+        list.prims.clear();
+        // The bounds are folded into the push loop: a second walk over the vertices would
+        // double the cost of every rebuild.
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for c in app.session.clouds.iter().filter(|c| c.visible) {
+            let level = c.level_for(xf.scale);
+            let start = list.verts.len() as u32;
+            for (i, v) in level.pts.iter().enumerate() {
+                // With the ground filter on, only the points it found are drawn.
+                if c.ground_only && level.classes.get(i).is_none_or(|k| *k != cadcraft_pointcloud::CLASS_GROUND) {
+                    continue;
+                }
+                // Each cloud is placed at its own offset: the drawing's (0, 0, 0) is that world point.
+                let x = f64::from(v.x) + c.origin[0] - c.offset[0];
+                let y = f64::from(v.y) + c.origin[1] - c.offset[1];
+                if c.clip.is_some_and(|clip| !clip.contains(x + c.offset[0], y + c.offset[1], f64::from(v.z))) {
+                    continue;
+                }
+                if x < far.min.x || x > far.max.x || y < far.min.y || y > far.max.y {
+                    continue;
+                }
+                list.verts.push(Vec2::new(x, y));
+                let [r, g, b] = c.color_of(v, level.dev.get(i).copied(), level.classes.get(i).copied());
+                list.colors.push(Rgb(r, g, b));
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+            let len = list.verts.len() as u32 - start;
+            if len > 0 {
+                // The transparency is a percentage; the cloud's opacity is the other way round.
+                let transparency = (((1.0 - c.opacity.clamp(0.05, 1.0)) * 100.0).round() as u8).min(90);
+                list.prims.push(cadcraft_render::DPrim {
+                    handle: Handle(0),
+                    color: Rgb(255, 255, 255),
+                    aci7: false,
+                    lw: 0.0,
+                    transparency,
+                    kind: Kind::Cloud,
+                    start,
+                    len,
+                });
+            }
+        }
+        if !list.verts.is_empty() {
+            list.bounds = Bounds2::new(Vec2::new(min_x, min_y), Vec2::new(max_x, max_y));
+        }
+        app.canvas.cloud_key = Some(key);
+    }
+    if app.canvas.cloud_list.verts.is_empty() {
+        // Nothing to draw: no cloud, every cloud hidden, or the crop removed every point. Drop
+        // the old buffer, or the last frame stays on the GPU. The key is dropped with it, so
+        // the next frame rebuilds and a point reaching the view shows at once, not when the
+        // key next moves.
+        if let Ok(mut slot) = app.canvas.cloud_slot.lock() {
+            *slot = None;
+        }
+        app.canvas.cloud_key = None;
+        return;
+    }
     if app.canvas.gpu.is_some() {
-        let origin = list.bounds.center();
-        if app.canvas.cloud_key != Some(key) {
+        let origin = app.canvas.cloud_list.bounds.center();
+        if rebuild {
             let t0 = crate::now_ms();
-            let mesh = crate::gpu::build_mesh(&list, origin, bg, false);
-            log::info!("cloud mesh: {} points -> {} instances in {:.1} ms", list.verts.len(), list.prims.len(), crate::now_ms() - t0);
+            let mesh = crate::gpu::build_mesh(&app.canvas.cloud_list, origin, bg, false);
+            log::info!(
+                "cloud mesh: {} points -> {} instances in {:.1} ms",
+                app.canvas.cloud_list.verts.len(),
+                app.canvas.cloud_list.prims.len(),
+                crate::now_ms() - t0
+            );
             if let Ok(mut slot) = app.canvas.cloud_slot.lock() {
                 *slot = Some(mesh);
             }
-            app.canvas.cloud_key = Some(key);
             app.canvas.cloud_origin = origin;
         }
         let center = xf.rect.center();
@@ -809,8 +828,33 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
             },
         ));
     } else {
-        draw_list(p, xf, &list, bg, false);
+        draw_list(p, xf, &app.canvas.cloud_list, bg, false);
     }
+}
+
+/// One cloud's share of [`draw_clouds`]'s overlay key: identity, chosen level and the colour
+/// settings. Everything the drawn points or their colours depend on must be in here, or a
+/// change (a new spectrum, a new comparison scale, the crop box, the cloud's offset) leaves a
+/// stale frame on the screen until the key next moves.
+fn cloud_state_key(c: &cadcraft_pointcloud::Cloud, cell: f64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (c.name.as_str(), c.color.name(), c.points()).hash(&mut h);
+    cell.to_bits().hash(&mut h);
+    // The colour scales: a new spectrum or deviation scale changes every colour of every point.
+    c.spectrum.name().hash(&mut h);
+    c.dev_scale.to_bits().hash(&mut h);
+    c.ground_only.hash(&mut h);
+    c.opacity.to_bits().hash(&mut h);
+    if let cadcraft_pointcloud::CloudColor::Single([r, g, b]) = c.color {
+        (r, g, b).hash(&mut h);
+    }
+    if let Some(clip) = &c.clip {
+        clip.min.map(f64::to_bits).hash(&mut h);
+        clip.max.map(f64::to_bits).hash(&mut h);
+    }
+    c.offset.map(f64::to_bits).hash(&mut h);
+    h.finish()
 }
 
 fn draw_grid(app: &CadApp, p: &egui::Painter, xf: &Xf) {
@@ -3137,5 +3181,47 @@ mod hatch_pick_tests {
         assert_eq!(app.hatch_dlg.as_ref().map(|s| s.edit.iter().map(|h| h.hex()).collect::<Vec<_>>()), Some(vec![hx]));
         // The double-click (at the hatch's centre grip) only opens the dialog: no grip edit.
         assert!(app.session.running.is_none(), "{:?}", app.session.running.as_ref().map(|r| r.machine.name()));
+    }
+}
+
+/// The point cloud overlay's state key and the caching around it: the key must move whenever
+/// the colours can change, or LASPECTRUM and LASCMP leave stale colours until the view moves.
+#[cfg(test)]
+mod cloud_overlay_tests {
+    use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice, Spectrum};
+
+    use super::cloud_state_key;
+
+    /// A small band: a line of points from 0 to 9 m, the way view3d's tests build theirs.
+    fn cloud() -> Cloud {
+        let pts: Vec<Pt> = (0..10).map(|i| Pt { x: f64::from(i), y: 0.0, z: 0.0, rgb: None, intensity: 0, class: 1 }).collect();
+        let mut b = Bounds3::EMPTY;
+        for p in &pts {
+            b.add(p.x, p.y, p.z);
+        }
+        let slice = Slice { points: pts, total: 10, in_band: 10, bounds: b };
+        Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, None, slice, 1_000_000, CloudColor::Rgb)
+    }
+
+    #[test]
+    fn the_cloud_state_key_is_stable_when_nothing_changes() {
+        let c = cloud();
+        let k = cloud_state_key(&c, 0.001);
+        assert_eq!(k, cloud_state_key(&c, 0.001), "a quiet frame reuses the overlay");
+        assert_ne!(k, cloud_state_key(&c, 2.0), "another level can carry other points");
+    }
+
+    /// A new intensity scale (LASPECTRUM) or comparison scale (LASCMP) changes every colour of
+    /// every point: the key must move so they repaint instead of waiting for the view to move.
+    #[test]
+    fn the_cloud_state_key_follows_the_spectrum_and_the_deviation_scale() {
+        let c = cloud();
+        let k = cloud_state_key(&c, 0.001);
+        let mut grey = c.clone();
+        grey.spectrum = Spectrum::Grey;
+        assert_ne!(k, cloud_state_key(&grey, 0.001), "a new intensity scale needs new colours");
+        let mut dev = c.clone();
+        dev.dev_scale = 7.5;
+        assert_ne!(k, cloud_state_key(&dev, 0.001), "a new comparison scale needs new colours");
     }
 }

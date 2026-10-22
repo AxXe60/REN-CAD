@@ -32,7 +32,7 @@ pub use classify::{
 };
 pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
 pub use cluster::{Cluster, clusters_of, feature_name, features_of, kmeans, suggest};
-pub use compare::{DeviationStats, deviation_color, distances, stats};
+pub use compare::{DeviationStats, deviation_color, distances, distances_with_grid, stats};
 pub use crs::{Crs, epsg_from_wkt};
 pub use dxf::{SKETCH_RGB, write_points_dxf, write_strokes_dxf};
 pub use geo::{LatLon, grid_from_lat_lon};

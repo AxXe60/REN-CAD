@@ -225,9 +225,11 @@ pub fn add_clouds(s: &mut Session, doc: usize, clouds: Vec<cadcraft_doc::PointCl
 /// shading.
 pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(text(p, "path")?);
-    let info = cadcraft_pointcloud::read_info(&path).map_err(oops)?;
-    let z0 = number(p, "z0").unwrap_or(info.bounds.min[2]);
-    let z1 = number(p, "z1").unwrap_or(info.bounds.max[2]);
+    // Without a band the whole file is read: `Cloud::open` reads the header on its way, and the
+    // cloud's own bounds say where the points are, so the header is not read for them here.
+    let band = [number(p, "z0"), number(p, "z1")];
+    let z0 = band[0].unwrap_or(f64::NEG_INFINITY);
+    let z1 = band[1].unwrap_or(f64::INFINITY);
     let decimate = number(p, "decimate").filter(|v| *v > 0.0);
     let max_points = match p.get("maxPoints").and_then(Value::as_u64) {
         None => cadcraft_pointcloud::DEFAULT_MAX_POINTS,
@@ -244,7 +246,18 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("Point cloud").to_string());
-    let cloud = cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, decimate, max_points, color).map_err(oops)?;
+    let mut cloud = cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, decimate, max_points, color).map_err(|e| {
+        // A band that was not given is the whole file: say so, not "-inf..inf".
+        if z0.is_finite() && z1.is_finite() { oops(e) } else { EngineError::Other(format!("{}: the file has no points", path.display())) }
+    })?;
+    // The band a whole file was read at: the heights of the points it holds, kept finite so the
+    // reference written into a drawing reads the same points again.
+    if band[0].is_none() {
+        cloud.z0 = cloud.bounds.min[2];
+    }
+    if band[1].is_none() {
+        cloud.z1 = cloud.bounds.max[2];
+    }
     // `attach` ties the cloud to the drawing: its reference is written into the file and the scan
     // is loaded again with it.
     let attach = p.get("attach").and_then(Value::as_bool).unwrap_or(false);
@@ -253,6 +266,7 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
     let count = cloud.points();
     let levels = cloud.levels.len();
     let full = cloud.full_points;
+    let file_points = cloud.file_points;
     let cell = cloud.levels.first().map_or(0.0, |l| l.cell);
     let crs = cloud.crs.clone();
     // First cloud in an empty drawing: frame it, so LASOPEN is all it takes to see the scan.
@@ -264,7 +278,6 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
             st.set_view(View { center, height: w.max(h).max(1.0) * 1.2 });
         }
     }
-    let mut cloud = cloud;
     // The site's frame: the world point that is the drawing's (0, 0, 0), so the cloud lands where
     // the drawing expects it, and a reference written from it lands there again.
     cloud.offset = s.local_origin;
@@ -282,7 +295,8 @@ pub(super) fn lasopen(s: &mut Session, p: &Value) -> Result<Value> {
         "levels": levels,
         "cell": cell,
         "inBand": full,
-        "filePoints": info.points,
+        // The file's own count, band or no band: what the header says.
+        "filePoints": file_points,
         "color": color.name(),
         "bounds": { "min": b.min, "max": b.max },
         "crs": crs_json(&crs),
@@ -537,6 +551,15 @@ fn lasground(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// Whether the ground is known: the ground filter's own class is among the cloud's classes.
+///
+/// The class bytes say what the file carried, not what the filter found: points with the class 0
+/// ("created") carry no ground, so the filter runs for them, while a cloud the filter has already
+/// spoken for keeps its ground.
+fn ground_is_known(cloud: &cadcraft_pointcloud::Cloud) -> bool {
+    cloud.levels.iter().any(|l| l.classes.contains(&cadcraft_pointcloud::CLASS_GROUND))
+}
+
 /// Classify the cloud: the ground, the vegetation, the walls, the noise.
 ///
 /// The heights are measured from the ground the filter found, so the ground filter runs first if
@@ -559,7 +582,7 @@ fn lasclass(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let name = s.clouds[i].name.clone();
     // The ground filter's word is the base of the classification.
-    if !s.clouds[i].has_classes() {
+    if !ground_is_known(&s.clouds[i]) {
         s.clouds[i].classify_ground(&cadcraft_pointcloud::GroundOptions::default());
     }
     let result = s.clouds[i].classify(&options);
@@ -580,6 +603,27 @@ fn lasclass(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// How many points each class holds: one pass over the finest level's class bytes, and the codes
+/// of [`cadcraft_pointcloud::ALL_CLASSES`] with points in them, in their own order.
+fn class_counts(cloud: &cadcraft_pointcloud::Cloud) -> serde_json::Map<String, Value> {
+    let mut tally = [0usize; 256];
+    if let Some(level) = cloud.levels.first() {
+        for &code in level.classes.iter() {
+            if let Some(n) = tally.get_mut(usize::from(code)) {
+                *n += 1;
+            }
+        }
+    }
+    let mut counts = serde_json::Map::new();
+    for code in cadcraft_pointcloud::ALL_CLASSES {
+        let n = tally.get(usize::from(code)).copied().unwrap_or(0);
+        if n > 0 {
+            counts.insert(cadcraft_pointcloud::class_name(code).to_string(), json!(n));
+        }
+    }
+    counts
+}
+
 /// Group the cloud's points by what they are, and name the groups.
 ///
 /// The points are described by four things — the height above the ground, the intensity of the
@@ -590,7 +634,6 @@ fn lasclass(s: &mut Session, p: &Value) -> Result<Value> {
 fn lascluster(s: &mut Session, p: &Value) -> Result<Value> {
     let i = cloud_index(s, p)?;
     let name = s.clouds[i].name.clone();
-    let mut counts = serde_json::Map::new();
     // The user names one of the groups: the classes are given again, without recomputing.
     if let (Some(cluster), Some(class)) = (p.get("cluster").and_then(Value::as_u64), text(p, "class").ok()) {
         let cluster = cluster as usize;
@@ -600,12 +643,7 @@ fn lascluster(s: &mut Session, p: &Value) -> Result<Value> {
         }
         s.clouds[i].cluster_info[cluster].class = class;
         s.clouds[i].apply_clusters();
-        for c in cadcraft_pointcloud::ALL_CLASSES {
-            let n = s.clouds[i].levels.first().map_or(0, |l| l.classes.iter().filter(|k| **k == c).count());
-            if n > 0 {
-                counts.insert(cadcraft_pointcloud::class_name(c).to_string(), json!(n));
-            }
-        }
+        let counts = class_counts(&s.clouds[i]);
         return Ok(json!({
             "message": format!("{name}: group {cluster} is now {}", cadcraft_pointcloud::class_name(class)),
             "index": i,
@@ -617,17 +655,12 @@ fn lascluster(s: &mut Session, p: &Value) -> Result<Value> {
     // The groups themselves.
     let k = p.get("k").and_then(Value::as_u64).map(|v| v.clamp(2, 16) as usize).unwrap_or(5);
     let options = cadcraft_pointcloud::ClassifyOptions::default();
-    if !s.clouds[i].has_classes() {
+    if !ground_is_known(&s.clouds[i]) {
         s.clouds[i].classify_ground(&cadcraft_pointcloud::GroundOptions::default());
     }
     let clusters = s.clouds[i].cluster(k, &options);
     s.clouds[i].apply_clusters();
-    for c in cadcraft_pointcloud::ALL_CLASSES {
-        let n = s.clouds[i].levels.first().map_or(0, |l| l.classes.iter().filter(|k| **k == c).count());
-        if n > 0 {
-            counts.insert(cadcraft_pointcloud::class_name(c).to_string(), json!(n));
-        }
-    }
+    let counts = class_counts(&s.clouds[i]);
     let groups: Vec<Value> = clusters
         .iter()
         .map(|c| {
@@ -1381,5 +1414,133 @@ mod tests {
         ] {
             assert!(measure3d(&bad).is_err(), "{bad}");
         }
+    }
+
+    /// A LAS 1.2 file on the disk, written by hand: the crate reads LAS, it does not write it,
+    /// and LASOPEN needs a real file to open. The points are (x, y, z, class).
+    fn write_test_las(path: &Path, points: &[(f64, f64, f64, u8)]) {
+        /// A fixed-size header text field: the text, zero padded.
+        fn padded(text: &[u8]) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            let n = text.len().min(out.len());
+            out[..n].copy_from_slice(&text[..n]);
+            out
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"LASF");
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // file source id
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // global encoding
+        bytes.extend_from_slice(&[0u8; 16]); // project id
+        bytes.push(1); // version 1.2
+        bytes.push(2);
+        bytes.extend_from_slice(&padded(b"CADCraft")); // system identifier
+        bytes.extend_from_slice(&padded(b"CADCraft test")); // generating software
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // creation day
+        bytes.extend_from_slice(&2024u16.to_le_bytes()); // creation year
+        bytes.extend_from_slice(&227u16.to_le_bytes()); // header size
+        bytes.extend_from_slice(&227u32.to_le_bytes()); // the points start right after the header
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // VLRs
+        bytes.push(0); // point format 0
+        bytes.extend_from_slice(&20u16.to_le_bytes()); // record length
+        bytes.extend_from_slice(&(points.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(points.len() as u32).to_le_bytes()); // points of the first return
+        bytes.extend_from_slice(&[0u8; 16]); // the other four returns are empty
+        let scale = 0.01f64;
+        for _ in 0..3 {
+            bytes.extend_from_slice(&scale.to_le_bytes()); // scale
+        }
+        for _ in 0..3 {
+            bytes.extend_from_slice(&0f64.to_le_bytes()); // offset
+        }
+        let (mut min, mut max) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for &(x, y, z, _) in points {
+            let p = [x, y, z];
+            for k in 0..3 {
+                min[k] = min[k].min(p[k]);
+                max[k] = max[k].max(p[k]);
+            }
+        }
+        for v in [max[0], min[0], max[1], min[1], max[2], min[2]] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for &(x, y, z, class) in points {
+            bytes.extend_from_slice(&((x / scale).round() as i32).to_le_bytes());
+            bytes.extend_from_slice(&((y / scale).round() as i32).to_le_bytes());
+            bytes.extend_from_slice(&((z / scale).round() as i32).to_le_bytes());
+            bytes.extend_from_slice(&100u16.to_le_bytes()); // intensity
+            bytes.push(0x11); // one return, the first
+            bytes.push(class); // the classification the file carries
+            bytes.push(0); // scan angle
+            bytes.push(0); // user data
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // point source id
+        }
+        std::fs::write(path, bytes).ok();
+    }
+
+    /// LASOPEN answers with the report it always gave: the same keys, and for a whole file the
+    /// same numbers.
+    #[test]
+    fn lasopen_reports_the_keys_it_always_did() {
+        let dir = std::env::temp_dir().join("cadcraft-lasopen-test");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("report.las");
+        // A small floor of 64 points, so the report counts something real.
+        let mut points: Vec<(f64, f64, f64, u8)> = Vec::new();
+        for i in 0..8 {
+            for j in 0..8 {
+                points.push((f64::from(i) * 0.25, f64::from(j) * 0.25, 1.0 + f64::from(j) * 0.1, 1));
+            }
+        }
+        write_test_las(&path, &points);
+        let mut s = Session::new();
+        let r = lasopen(&mut s, &json!({ "path": path.to_string_lossy() })).ok();
+        let report = r.as_ref().and_then(|v| v.as_object());
+        assert!(report.is_some_and(|o| !o.is_empty()), "the report comes back: {r:?}");
+        let empty = serde_json::Map::new();
+        let report = report.unwrap_or(&empty);
+        for key in ["message", "name", "points", "levels", "cell", "inBand", "filePoints", "color", "bounds", "crs", "open"] {
+            assert!(report.contains_key(key), "the report keeps `{key}`: {r:?}");
+        }
+        // The whole file is the band, so the counts are the file's own 64 points.
+        assert_eq!(r.as_ref().and_then(|v| v["filePoints"].as_u64()), Some(64));
+        assert_eq!(r.as_ref().and_then(|v| v["inBand"].as_u64()), Some(64));
+        assert_eq!(r.as_ref().and_then(|v| v["points"].as_u64()), Some(64));
+        // The cloud keeps a band a drawing can be written with: the heights of its own points,
+        // not the endless numbers the whole file was read at.
+        assert!(s.clouds.first().is_some_and(|c| c.z0.is_finite() && c.z1.is_finite() && c.z0 < c.z1), "{:?}", s.clouds.first());
+    }
+
+    /// A file whose points carry the class 0 ("created") knows no ground: the ground filter still
+    /// runs for it, so the classes are not left as the file carried them and the heights of the
+    /// classification are measured from the ground instead of the band's lowest point.
+    #[test]
+    fn a_cloud_with_class_zero_still_gets_the_ground_filter() {
+        use cadcraft_pointcloud::{Bounds3, CLASS_GROUND, Cloud, CloudColor, Pt, Slice};
+        let mut b = Bounds3::EMPTY;
+        b.add(0.0, 0.0, 5.0);
+        b.add(2.9, 2.9, 9.4);
+        // A floor at 5 m with a wall above it, every point carrying the class 0.
+        let mut pts: Vec<Pt> = Vec::new();
+        for i in 0..30 {
+            for j in 0..30 {
+                pts.push(Pt { x: i as f64 * 0.1, y: j as f64 * 0.1, z: 5.0, rgb: None, intensity: 100, class: 0 });
+            }
+        }
+        for i in 0..30 {
+            for k in 0..20 {
+                pts.push(Pt { x: i as f64 * 0.1, y: 0.0, z: 7.5 + k as f64 * 0.1, rgb: None, intensity: 100, class: 0 });
+            }
+        }
+        let n = pts.len() as u64;
+        let slice = Slice { points: pts, total: n, in_band: n, bounds: b };
+        let mut s = Session::new();
+        s.clouds.push(Cloud::from_slice("t".into(), String::new(), 5.0, 10.0, Some(0.05), slice, 1000, CloudColor::Rgb));
+        // The class the file carries is not the ground filter's word.
+        assert!(!ground_is_known(&s.clouds[0]), "the class 0 says nothing about the ground");
+        let r = lasclass(&mut s, &json!({ "mode": "auto" })).ok();
+        assert!(s.clouds[0].ground_points() > 0, "the ground filter ran for the class 0: {r:?}");
+        let classes = r.as_ref().and_then(|v| v["classes"].as_object()).cloned().unwrap_or_default();
+        assert!(classes.contains_key("ground"), "the floor at 5 m is the ground: {classes:?}");
+        assert!(s.clouds[0].levels.first().is_some_and(|l| l.classes.contains(&CLASS_GROUND)), "the classes are not left as the file carried them");
     }
 }

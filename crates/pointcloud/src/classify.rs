@@ -321,39 +321,59 @@ pub fn shape_of(neighbours: &[[f64; 3]], centre: [f64; 3]) -> Shape {
     out
 }
 
-/// The height above the ground of every point, in metres.
+/// The cell a point falls in.
+fn cell_key(p: [f64; 3], inv: f64) -> (i64, i64) {
+    ((p[0] * inv).floor() as i64, (p[1] * inv).floor() as i64)
+}
+
+/// The ground height of every cell that holds ground points, and the fallback for the others.
 ///
-/// The ground height of a cell is the median of the points the ground filter found in it; a cell
-/// without ground takes the nearest cell that has some.
-pub fn heights_above_ground(points: &[[f64; 3]], ground: &[u8], cell: f64) -> Vec<f32> {
-    let cell = if cell > 0.0 && cell.is_finite() { cell } else { 0.5 };
-    let inv = 1.0 / cell;
-    let mut surface: HashMap<(i64, i64), Vec<f64>> = HashMap::new();
-    for (i, p) in points.iter().enumerate() {
-        if ground.get(i).copied() != Some(CLASS_GROUND) {
-            continue;
+/// The cells are built once and read for the points that need a height: the classifier reads them
+/// on its sample only, so a level of four million points costs one pass over the ground instead of
+/// a probe of twenty-five cells for every point.
+struct GroundCells {
+    /// The ground height of a cell: the median of the ground points in it.
+    heights: HashMap<(i64, i64), f64>,
+    /// The fallback for a cell without ground nearby: the lowest cell of the level.
+    fallback: f64,
+    /// One over the cell size.
+    inv: f64,
+}
+
+impl GroundCells {
+    /// The ground height of every cell, read from the points the ground filter found.
+    fn new(points: &[[f64; 3]], ground: &[u8], cell: f64) -> Self {
+        let cell = if cell > 0.0 && cell.is_finite() { cell } else { 0.5 };
+        let inv = 1.0 / cell;
+        let mut surface: HashMap<(i64, i64), Vec<f64>> = HashMap::new();
+        for (i, p) in points.iter().enumerate() {
+            if ground.get(i).copied() != Some(CLASS_GROUND) {
+                continue;
+            }
+            surface.entry(cell_key(*p, inv)).or_default().push(p[2]);
         }
-        let key = ((p[0] * inv).floor() as i64, (p[1] * inv).floor() as i64);
-        surface.entry(key).or_default().push(p[2]);
+        // The ground height of a cell: the median of its ground points.
+        let mut heights: HashMap<(i64, i64), f64> = HashMap::with_capacity(surface.len());
+        for (key, zs) in surface {
+            let mut zs = zs;
+            zs.sort_by(f64::total_cmp);
+            let h = zs[zs.len() / 2];
+            heights.insert(key, h);
+        }
+        // The fallback for a cell without ground: the lowest cell of the level.
+        let fallback = heights.values().copied().fold(f64::INFINITY, f64::min);
+        let fallback = if fallback.is_finite() { fallback } else { 0.0 };
+        Self { heights, fallback, inv }
     }
-    // The ground height of a cell: the median of its ground points.
-    let mut heights: HashMap<(i64, i64), f64> = HashMap::with_capacity(surface.len());
-    for (key, zs) in surface {
-        let mut zs = zs;
-        zs.sort_by(f64::total_cmp);
-        let h = zs[zs.len() / 2];
-        heights.insert(key, h);
-    }
-    // The fallback for a cell without ground: the lowest cell of the neighbourhood.
-    let fallback = heights.values().copied().fold(f64::INFINITY, f64::min);
-    let fallback = if fallback.is_finite() { fallback } else { 0.0 };
-    let mut out = Vec::with_capacity(points.len());
-    for p in points {
-        let key = ((p[0] * inv).floor() as i64, (p[1] * inv).floor() as i64);
+
+    /// The height above the ground of a point: the ground of the nearest cell of its 5 × 5
+    /// neighbourhood, or the lowest cell of the level when the neighbourhood has no ground.
+    fn height(&self, p: [f64; 3]) -> f32 {
+        let key = cell_key(p, self.inv);
         let mut ground_z = None;
         for dx in -2i64..=2 {
             for dy in -2i64..=2 {
-                if let Some(h) = heights.get(&(key.0 + dx, key.1 + dy)) {
+                if let Some(h) = self.heights.get(&(key.0 + dx, key.1 + dy)) {
                     ground_z = Some(*h);
                     break;
                 }
@@ -362,9 +382,17 @@ pub fn heights_above_ground(points: &[[f64; 3]], ground: &[u8], cell: f64) -> Ve
                 break;
             }
         }
-        out.push((p[2] - ground_z.unwrap_or(fallback)) as f32);
+        (p[2] - ground_z.unwrap_or(self.fallback)) as f32
     }
-    out
+}
+
+/// The height above the ground of every point, in metres.
+///
+/// The ground height of a cell is the median of the points the ground filter found in it; a cell
+/// without ground takes the nearest cell that has some.
+pub fn heights_above_ground(points: &[[f64; 3]], ground: &[u8], cell: f64) -> Vec<f32> {
+    let cells = GroundCells::new(points, ground, cell);
+    points.iter().map(|p| cells.height(*p)).collect()
 }
 
 /// The class a point gets from its height and its shape.
@@ -446,17 +474,22 @@ impl Sample {
 
 /// Read the features of a sample of a level: the height above the ground and the shape.
 pub fn sample_level(points: &[[f64; 3]], ground: &[u8], options: &ClassifyOptions) -> Sample {
-    let heights = heights_above_ground(points, ground, options.cell);
     let step = (points.len() / options.sample.max(1)).max(1);
     let indices: Vec<usize> = (0..points.len()).step_by(step).collect();
     let sampled: Vec<[f64; 3]> = indices.iter().map(|&i| points[i]).collect();
+    // The ground is built once and probed for the sampled points only: the height of every point
+    // of the level is never read.
+    let cells = GroundCells::new(points, ground, options.cell);
+    let heights: Vec<f32> = indices.iter().map(|&i| cells.height(points[i])).collect();
     let grid = Grid::new(&sampled, options.radius.max(options.cell * 0.5));
     let mut near = Vec::new();
+    // One buffer of neighbours for the whole sample: it is cleared, not reallocated.
+    let mut neighbours = Vec::new();
     let mut shapes = Vec::with_capacity(sampled.len());
+    let r2 = options.radius * options.radius;
     for p in sampled.iter() {
         grid.around(*p, &mut near);
-        let r2 = options.radius * options.radius;
-        let mut neighbours: Vec<[f64; 3]> = Vec::with_capacity(near.len());
+        neighbours.clear();
         for &j in near.iter() {
             let q = sampled[j as usize];
             let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
@@ -466,8 +499,7 @@ pub fn sample_level(points: &[[f64; 3]], ground: &[u8], options: &ClassifyOption
         }
         shapes.push(shape_of(&neighbours, *p));
     }
-    let sample_heights = indices.iter().map(|&i| heights[i]).collect();
-    Sample { indices, points: sampled, heights: sample_heights, shapes }
+    Sample { indices, points: sampled, heights, shapes }
 }
 
 /// Classify the points of one level.
@@ -597,5 +629,32 @@ mod tests {
         assert!(result.counts[CLASS_GROUND as usize] > 0, "the floor is the ground");
         assert!(result.counts[CLASS_BUILDING as usize] > 0, "the wall is a building: {result:?}");
         assert!(result.summary().contains("ground"), "{}", result.summary());
+    }
+
+    #[test]
+    fn the_sample_heights_are_the_heights_of_the_whole_level() {
+        // A floor with a step in it, a hole without ground and a few points above the floor: the
+        // sample must read exactly the heights the whole level would.
+        let mut points: Vec<[f64; 3]> = Vec::new();
+        for i in 0..24 {
+            for j in 0..24 {
+                if (8..12).contains(&i) && (8..12).contains(&j) {
+                    continue;
+                }
+                let z = if i > 12 { 0.4 } else { 0.0 };
+                points.push([i as f64 * 0.3, j as f64 * 0.3, z]);
+            }
+        }
+        for i in 0..10 {
+            points.push([i as f64 * 0.5, 2.0, 3.0 + i as f64 * 0.2]);
+        }
+        let ground: Vec<u8> = points.iter().map(|p| if p[2] < 0.5 { CLASS_GROUND } else { CLASS_UNCLASSIFIED }).collect();
+        let options = ClassifyOptions { sample: 200, ..ClassifyOptions::default() };
+        let whole = heights_above_ground(&points, &ground, options.cell);
+        let sample = sample_level(&points, &ground, &options);
+        assert!(sample.len() > 50, "the sample is read: {}", sample.len());
+        for (n, &i) in sample.indices.iter().enumerate() {
+            assert_eq!(sample.heights[n].to_bits(), whole[i].to_bits(), "the height of point {i}");
+        }
     }
 }

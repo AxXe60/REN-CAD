@@ -694,21 +694,55 @@ The LOD keeps the drawn count proportional to the screen, not to the file: ~550k
 1600×1000 canvas can show at ~2 px per point, and panning inside the built area only moves the
 buffer.
 
+### The commands, measured (the whole 3 899 545-point scan, release build)
+
+| Command | Before | Now |
+|---|---|---|
+| `LASOPEN` (read and pyramid) | 6.1 s | **3.0 s** |
+| `LASGROUND` (the ground filter) | +0.4 s | +0.0 s |
+| `LASCLASS` (the classification) | +7.5 s | +5.4 s |
+| `LASCLUSTER` (the grouping) | +6.8 s | +4.8 s |
+| `LASCMP` (two such clouds) | +10.7 s | +6.0 s |
+
+What made the difference:
+
+* the pyramid is built **level by level** (each level from the one below it), not by walking the
+  whole band once per level: the cells double, so every cube of a level sits inside one cube of
+  the level above, and the decimation is then exactly the one a fresh pass would give;
+* the read uses the reusable buffer of the `las` crate and takes the coordinates from the column
+  accessors, instead of decoding every record into an owned struct and copying it again;
+* the ground filter works on one flat cell array over the band's own box, with no allocation per
+  cell (and keeps the old path for a band spread over kilometres, so the memory stays bounded);
+* the classification computes the heights above the ground **for the sample it uses**, not for the
+  whole level;
+* the comparison builds the reference's grid **once** for all the levels of the tested cloud, and
+  the grid itself is an open-addressed table instead of a hashed map;
+* the statistics of a comparison find their percentile from a histogram, without copying and
+  sorting three million distances.
+
+What is still slow, and why: the classification gives every point of every level the class of its
+nearest sampled point, and that is a nearest-neighbour search over the whole pyramid. The next
+step is for the coarse levels to inherit from the fine one.
+
 ## Design
 
 - `crates/pointcloud` (L3) reads, slices and builds the pyramid; it knows nothing about egui or the
   drawing model.
 - Points stream in batches of one million, so a 12-million-point scan never sits in memory whole.
-- `Cloud::from_slice` keeps a chain of grid-decimated levels (cells ×1.6) until the coarsest fits
-  20k points, capped at 16 levels. Each vertex is 16 bytes: `f32` x/y/z relative to the cloud origin
+- `Cloud::from_slice` keeps a chain of grid-decimated levels (the cells double, so every cube of a
+  level sits inside one cube of the level above: the level is built from the level below it, and
+  the decimation is then exactly the one a fresh pass over the band would give) until the coarsest
+  fits 20k points, capped at 16 levels. Each vertex is 16 bytes: `f32` x/y/z relative to the cloud origin
   plus RGB and intensity bytes. `level_for(px_per_m)` picks the level whose cell is nearest 2 screen
   pixels.
 - The canvas clips the chosen level to the view plus a quarter screen, builds a `DisplayList` with
   one `Kind::Cloud` primitive, and hands it to the GPU instanced-quad pipeline on `LAYER_CLOUD`
-  (5): one instance per point with its own colour, one draw call. `gpu::CLOUD_SIZE` is 2 px,
-  matching the LOD spacing.
+  (5): one instance per point with its own colour, one draw call. `gpu::CLOUD_SIZE` is 2 px,  matching the LOD spacing.
 - The mesh is rebuilt only when the level, the colour mode or the ground covered changes
-  (quantised view centre and zoom); plain panning just moves it.
+  (quantised view centre and zoom); plain panning just moves it. The overlay list is kept with
+  its key, so a frame that changes nothing walks no points at all.
+- The 3D scene counts its visible points only when the scene changes, and reserves what it really
+  holds, not the whole level.
 - Clouds live in `Session::clouds`, never as drawing entities: snaps, picking, undo and save see
   only what the user drew. Plots, PDF/SVG export and the CPU raster path have `Kind::Cloud` arms so
   a list containing one still renders (plots never do).
