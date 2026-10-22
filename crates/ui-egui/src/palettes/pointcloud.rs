@@ -424,6 +424,8 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         });
     });
     if app.view3d.active {
+        // Tighten the row pitch: the clarity sliders must stay on screen without scrolling.
+        ui.spacing_mut().item_spacing.y = 5.0;
         // ---------- 3D drafting (first: it is what the view is for) ----------
         let strokes = app.session.sketch.count();
         ui.horizontal(|ui| {
