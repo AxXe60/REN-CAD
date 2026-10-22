@@ -386,6 +386,19 @@ impl View3d {
             }
         }
     }
+
+    /// Keep the orbit target on the clouds. A wheel zoom whose cursor is over the empty sky, or a
+    /// pan past the edge, otherwise walks the camera off the scan and leaves an empty viewport while
+    /// the HUD still reports points. A missing or degenerate box leaves the target alone.
+    fn clamp_target(&mut self, bounds: Option<([f64; 3], [f64; 3])>) {
+        let Some((min, max)) = bounds else { return };
+        for i in 0..3 {
+            let (lo, hi) = (min[i], max[i]);
+            if lo.is_finite() && hi.is_finite() && lo <= hi && self.target[i].is_finite() {
+                self.target[i] = self.target[i].clamp(lo, hi);
+            }
+        }
+    }
 }
 
 /// The box around every visible cloud, in the drawing frame: every cloud is placed at its own
@@ -717,6 +730,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     });
     if inside && wheel != 0.0 {
         app.view3d.zoom_at(f64::from(wheel), pointer, rect);
+        app.view3d.clamp_target(bounds);
     }
     // Middle-drag panning is read from the pointer (egui's drag sense follows the primary button).
     let drag = if inside && middle && pointer_delta != egui::Vec2::ZERO {
@@ -736,6 +750,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
             for i in 0..3 {
                 app.view3d.target[i] += (-right[i] * f64::from(d.x) + up[i] * f64::from(d.y)) * k;
             }
+            app.view3d.clamp_target(bounds);
         } else {
             app.view3d.yaw -= f64::from(d.x) * 0.008;
             app.view3d.pitch = (app.view3d.pitch - f64::from(d.y) * 0.008).clamp(-1.5, 1.5);
@@ -1298,6 +1313,22 @@ mod tests {
             assert!((before[i] - after[i]).abs() < 1e-6, "axis {i}: {before:?} vs {after:?}");
         }
         assert!(v.dist < 10.0, "a positive wheel zooms in: {}", v.dist);
+    }
+
+    /// A wheel over the empty sky walks the orbit target towards the cursor; the clamp keeps it on
+    /// the cloud, so the camera cannot end up looking at nothing with the scan off screen.
+    #[test]
+    fn a_zoom_off_the_cloud_keeps_the_target_on_the_data() {
+        let mut v = default_view();
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0));
+        let bounds = ([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]);
+        let off = |t: [f64; 3]| t.iter().any(|c| !(0.0..=4.0).contains(c));
+        v.zoom_at(900.0, Some(pos2(1150.0, 40.0)), rect);
+        assert!(off(v.target), "the zoom walked off the cloud: {:?}", v.target);
+        v.clamp_target(Some(bounds));
+        for (i, c) in v.target.iter().enumerate() {
+            assert!((0.0..=4.0).contains(c), "axis {i} stays on the cloud: {c}");
+        }
     }
 
     #[test]

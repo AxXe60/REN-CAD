@@ -239,7 +239,11 @@ perspective view of the visible clouds in the same rectangle; `{"on": false}` re
   **Top**, **Front** and **Iso** restore the standard angles. Camera angles and projection survive
   switching to 2D and back.
 - Zooming is anchored at the cursor: the world point under the pointer stays under it while `dist`
-  changes, instead of the view growing towards the middle of the screen.
+  changes, instead of the view growing towards the middle of the screen. The anchor moves the orbit
+  target, so the target is clamped to the visible clouds' box after every zoom and pan: a wheel over
+  the empty sky (or a pan past the edge) otherwise walked the camera off the scan and left an empty
+  viewport while the HUD still reported points. With no visible cloud there is no box and the camera
+  moves freely.
 - The same decimation pyramid is used: the level is picked for the on-screen density at the camera
   target, then the scene keeps only the points inside a ball around the target (three times the
   camera distance, which covers the screen corners at every orbit angle). The uploaded set is
@@ -302,8 +306,10 @@ geometry are mixed. Two things stand in for the depth test:
   camera.
 - **The depth cue** (`Cue` in the palette, `{"cue": 1}`): every point knows its depth along the
   view direction, so the ones behind the orbit target fade towards the background (up to 45%, with
-  a quadratic ramp so only the far ones recede) and their squares shrink. The near geometry
-  stands out from the wall behind it.
+  a quadratic ramp so only the far ones recede). The squares keep their size: the level's spacing
+  still sets the side, and the cue works through colour alone. Shrinking the far squares as well
+  left one-pixel holes between them in the fitted view (79% of the cloud covered there, against 98%
+  in the same view in 2D), so the depth is told by the fade and not by a smaller point.
 
 Both live in the vertex shader of `crates/ui-egui/src/gpu3d.rs` and need no extra attachment: the
 depth is `dot(point − eye, forward)`, which works in the orthographic projection too (where

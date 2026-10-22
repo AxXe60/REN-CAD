@@ -344,12 +344,13 @@ fn vs(
     let right = select(k == 1u, k == 2u, second);
     let up_corner = select(k == 2u, k == 1u, second);
     let o = vec2<f32>(select(-1.0, 1.0, right), select(-1.0, 1.0, up_corner));
-    // The square is drawn at a whole-pixel size, keeping the depth cue's shrink but rounding it and
-    // never going below one pixel, and its centre is snapped to a half pixel. A fractional square at
-    // a fractional position covers a different set of pixels for every sub-pixel of camera motion,
-    // which made the cloud crawl while orbiting. The old half-extent was half of the square asked
-    // for, so the points were sub-pixel and dim.
-    let side = max(1.0, floor(view.params.x * (1.0 - 0.45 * far) + 0.5));
+    // The square is drawn at a whole-pixel size, rounding the size the level asks for and never
+    // going below one pixel, and its centre is snapped to a half pixel. A fractional square at a
+    // fractional position covers a different set of pixels for every sub-pixel of camera motion,
+    // which made the cloud crawl while orbiting. The size does not shrink with depth: the depth cue
+    // only fades the colour, because a smaller far square left one-pixel holes in the fitted view.
+    // The old half-extent was half of the square asked for, so the points were sub-pixel and dim.
+    let side = max(1.0, floor(view.params.x + 0.5));
     let half_viewport = vec2<f32>(view.params.y * 0.5, view.params.z * 0.5);
     if (clip.w > 0.0) {
         // The viewport is the full size in device pixels, so half of it spans the [-1, 1] NDC range.
@@ -424,10 +425,10 @@ mod tests {
         }
     }
 
-    /// The side the shader asks for: the requested size shrunk by the depth cue, rounded to a whole
-    /// pixel and never below one.
-    fn side(requested: f32, far: f32) -> f32 {
-        (requested * (1.0 - 0.45 * far) + 0.5).floor().max(1.0)
+    /// The side the shader asks for: the requested size rounded to a whole pixel and never below
+    /// one. Depth changes the colour, not the size.
+    fn side(requested: f32) -> f32 {
+        (requested + 0.5).floor().max(1.0)
     }
 
     /// The shader's centre snap, replicated in NDC: to device pixels, onto the half-pixel grid, and
@@ -455,9 +456,10 @@ mod tests {
     /// sits on the half-pixel grid, so no sub-pixel camera motion changes which pixels it covers.
     #[test]
     fn the_point_square_is_whole_pixels_wide_and_centred_on_a_half_pixel() {
-        assert_eq!(side(3.0, 0.0), 3.0);
-        assert_eq!(side(10.0, 1.0), 6.0, "the cue's shrink is rounded to a whole pixel");
-        assert_eq!(side(1.0, 1.0), 1.0, "never below one pixel");
+        assert_eq!(side(3.0), 3.0);
+        assert_eq!(side(10.0), 10.0, "no depth shrink: the level's spacing is what is drawn");
+        assert_eq!(side(1.5), 2.0, "a pixel and a half rounds up, so the squares tile the cloud");
+        assert_eq!(side(0.2), 1.0, "never below one pixel");
 
         let viewport = [1600.0, 1000.0];
         // A centre that lands exactly on the corner of four device pixels.
