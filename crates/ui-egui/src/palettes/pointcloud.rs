@@ -166,16 +166,18 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
     ui.add_space(6.0);
     let all = cell_now <= 0.0;
     let mut cell = ui.data(|d| d.get_temp::<f32>(cell_id)).unwrap_or(if all { 0.005 } else { cell_now as f32 });
+    // Two rows: the narrow panel cannot fit the slider and the two buttons on the same line.
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.label(egui::RichText::new("Grid").color(t.text_dim).size(12.0));
         let slider = egui::Slider::new(&mut cell, 0.001..=0.2).logarithmic(true).suffix(" m").fixed_decimals(3);
-        // The panel is narrow, so the slider yields the room the Apply and All buttons need instead
-        // of pushing them out of the panel.
-        let slider_w = (ui.available_width() - 84.0).max(60.0);
-        if ui.add_sized([slider_w, 18.0], slider).changed() {
+        let width = (ui.available_width() - 4.0).max(60.0);
+        if ui.add_sized([width, 18.0], slider).changed() {
             ui.data_mut(|d| d.insert_temp(cell_id, cell));
         }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(42.0);
         if ui.button("Apply").on_hover_text("Re-read the file at this grid cell").clicked() {
             run(app, "lasdecimate", json!({"index": selected, "cell": cell}));
         }
