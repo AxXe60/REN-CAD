@@ -345,46 +345,43 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     });
 
-    // ---------- the Z band: the scan's profile and the band jogger ----------
+    // ---------- the scan: profile, band jogger and the facts ----------
     // Folded so the palette keeps the clarity sliders (Lens, Size, Cut, Cue) on screen without
-    // scrolling: the slice is a tool one opens while working on it, not one to see all the time.
-    egui::CollapsingHeader::new(egui::RichText::new("Z band (height slice)").size(12.0)).id_salt("cc_pc_zband").default_open(clip.is_some()).show(
-        ui,
-        |ui| {
-            let mut hud = crate::pointcloud_hud::PointCloudHudState {
-                is_3d_active: app.view3d.active,
-                is_ortho: app.view3d.projection == crate::view3d::Projection::Ortho,
-                opacity: app.session.clouds[selected].opacity,
-                bounds_z_min: bounds.min[2],
-                bounds_z_max: bounds.max[2],
-                clip_z_min: clip.map_or(bounds.min[2], |c| c.min[2]),
-                clip_z_max: clip.map_or(bounds.max[2], |c| c.max[2]),
-                lock_slice_thickness: false,
-                jog_step_m: 0.15,
-                z_histogram: app.session.clouds[selected].zhisto,
-            };
-            let mut actions = Vec::new();
-            crate::pointcloud_hud::draw_z_slice_and_histogram_panel(ui, &mut hud, &mut actions);
-            for action in actions {
-                match action {
-                    crate::pointcloud_hud::PointCloudUiAction::SetZClip { z_min, z_max } => {
-                        let min = [bounds.min[0], bounds.min[1], z_min];
-                        let max = [bounds.max[0], bounds.max[1], z_max];
-                        run(app, "lasclip", json!({ "index": selected, "min": min, "max": max }));
-                    }
-                    crate::pointcloud_hud::PointCloudUiAction::ResetZClip => {
-                        run(app, "lasclip", json!({ "index": selected, "reset": true }));
-                    }
-                    _ => {}
+    // scrolling: the slice and the scan facts are tools one opens while working on them, not ones
+    // to see all the time. The old separate Z band and Scan info headers were folded into one, so
+    // the RENCAD quick tools below cost no extra row.
+    egui::CollapsingHeader::new(egui::RichText::new("Scan info").size(12.0)).id_salt("cc_pc_scan").default_open(clip.is_some()).show(ui, |ui| {
+        let mut hud = crate::pointcloud_hud::PointCloudHudState {
+            is_3d_active: app.view3d.active,
+            is_ortho: app.view3d.projection == crate::view3d::Projection::Ortho,
+            opacity: app.session.clouds[selected].opacity,
+            bounds_z_min: bounds.min[2],
+            bounds_z_max: bounds.max[2],
+            clip_z_min: clip.map_or(bounds.min[2], |c| c.min[2]),
+            clip_z_max: clip.map_or(bounds.max[2], |c| c.max[2]),
+            lock_slice_thickness: false,
+            jog_step_m: 0.15,
+            z_histogram: app.session.clouds[selected].zhisto,
+        };
+        let mut actions = Vec::new();
+        crate::pointcloud_hud::draw_z_slice_and_histogram_panel(ui, &mut hud, &mut actions);
+        for action in actions {
+            match action {
+                crate::pointcloud_hud::PointCloudUiAction::SetZClip { z_min, z_max } => {
+                    let min = [bounds.min[0], bounds.min[1], z_min];
+                    let max = [bounds.max[0], bounds.max[1], z_max];
+                    run(app, "lasclip", json!({ "index": selected, "min": min, "max": max }));
                 }
+                crate::pointcloud_hud::PointCloudUiAction::ResetZClip => {
+                    run(app, "lasclip", json!({ "index": selected, "reset": true }));
+                }
+                _ => {}
             }
-        },
-    );
+        }
 
-    // ---------- info (folded: the scan facts are read rarely, the controls are read all the time) ----------
-    egui::CollapsingHeader::new(egui::RichText::new("Scan info").size(12.0)).id_salt("cc_pc_info").default_open(false).show(ui, |ui| {
         let shown = if all { format!("{} points (all)", num(points)) } else { format!("{} of {} band points", num(points), num(in_band)) };
         let intensity = if color == cadcraft_pointcloud::CloudColor::Intensity { format!(" · intensity {imin}–{imax}") } else { String::new() };
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.label(egui::RichText::new(format!("{shown} · {levels} levels{intensity}")).color(t.text_dim).size(11.0));
@@ -422,6 +419,36 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             };
             ui.label(egui::RichText::new(text).color(t.text_dim).size(11.0));
         });
+    });
+
+    // ---------- RENCAD quick tools ----------
+    // The survey commands the Tools menu reaches (`Point Cloud & RLV`, `TopoCAD`) as one-click
+    // buttons next to the cloud they work on; folded so the clarity sliders stay on screen, and
+    // planted where the merged Scan header freed a row, so nothing else moves.
+    egui::CollapsingHeader::new(egui::RichText::new("RENCAD tools").size(12.0)).id_salt("cc_pc_rencad").default_open(false).show(ui, |ui| {
+        let width = (ui.available_width() - 26.0).max(60.0) * 0.5;
+        let quick = [
+            ("Auto-RLV", "Auto-RLV 2D with the room schedule, from this cloud (Tools ▸ Point Cloud & RLV)", "autorlv"),
+            ("Auto-3D", "Auto-3D building structure: walls, slabs and roof (Tools ▸ Point Cloud & RLV)", "auto3d"),
+            ("DTM / TIN", "Digital terrain model: triangles on layer TOPOCAD_TIN (Tools ▸ TopoCAD)", "topodtm"),
+            ("Contours", "Contour lines: major and minor segments on layers TOPOCAD_CONTUR_* (Tools ▸ TopoCAD)", "curbenivel"),
+            ("Volumes", "Cut & fill volumes against the reference Z, on this cloud's terrain (Tools ▸ TopoCAD)", "volumetopo"),
+            (
+                "Profile",
+                "Longitudinal profile stations along an axis (Tools ▸ TopoCAD). A full-scan sample per station: on big scans it takes a minute",
+                "profiltopo",
+            ),
+        ];
+        for pair in quick.chunks(2) {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                for (label, hint, command) in pair {
+                    if ui.add_sized([width, 18.0], egui::Button::new(egui::RichText::new(*label).size(11.0))).on_hover_text(*hint).clicked() {
+                        run(app, command, json!({"index": selected}));
+                    }
+                }
+            });
+        }
     });
     if app.view3d.active {
         // Tighten the row pitch: the clarity sliders must stay on screen without scrolling.
