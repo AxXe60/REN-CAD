@@ -49,6 +49,8 @@ impl Crs {
         Some(match code {
             4326 => "WGS 84 (geographic)".to_string(),
             4269 => "NAD83 (geographic)".to_string(),
+            4258 => "ETRS89 (geographic)".to_string(),
+            3035 => "ETRS89 / LAEA Europe".to_string(),
             3857 => "WGS 84 / Pseudo-Mercator".to_string(),
             31700 => "Stereo 70 (Romania)".to_string(),
             32601..=32660 => format!("WGS 84 / UTM zone {}N", code - 32600),
@@ -60,7 +62,7 @@ impl Crs {
 
     /// Whether the system is geographic (longitude and latitude) rather than projected.
     pub fn is_geographic(&self) -> bool {
-        matches!(self.epsg, Some(4326 | 4269))
+        matches!(self.epsg, Some(4326 | 4269 | 4258))
     }
 
     /// The line written next to an exported drawing.

@@ -293,5 +293,20 @@ Control (JSON lines pe `127.0.0.1:47902`): `engine.execute`, `cmdline.input`, `u
   fără dependențe noi, teste unitare (7 pentru CRS, 6 pentru filtrul de teren), verificat live pe
   scanul real (737.687 puncte de teren, planul etajului extras, export cu `.prj` când fișierul
   are CRS).
-- Următorul: M10b (secțiune verticală prin nor → polilinie exportabilă) și M10c (citire COPC pe
-  octree, cu query pe nivel + bounds — `las` are deja `CopcReader`).
+
+## 11. Extinderea RENCAD: Auto-RLV, Auto-3D, Clasificare AI, TopoLT / TopoCAD / CADGen, OpenStreetMap & MCP
+
+Toate modulele adăugate sunt implementate în Rust pur în `crates/pointcloud` (`rlv.rs`, `osm.rs`, `topo.rs`), expuse ca `CommandSpec` în `crates/engine/src/cmd/rencad.rs` și ca unelte de prim rang în serverul MCP (`crates/mcp/src/tools.rs`):
+
+| Modul / Funcționalitate | Comandă CLI / JSON | Unealtă MCP (`tools/call`) | Descriere |
+|---|---|---|---|
+| **Eliminare Mobilă din LAS** | `LASFURNITURE {index?, cell?, slabMargin?, minWallRatio?}` | `pointcloud_rlv` | Filtrare volumetrică pe coloane: păstrează pereții continui și plăcile podea/tavan, eliminând mobila interioară |
+| **Auto-RLV 2D + Tabel Camere** | `AUTORLV {index?, removeFurniture?}` | `pointcloud_rlv` | Detectează pereții (`RLV_WALLS`), golurile de uși și ferestre (`RLV_OPENINGS`), cotele automate (`RLV_DIMS`) și tabelul de suprafețe utile și perimetre (`RLV_SCHEDULE`) |
+| **Auto-3D Construcții (fără mobilă)** | `AUTO3D {index?, roof?}` | `pointcloud_auto3d` | Reconstruiește pereții 3D extrudați (`BIM_3D_WALLS`), planșeele podea/tavan și acoperișul 3D (`BIM_3D_SLABS_ROOF`), fără mobilier |
+| **Clasificare AI & Vectorizare** | `AUTOVECTORIZE {index?}` | `pointcloud_classify` | Clasifică și vectorizează automat: clădiri (`TOPO_BUILDINGS`), garduri (`TOPO_FENCES`), stâlpi (`TOPO_POLES`), drum (`TOPO_ROADS`), borduri (`TOPO_CURBS`), șanțuri (`TOPO_DITCHES`) |
+| **OpenStreetMap Live & Local `.osm`** | `OSMIMPORT {xml?, json?, epsg?}` · `OSMFETCH {minLat, minLon, maxLat, maxLon, epsg?}` | `osm_import` | Importă clădiri, numere poștale (`addr:housenumber`, `addr:street`), drumuri și parcele în CRS-ul activ (implicit Stereo 70 `EPSG:31700`) |
+| **Sisteme de Coordonate (CRS)** | `LASCRS {epsg, falseEasting?, falseNorthing?}` | `crs_transform` | Stereo 70 (`EPSG:31700`), ETRS89 (`EPSG:4258` / `3035`), WGS 84 (`EPSG:4326`), Web Mercator (`EPSG:3857`), zonele UTM Nord/Sud |
+| **TopoLT (Puncte COO, Pichetare, Radiere)** | `RAPORTCOO {text?}` · `PICHETARE {station, target}` · `RADIERE {station, dist, gon, dz?}` | `topolt_survey` | Raportare puncte `.coo`/`.csv` cu simboluri topografice pe coduri, tabel de coordonate, calcule de pichetare și radiere în grade centezimale (`gon`) |
+| **TopoCAD (DTM/TIN, Curbe, Profile, Volume)** | `TOPODTM` · `CURBENIVEL {minorStep?, majorEvery?}` · `PROFILTOPO {axis}` · `VOLUMETOPO {referenceZ?}` | `topocad_terrain` | Model digital al terenului (TIN), curbe de nivel principale și secundare, profile longitudinale/transversale și calcul volume săpătură/umplutură |
+| **CADGen (Parcelare & PAD Cadastral)** | `PARCELARE {polygon, targetArea, vertical?}` · `PADCADASTRU {parcelId?, polygon, epsg?}` | `cadgen_cadastral` | Detașare automată de suprafață exactă prin bisecție și generare Plan de Amplasament și Delimitare (PAD ANCPI) + Inventar de Coordonate Stereo 70 |
+

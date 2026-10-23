@@ -259,3 +259,34 @@ fn a_lazy_bridge_starts_without_the_app_and_says_how_to_open_it() {
     assert_ne!(r["result"]["isError"], json!(true), "{r}");
     app.join().unwrap();
 }
+
+#[test]
+fn rencad_mcp_tools_execute_end_to_end() {
+    let mut s = Server::new(Box::new(Headless::default()));
+    call(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+
+    let crs = tool(&mut s, "crs_transform", json!({"epsg": 31700}));
+    assert_eq!(crs["crs"]["epsg"], 31700);
+
+    let osm = tool(&mut s, "osm_import", json!({"epsg": 31700}));
+    assert!(osm["buildings"].as_u64().unwrap_or(0) >= 1, "{osm}");
+    assert!(osm["addresses"].as_u64().unwrap_or(0) >= 1, "{osm}");
+
+    let rlv = tool(&mut s, "pointcloud_rlv", json!({"removeFurniture": true}));
+    assert!(rlv["totalUsableAreaM2"].as_f64().unwrap_or(0.0) > 10.0, "{rlv}");
+
+    let b3d = tool(&mut s, "pointcloud_auto3d", json!({"roof": true}));
+    assert!(b3d["walls3d"].as_u64().unwrap_or(0) >= 4, "{b3d}");
+
+    let cls = tool(&mut s, "pointcloud_classify", json!({}));
+    assert!(cls["vectorized"]["fences"].as_u64().unwrap_or(0) >= 1, "{cls}");
+
+    let topo = tool(&mut s, "topolt_survey", json!({"station": [0.0, 0.0, 100.0], "target": [10.0, 0.0, 101.0]}));
+    assert_eq!(topo["dist2d"], 10.0, "{topo}");
+
+    let terrain = tool(&mut s, "topocad_terrain", json!({"minorStep": 0.5, "majorEvery": 5}));
+    assert!(terrain["segments"].as_u64().is_some(), "{terrain}");
+
+    let pad = tool(&mut s, "cadgen_cadastral", json!({"parcelId": "IE 900100", "epsg": 31700}));
+    assert_eq!(pad["parcelId"], "IE 900100", "{pad}");
+}

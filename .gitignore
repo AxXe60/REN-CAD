@@ -10,3 +10,14 @@
 /apps/cadcraft-web/dist/
 /.claude/worktrees/
 /out
+/node_modules/
+/src/
+/package.json
+/package-lock.json
+/vite.config.ts
+/tsconfig.json
+/metadata.json
+/.env.example
+/index.html
+/bun.lock
+/.aistudio/

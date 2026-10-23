@@ -20,11 +20,14 @@ mod geo;
 mod grid;
 mod ground;
 mod measure;
+pub mod osm;
 mod read;
+pub mod rlv;
 mod sketch;
 mod slice;
 mod snap;
 mod spectrum;
+pub mod topo;
 
 pub use classify::{
     ALL_CLASSES, CLASS_BUILDING, CLASS_HIGH_VEG, CLASS_LOW_POINT, CLASS_LOW_VEG, CLASS_MED_VEG, ClassifyMode, ClassifyOptions, ClassifyResult, Shape,
@@ -38,11 +41,22 @@ pub use dxf::{SKETCH_RGB, write_points_dxf, write_strokes_dxf};
 pub use geo::{LatLon, grid_from_lat_lon};
 pub use ground::{CLASS_GROUND, CLASS_NOISE, CLASS_UNCLASSIFIED, GroundOptions, GroundResult, classify_with};
 pub use measure::{Measure, measure, readout};
+pub use osm::{OsmAddress, OsmBuilding, OsmDataset, OsmParcel, OsmPole, OsmRoad, build_overpass_query, parse_osm_xml, parse_overpass_json};
 pub use read::{CloudInfo, read_info};
+pub use rlv::{
+    Auto3dBuilding, AutoRlvResult, CLASS_FURNITURE, FurnitureFilterResult, OpeningKind, RlvDimension, RlvOpening, RoomScheduleRow, SlabOrRoof3d,
+    Wall3d, WallSegment, extract_auto_3d_building, extract_auto_rlv, filter_interior_furniture,
+};
 pub use sketch::{DEFAULT_LAYER, Sketch3d, Stroke3};
 pub use slice::{Pt, Slice, slice, slice_capped};
 pub use snap::{FRONT_LAYER_M, SMOOTH_RADIUS_M, SnapHit, SnapMode, axis_locked, front_layer, nearest, smooth_centroid, z_locked};
 pub use spectrum::Spectrum;
+pub use topo::{
+    CLASS_CURB, CLASS_DITCH, CLASS_FENCE, CLASS_POLE, ContourSegment, PadInventory, PadInventoryRow, ParcelSubdivision, ProfileStation,
+    StakeoutElement, TinTriangle, TopoClassifyReport, TopoPoint, VectorizedTopo, VolumeReport, build_pad_inventory, build_tin,
+    classify_topographic_ai, compute_cut_fill_volume, compute_radiation, compute_stakeout, extract_contours, extract_profile, format_coo,
+    parse_coo, subdivide_parcel_by_area, topo_class_name, vectorize_topography,
+};
 
 /// An axis-aligned box in world units.
 #[derive(Clone, Copy, Debug, PartialEq)]

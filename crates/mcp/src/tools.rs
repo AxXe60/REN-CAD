@@ -35,6 +35,22 @@ pub fn tool_definitions(has_ui: bool) -> Value {
         json!({"name": "open", "description": "Open a DXF or DWG file.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}),
         json!({"name": "save", "description": "Save the drawing (DXF or DWG by extension). A .svg, .png or .pdf path exports instead: the drawing keeps its name and unsaved changes.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}}),
         json!({"name": "cancel", "description": "Press Escape: cancel the running command (or clear the selection).", "inputSchema": {"type": "object", "properties": {}}}),
+        json!({"name": "osm_import", "description": "Import OpenStreetMap (.osm XML or Overpass JSON) with buildings, postal numbers (addr:housenumber, addr:street), roads and parcels projected into the drawing's CRS (default Stereo 70 EPSG:31700).",
+            "inputSchema": {"type": "object", "properties": {"xml": {"type": "string"}, "json": {"type": "string"}, "epsg": {"type": "integer", "minimum": 1024}}}}),
+        json!({"name": "crs_transform", "description": "Set the project Coordinate Reference System (Stereo 70 EPSG:31700, ETRS89 EPSG:4258/3035, WGS84 EPSG:4326, Web Mercator EPSG:3857, UTM zones) and optional local falseEasting/falseNorthing offsets.",
+            "inputSchema": {"type": "object", "properties": {"epsg": {"type": "integer", "minimum": 1024}, "name": {"type": "string"}, "falseEasting": {"type": "number"}, "falseNorthing": {"type": "number"}}}}),
+        json!({"name": "pointcloud_rlv", "description": "Run Auto-RLV 2D on the active apartment/building LAS point cloud: volumetrically removes interior furniture, detects walls and door/window openings, places automatic dimensions and generates the RLV room schedule table (usable areas and perimeters).",
+            "inputSchema": {"type": "object", "properties": {"index": {"type": "integer", "minimum": 0}, "removeFurniture": {"type": "boolean"}}}}),
+        json!({"name": "pointcloud_auto3d", "description": "Reconstruct a 3D structural building model (3D extruded walls, floor/ceiling slabs and roof) from the active point cloud while filtering out interior furniture.",
+            "inputSchema": {"type": "object", "properties": {"index": {"type": "integer", "minimum": 0}, "roof": {"type": "boolean"}}}}),
+        json!({"name": "pointcloud_classify", "description": "Run AI semantic & geometric topographic classification on the point cloud (ground, building, fence, pole, road, curb, ditch, vegetation) and automatically vectorize features onto CAD layers.",
+            "inputSchema": {"type": "object", "properties": {"index": {"type": "integer", "minimum": 0}}}}),
+        json!({"name": "topolt_survey", "description": "TopoLT module: report survey points from .coo/.csv text onto CAD layers with topographic symbols and elevations, or compute stakeout (pichetare) and radiation (radiere).",
+            "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "station": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 3}, "target": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 3}}}}),
+        json!({"name": "topocad_terrain", "description": "TopoCAD module: build Digital Terrain Model (DTM / TIN), generate major/minor contour lines (curbe de nivel) and compute earthwork cut/fill volumes.",
+            "inputSchema": {"type": "object", "properties": {"minorStep": {"type": "number"}, "majorEvery": {"type": "integer", "minimum": 1}, "referenceZ": {"type": "number"}}}}),
+        json!({"name": "cadgen_cadastral", "description": "CADGen module: subdivide a parcel polygon to detach an exact target area (m²) or generate a Romanian ANCPI Cadastral PAD plan and Stereo 70 coordinate inventory table.",
+            "inputSchema": {"type": "object", "properties": {"parcelId": {"type": "string"}, "targetArea": {"type": "number"}, "vertical": {"type": "boolean"}, "epsg": {"type": "integer", "minimum": 1024}}}}),
     ];
     if has_ui {
         tools.push(json!({"name": "screenshot", "description": "Screenshot the CADCraft window (PNG).", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}}));
@@ -134,6 +150,32 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, args: &Value) -> Result<Value,
         "open" => b.call("app.open", a),
         "save" => b.call("app.save", a),
         "cancel" => b.call("cmdline.key", json!({"key": "escape"})),
+        "osm_import" => b.call("engine.execute", json!({"command": "osmimport", "params": a})),
+        "crs_transform" => b.call("engine.execute", json!({"command": "lascrs", "params": a})),
+        "pointcloud_rlv" => b.call("engine.execute", json!({"command": "autorlv", "params": a})),
+        "pointcloud_auto3d" => b.call("engine.execute", json!({"command": "auto3d", "params": a})),
+        "pointcloud_classify" => b.call("engine.execute", json!({"command": "autovectorize", "params": a})),
+        "topolt_survey" => {
+            if a.get("station").is_some() && a.get("target").is_some() {
+                b.call("engine.execute", json!({"command": "pichetare", "params": a}))
+            } else {
+                b.call("engine.execute", json!({"command": "raportcoo", "params": a}))
+            }
+        }
+        "topocad_terrain" => {
+            if a.get("referenceZ").is_some() {
+                b.call("engine.execute", json!({"command": "volumetopo", "params": a}))
+            } else {
+                b.call("engine.execute", json!({"command": "curbenivel", "params": a}))
+            }
+        }
+        "cadgen_cadastral" => {
+            if a.get("targetArea").is_some() {
+                b.call("engine.execute", json!({"command": "parcelare", "params": a}))
+            } else {
+                b.call("engine.execute", json!({"command": "padcadastru", "params": a}))
+            }
+        }
         "screenshot" => b.call("ui.screenshot", a),
         "ui_inspect" => b.call("ui.inspect", json!({})),
         "ui_click" => b.call("ui.pointer", a),
