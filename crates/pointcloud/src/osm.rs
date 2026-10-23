@@ -117,10 +117,8 @@ pub fn project_lat_lon(epsg: u32, lat: f64, lon: f64) -> Option<[f64; 2]> {
 /// Parse an Overpass API JSON response (`elements: [...]`) and project all features into `epsg`.
 pub fn parse_overpass_json(json_text: &str, epsg: u32) -> Result<OsmDataset, String> {
     let root: serde_json::Value = serde_json::from_str(json_text).map_err(|e| format!("invalid Overpass JSON: {e}"))?;
-    let elements = root
-        .get("elements")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "missing `elements` array in Overpass JSON".to_string())?;
+    let elements =
+        root.get("elements").and_then(serde_json::Value::as_array).ok_or_else(|| "missing `elements` array in Overpass JSON".to_string())?;
 
     let mut nodes: HashMap<u64, [f64; 2]> = HashMap::new();
     let mut origin_offset: Option<[f64; 2]> = None;
@@ -136,11 +134,7 @@ pub fn parse_overpass_json(json_text: &str, epsg: u32) -> Result<OsmDataset, Str
         }
     }
 
-    let mut dataset = OsmDataset {
-        epsg,
-        origin_offset: origin_offset.unwrap_or([0.0, 0.0]),
-        ..OsmDataset::default()
-    };
+    let mut dataset = OsmDataset { epsg, origin_offset: origin_offset.unwrap_or([0.0, 0.0]), ..OsmDataset::default() };
 
     for el in elements {
         let Some(id) = el.get("id").and_then(serde_json::Value::as_u64) else { continue };
@@ -181,10 +175,7 @@ pub fn parse_overpass_json(json_text: &str, epsg: u32) -> Result<OsmDataset, Str
                 continue;
             }
             if tags.contains_key("building") {
-                let levels = tag_str("building:levels")
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .map(|l| l.clamp(1, 80))
-                    .unwrap_or(2);
+                let levels = tag_str("building:levels").and_then(|s| s.parse::<u32>().ok()).map(|l| l.clamp(1, 80)).unwrap_or(2);
                 let height_m = tag_str("height")
                     .and_then(|s| s.trim_end_matches('m').trim().parse::<f64>().ok())
                     .filter(|h| h.is_finite() && *h > 1.5)
@@ -202,15 +193,7 @@ pub fn parse_overpass_json(json_text: &str, epsg: u32) -> Result<OsmDataset, Str
                         position: centroid,
                     });
                 }
-                dataset.buildings.push(OsmBuilding {
-                    id,
-                    name: tag_str("name"),
-                    street,
-                    house_number,
-                    levels,
-                    height_m,
-                    polygon: pts,
-                });
+                dataset.buildings.push(OsmBuilding { id, name: tag_str("name"), street, house_number, levels, height_m, polygon: pts });
             } else if let Some(hw) = tag_str("highway") {
                 let width_m = match hw.as_str() {
                     "primary" | "trunk" => 11.0,
@@ -219,20 +202,9 @@ pub fn parse_overpass_json(json_text: &str, epsg: u32) -> Result<OsmDataset, Str
                     "service" | "living_street" => 4.5,
                     _ => 3.5,
                 };
-                dataset.roads.push(OsmRoad {
-                    id,
-                    kind: hw,
-                    name: tag_str("name"),
-                    width_m,
-                    points: pts,
-                });
+                dataset.roads.push(OsmRoad { id, kind: hw, name: tag_str("name"), width_m, points: pts });
             } else if let Some(lu) = tag_str("landuse").or_else(|| tag_str("boundary")) {
-                dataset.parcels.push(OsmParcel {
-                    id,
-                    category: lu,
-                    label: tag_str("name").or_else(|| tag_str("ref")),
-                    polygon: pts,
-                });
+                dataset.parcels.push(OsmParcel { id, category: lu, label: tag_str("name").or_else(|| tag_str("ref")), polygon: pts });
             }
         }
     }
@@ -331,20 +303,9 @@ pub fn parse_osm_xml(xml: &str, epsg: u32) -> Result<OsmDataset, String> {
                             polygon: pts,
                         });
                     } else if let Some(hw) = tags.get("highway").cloned() {
-                        dataset.roads.push(OsmRoad {
-                            id,
-                            kind: hw,
-                            name: tags.get("name").cloned(),
-                            width_m: 7.0,
-                            points: pts,
-                        });
+                        dataset.roads.push(OsmRoad { id, kind: hw, name: tags.get("name").cloned(), width_m: 7.0, points: pts });
                     } else if let Some(lu) = tags.get("landuse").or_else(|| tags.get("boundary")).cloned() {
-                        dataset.parcels.push(OsmParcel {
-                            id,
-                            category: lu,
-                            label: tags.get("name").cloned(),
-                            polygon: pts,
-                        });
+                        dataset.parcels.push(OsmParcel { id, category: lu, label: tags.get("name").cloned(), polygon: pts });
                     }
                 }
             }

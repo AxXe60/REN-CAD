@@ -107,6 +107,7 @@ mod native {
         current_style_names(&mut doc);
         table_merges(&mut doc);
         table_style_rows(&mut doc, false);
+        dimension_flags(&mut doc, false);
         let orphans = drop_orphaned_dgn_components(&mut doc);
         if orphans > 0 {
             let (s, were) = if orphans == 1 { ("", "was") } else { ("s", "were") };
@@ -290,14 +291,24 @@ mod native {
         }
     }
 
-    /// The DWG dimension flags byte. Its bit 1 is DXF group 70's bit 32 (ODA DWG specification,
-    /// common dimension data), which acadrust keeps no copy of from DXF: it is set here as
-    /// CADCraft's DXF writer always sets it (#1094). Bit 0, the opposite of group 70's bit 128,
-    /// acadrust 0.6.5 reads and writes itself.
-    fn dimension_flags(doc: &mut acadrust::CadDocument) {
+    /// The DWG dimension flags byte. Its bit 0 is the opposite of DXF group 70's bit 128 (set: the
+    /// text is at its default position) and its bit 1 is group 70's bit 32 (ODA DWG
+    /// specification, common dimension data). Without a care for this byte, every dimension of a
+    /// DWG CADCraft writes is user-positioned for AutoCAD (#1094), and every dimension of an
+    /// AutoCAD DWG is read as user-positioned. `to_dwg` sets the byte up for the writer: bit 32,
+    /// which the DXF reader leaves out of it; otherwise `text_user_positioned` is read back from
+    /// bit 0 after a DWG is read. acadrust 0.6.4 mirrored DXF group 70's bits when it wrote the
+    /// DWG flags byte, so a flip of the user-positioned field was needed here first; 0.6.6
+    /// follows the ODA specification, so the field goes through untouched.
+    fn dimension_flags(doc: &mut acadrust::CadDocument, to_dwg: bool) {
         for e in doc.entities_mut() {
             let acadrust::entities::EntityType::Dimension(d) = e else { continue };
-            d.base_mut().dwg_flags_byte |= 0x02;
+            let b = d.base_mut();
+            if to_dwg {
+                b.dwg_flags_byte |= 0x02;
+            } else {
+                b.text_user_positioned = b.dwg_flags_byte & 0x01 == 0;
+            }
         }
     }
 
@@ -538,7 +549,7 @@ mod native {
         }
         other_layout_owners(&mut doc);
         table_style_rows(&mut doc, true);
-        dimension_flags(&mut doc);
+        dimension_flags(&mut doc, true);
         drop_unwritable(&mut doc);
         current_dimstyle(&mut doc);
         add_variable_dictionary(&mut doc);

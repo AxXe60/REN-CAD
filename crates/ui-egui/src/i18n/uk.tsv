@@ -1410,3 +1410,38 @@
 	Attach Point Cloud to Drawing	Приєднати хмару до креслення
 	Attach to the drawing	Приєднати до креслення
 	Scan file	Файл сканування
+	AI Classify & Vectorize (Buildings, Fences, Poles, Roads, Ditches)	AI-класифікація та векторизація (будівлі, паркани, стовпи, дороги, канави)
+	AI Classify & Vectorize Topography	AI-класифікація та векторизація топографії
+	Auto-3D Building (Walls, Slabs, Roof)	Авто-3D будівля (стіни, плити, дах)
+	Auto-3D Building Structure from Point Cloud	Авто-3D конструкція будівлі з хмари точок
+	Auto-RLV 2D & Room Schedule from Point Cloud	Авто-RLV 2D та відомість приміщень з хмари точок
+	Auto-RLV 2D (Apartment Releveu)	Авто-RLV 2D (обмір квартири)
+	Build DTM / TIN	Побудова DTM / TIN
+	Build Overpass Query & Project BBox into CRS	Формування запиту Overpass та проєкція BBox у CRS
+	CADGen	CADGen
+	CADGen ANCPI Cadastral PAD & Coordinate Inventory	CADGen кадастровий PAD ANCPI та відомість координат
+	CADGen Exact Area Parcel Subdivision	CADGen поділ ділянки з точною площею
+	Cut & Fill Volumes (Volum Săpătură / Umplutură)	Об'єми виїмки та насипу (Volum Săpătură / Umplutură)
+	Filter Interior Furniture (No Furniture)	Фільтр внутрішніх меблів (без меблів)
+	Filter Interior Furniture from Point Cloud	Фільтр внутрішніх меблів з хмари точок
+	Generate Cadastral PAD & Stereo 70 Inventory	Створення кадастрового PAD та відомості Stereo 70
+	Generate Contour Lines (Curbe de Nivel)	Створення горизонталей (Curbe de Nivel)
+	Import .OSM / Overpass JSON...	Імпорт .OSM / Overpass JSON...
+	Import OpenStreetMap (.osm / Overpass JSON) in CRS	Імпорт OpenStreetMap (.osm / Overpass JSON) у CRS
+	Longitudinal Profile (Profil Longitudinal)	Поздовжній профіль (Profil Longitudinal)
+	OpenStreetMap & CRS	OpenStreetMap та CRS
+	Overpass Live BBox Query...	Живий запит BBox до Overpass...
+	Parcel Subdivision (Detașare Suprafață)	Поділ ділянки (Detașare Suprafață)
+	Point Cloud & RLV	Хмара точок та RLV
+	Radiation (Radiere)	Радіальна зйомка (Radiere)
+	Report Points (.COO / .CSV)	Відомість точок (.COO / .CSV)
+	Stakeout (Pichetare)	Розбивка (Pichetare)
+	TopoCAD	TopoCAD
+	TopoCAD Build Digital Terrain Model (TIN / DTM)	TopoCAD побудова цифрової моделі рельєфу (TIN / DTM)
+	TopoCAD Cut & Fill Volume Calculation	TopoCAD розрахунок об'ємів виїмки та насипу
+	TopoCAD Generate Contour Lines	TopoCAD створення горизонталей
+	TopoCAD Longitudinal & Cross Profile	TopoCAD поздовжній та поперечний профілі
+	TopoLT	TopoLT
+	TopoLT Radiation Calculation	TopoLT розрахунок радіальної зйомки
+	TopoLT Report Survey Points (.COO / .CSV)	TopoLT відомість точок зйомки (.COO / .CSV)
+	TopoLT Stakeout Calculation	TopoLT розрахунок розбивки

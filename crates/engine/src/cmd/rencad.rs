@@ -84,11 +84,7 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 fn active_cloud_points(s: &Session, p: &Value) -> Vec<[f64; 3]> {
-    let idx = p
-        .get("index")
-        .and_then(Value::as_u64)
-        .map(|i| i as usize)
-        .unwrap_or_else(|| s.clouds.len().saturating_sub(1));
+    let idx = p.get("index").and_then(Value::as_u64).map(|i| i as usize).unwrap_or_else(|| s.clouds.len().saturating_sub(1));
     if let Some(cloud) = s.clouds.get(idx) {
         let pts = cloud.world_points();
         if !pts.is_empty() {
@@ -227,12 +223,7 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
 
     let mut wall_strokes = 0usize;
     for w in &bld.walls_3d {
-        let poly = [
-            w.base_p1,
-            w.base_p2,
-            [w.base_p2[0], w.base_p2[1], w.top_z],
-            [w.base_p1[0], w.base_p1[1], w.top_z],
-        ];
+        let poly = [w.base_p1, w.base_p2, [w.base_p2[0], w.base_p2[1], w.top_z], [w.base_p1[0], w.base_p1[1], w.top_z]];
         s.sketch.add(&poly, "BIM_3D_WALLS", true);
         let a = Vec2::new(w.base_p1[0], w.base_p1[1]);
         let b = Vec2::new(w.base_p2[0], w.base_p2[1]);
@@ -323,12 +314,7 @@ fn autovectorize(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn osmimport(s: &mut Session, p: &Value) -> Result<Value> {
-    let epsg = p
-        .get("epsg")
-        .and_then(Value::as_u64)
-        .map(|v| v as u32)
-        .or_else(|| s.crs.as_ref().and_then(|c| c.epsg))
-        .unwrap_or(31700);
+    let epsg = p.get("epsg").and_then(Value::as_u64).map(|v| v as u32).or_else(|| s.crs.as_ref().and_then(|c| c.epsg)).unwrap_or(31700);
 
     let dataset = if let Some(xml) = p.get("xml").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
         cadcraft_pointcloud::parse_osm_xml(xml, epsg).map_err(EngineError::Other)?
@@ -436,13 +422,7 @@ fn raportcoo(s: &mut Session, p: &Value) -> Result<Value> {
     for pt in &pts {
         let local = [pt.x - ox, pt.y - oy];
         let _ = add_on_layer(s, "TOPOLT_POINTS", circle(Vec2::new(local[0], local[1]), 0.30))?;
-        let _ = add_label(
-            s,
-            "TOPOLT_LABELS",
-            [local[0] + 0.4, local[1] + 0.2],
-            0.35,
-            format!("{} Z={:.2} ({})", pt.nr, pt.z, pt.code),
-        )?;
+        let _ = add_label(s, "TOPOLT_LABELS", [local[0] + 0.4, local[1] + 0.2], 0.35, format!("{} Z={:.2} ({})", pt.nr, pt.z, pt.code))?;
     }
     let formatted = cadcraft_pointcloud::format_coo(&pts);
     Ok(json!({
@@ -458,25 +438,13 @@ fn pichetare(p: &Value) -> Result<Value> {
         .get("station")
         .and_then(Value::as_array)
         .filter(|a| a.len() >= 2)
-        .map(|a| {
-            [
-                a[0].as_f64().unwrap_or(0.0),
-                a[1].as_f64().unwrap_or(0.0),
-                a.get(2).and_then(Value::as_f64).unwrap_or(0.0),
-            ]
-        })
+        .map(|a| [a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0), a.get(2).and_then(Value::as_f64).unwrap_or(0.0)])
         .ok_or_else(|| EngineError::Other("`station` [x, y, z] is required".to_string()))?;
     let tg = p
         .get("target")
         .and_then(Value::as_array)
         .filter(|a| a.len() >= 2)
-        .map(|a| {
-            [
-                a[0].as_f64().unwrap_or(0.0),
-                a[1].as_f64().unwrap_or(0.0),
-                a.get(2).and_then(Value::as_f64).unwrap_or(0.0),
-            ]
-        })
+        .map(|a| [a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0), a.get(2).and_then(Value::as_f64).unwrap_or(0.0)])
         .ok_or_else(|| EngineError::Other("`target` [x, y, z] is required".to_string()))?;
 
     let el = cadcraft_pointcloud::compute_stakeout(st, tg);
@@ -501,13 +469,7 @@ fn radiere(s: &mut Session, p: &Value) -> Result<Value> {
         .get("station")
         .and_then(Value::as_array)
         .filter(|a| a.len() >= 2)
-        .map(|a| {
-            [
-                a[0].as_f64().unwrap_or(0.0),
-                a[1].as_f64().unwrap_or(0.0),
-                a.get(2).and_then(Value::as_f64).unwrap_or(0.0),
-            ]
-        })
+        .map(|a| [a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0), a.get(2).and_then(Value::as_f64).unwrap_or(0.0)])
         .unwrap_or([0.0, 0.0, 0.0]);
     let dist = p
         .get("dist")

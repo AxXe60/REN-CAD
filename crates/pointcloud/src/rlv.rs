@@ -188,9 +188,7 @@ pub fn filter_interior_furniture(points: &[[f64; 3]], cell_xy: f64, slab_margin:
             continue;
         }
         let key = ((p[0] * inv).floor() as i64, (p[1] * inv).floor() as i64);
-        let is_wall = columns
-            .get(&key)
-            .is_some_and(|&(z_lo, z_hi, count)| (z_hi - z_lo) >= min_span && count >= 3);
+        let is_wall = columns.get(&key).is_some_and(|&(z_lo, z_hi, count)| (z_hi - z_lo) >= min_span && count >= 3);
         if is_wall {
             keep_mask.push(true);
             structural_points += 1;
@@ -200,14 +198,7 @@ pub fn filter_interior_furniture(points: &[[f64; 3]], cell_xy: f64, slab_margin:
         }
     }
 
-    FurnitureFilterResult {
-        total_points: points.len(),
-        structural_points,
-        furniture_points,
-        floor_z,
-        ceiling_z,
-        keep_mask,
-    }
+    FurnitureFilterResult { total_points: points.len(), structural_points, furniture_points, floor_z, ceiling_z, keep_mask }
 }
 
 /// Extract a complete 2D Releveu (`AutoRlvResult`) from a point cloud:
@@ -331,30 +322,10 @@ pub fn extract_auto_rlv(points: &[[f64; 3]], remove_furniture: bool) -> AutoRlvR
     ];
 
     let dimensions = vec![
-        RlvDimension {
-            p1: [min_x, min_y + 0.45],
-            p2: [x_mid, min_y + 0.45],
-            length_m: round2(r1_w),
-            label: format!("{:.2} m", r1_w),
-        },
-        RlvDimension {
-            p1: [min_x + 0.45, min_y],
-            p2: [min_x + 0.45, max_y],
-            length_m: round2(r1_h),
-            label: format!("{:.2} m", r1_h),
-        },
-        RlvDimension {
-            p1: [x_mid, max_y - 0.45],
-            p2: [max_x, max_y - 0.45],
-            length_m: round2(r2_w),
-            label: format!("{:.2} m", r2_w),
-        },
-        RlvDimension {
-            p1: [max_x - 0.45, y_mid],
-            p2: [max_x - 0.45, max_y],
-            length_m: round2(r2_h),
-            label: format!("{:.2} m", r2_h),
-        },
+        RlvDimension { p1: [min_x, min_y + 0.45], p2: [x_mid, min_y + 0.45], length_m: round2(r1_w), label: format!("{:.2} m", r1_w) },
+        RlvDimension { p1: [min_x + 0.45, min_y], p2: [min_x + 0.45, max_y], length_m: round2(r1_h), label: format!("{:.2} m", r1_h) },
+        RlvDimension { p1: [x_mid, max_y - 0.45], p2: [max_x, max_y - 0.45], length_m: round2(r2_w), label: format!("{:.2} m", r2_w) },
+        RlvDimension { p1: [max_x - 0.45, y_mid], p2: [max_x - 0.45, max_y], length_m: round2(r2_h), label: format!("{:.2} m", r2_h) },
     ];
 
     let total_usable_area_m2 = round2(rooms.iter().map(|r| r.area_m2).sum());
@@ -384,12 +355,7 @@ pub fn extract_auto_3d_building(points: &[[f64; 3]], include_roof: bool) -> Auto
     let walls_3d: Vec<Wall3d> = rlv
         .walls
         .iter()
-        .map(|w| Wall3d {
-            base_p1: [w.p1[0], w.p1[1], floor_z],
-            base_p2: [w.p2[0], w.p2[1], floor_z],
-            top_z: ceiling_z,
-            thickness: w.thickness,
-        })
+        .map(|w| Wall3d { base_p1: [w.p1[0], w.p1[1], floor_z], base_p2: [w.p2[0], w.p2[1], floor_z], top_z: ceiling_z, thickness: w.thickness })
         .collect();
 
     let mut min_x = f64::INFINITY;
@@ -414,23 +380,13 @@ pub fn extract_auto_3d_building(points: &[[f64; 3]], include_roof: bool) -> Auto
     let mut slabs_and_roof = vec![
         SlabOrRoof3d {
             kind: "floor_slab",
-            vertices: vec![
-                [min_x, min_y, floor_z],
-                [max_x, min_y, floor_z],
-                [max_x, max_y, floor_z],
-                [min_x, max_y, floor_z],
-            ],
+            vertices: vec![[min_x, min_y, floor_z], [max_x, min_y, floor_z], [max_x, max_y, floor_z], [min_x, max_y, floor_z]],
             elevation_m: floor_z,
             thickness_m: 0.15,
         },
         SlabOrRoof3d {
             kind: "ceiling_slab",
-            vertices: vec![
-                [min_x, min_y, ceiling_z],
-                [max_x, min_y, ceiling_z],
-                [max_x, max_y, ceiling_z],
-                [min_x, max_y, ceiling_z],
-            ],
+            vertices: vec![[min_x, min_y, ceiling_z], [max_x, min_y, ceiling_z], [max_x, max_y, ceiling_z], [min_x, max_y, ceiling_z]],
             elevation_m: ceiling_z,
             thickness_m: 0.15,
         },
@@ -441,23 +397,13 @@ pub fn extract_auto_3d_building(points: &[[f64; 3]], include_roof: bool) -> Auto
         let mid_y = (min_y + max_y) * 0.5;
         slabs_and_roof.push(SlabOrRoof3d {
             kind: "roof_south_slope",
-            vertices: vec![
-                [min_x, min_y, ceiling_z],
-                [max_x, min_y, ceiling_z],
-                [max_x, mid_y, ridge_z],
-                [min_x, mid_y, ridge_z],
-            ],
+            vertices: vec![[min_x, min_y, ceiling_z], [max_x, min_y, ceiling_z], [max_x, mid_y, ridge_z], [min_x, mid_y, ridge_z]],
             elevation_m: ridge_z,
             thickness_m: 0.18,
         });
         slabs_and_roof.push(SlabOrRoof3d {
             kind: "roof_north_slope",
-            vertices: vec![
-                [min_x, max_y, ceiling_z],
-                [max_x, max_y, ceiling_z],
-                [max_x, mid_y, ridge_z],
-                [min_x, mid_y, ridge_z],
-            ],
+            vertices: vec![[min_x, max_y, ceiling_z], [max_x, max_y, ceiling_z], [max_x, mid_y, ridge_z], [min_x, mid_y, ridge_z]],
             elevation_m: ridge_z,
             thickness_m: 0.18,
         });

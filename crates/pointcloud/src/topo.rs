@@ -87,11 +87,7 @@ pub fn classify_topographic_ai(points: &[[f64; 3]]) -> TopoClassifyReport {
         global_min_z = 0.0;
     }
 
-    let mut report = TopoClassifyReport {
-        total_points: points.len(),
-        classes: Vec::with_capacity(points.len()),
-        ..TopoClassifyReport::default()
-    };
+    let mut report = TopoClassifyReport { total_points: points.len(), classes: Vec::with_capacity(points.len()), ..TopoClassifyReport::default() };
 
     for p in points {
         if !p[0].is_finite() || !p[1].is_finite() || !p[2].is_finite() {
@@ -109,11 +105,7 @@ pub fn classify_topographic_ai(points: &[[f64; 3]]) -> TopoClassifyReport {
         let mut occupied_neighbours = 0usize;
         for dx in -1i64..=1 {
             for dy in -1i64..=1 {
-                if (dx != 0 || dy != 0)
-                    && grid_stats
-                        .get(&(key.0 + dx, key.1 + dy))
-                        .is_some_and(|&(_, hi, _)| (hi - z_lo) > 1.2)
-                {
+                if (dx != 0 || dy != 0) && grid_stats.get(&(key.0 + dx, key.1 + dy)).is_some_and(|&(_, hi, _)| (hi - z_lo) > 1.2) {
                     occupied_neighbours += 1;
                 }
             }
@@ -221,34 +213,17 @@ pub fn vectorize_topography(points: &[[f64; 3]], classes: &[u8]) -> VectorizedTo
     ]];
 
     let roads = vec![
-        vec![
-            [round3(min_x), round3(min_y + h * 0.05), z0],
-            [round3(max_x), round3(min_y + h * 0.05), z0],
-        ],
-        vec![
-            [round3(min_x), round3(min_y + h * 0.15), z0],
-            [round3(max_x), round3(min_y + h * 0.15), z0],
-        ],
+        vec![[round3(min_x), round3(min_y + h * 0.05), z0], [round3(max_x), round3(min_y + h * 0.05), z0]],
+        vec![[round3(min_x), round3(min_y + h * 0.15), z0], [round3(max_x), round3(min_y + h * 0.15), z0]],
     ];
 
-    let curbs = vec![vec![
-        [round3(min_x), round3(min_y + h * 0.16), round3(z0 + 0.15)],
-        [round3(max_x), round3(min_y + h * 0.16), round3(z0 + 0.15)],
-    ]];
+    let curbs =
+        vec![vec![[round3(min_x), round3(min_y + h * 0.16), round3(z0 + 0.15)], [round3(max_x), round3(min_y + h * 0.16), round3(z0 + 0.15)]]];
 
-    let ditches = vec![vec![
-        [round3(min_x), round3(min_y + h * 0.20), round3(z0 - 0.35)],
-        [round3(max_x), round3(min_y + h * 0.20), round3(z0 - 0.35)],
-    ]];
+    let ditches =
+        vec![vec![[round3(min_x), round3(min_y + h * 0.20), round3(z0 - 0.35)], [round3(max_x), round3(min_y + h * 0.20), round3(z0 - 0.35)]]];
 
-    VectorizedTopo {
-        buildings,
-        fences,
-        poles,
-        roads,
-        curbs,
-        ditches,
-    }
+    VectorizedTopo { buildings, fences, poles, roads, curbs, ditches }
 }
 
 // ============================================================================
@@ -277,11 +252,7 @@ pub fn parse_coo(text: &str) -> Vec<TopoPoint> {
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
             continue;
         }
-        let tokens: Vec<&str> = trimmed
-            .split([',', ';', '\t', ' '])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
+        let tokens: Vec<&str> = trimmed.split([',', ';', '\t', ' ']).map(str::trim).filter(|s| !s.is_empty()).collect();
         if tokens.len() < 3 {
             continue;
         }
@@ -292,19 +263,9 @@ pub fn parse_coo(text: &str) -> Vec<TopoPoint> {
         let Some(y) = tokens.get(2).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite()) else {
             continue;
         };
-        let z = tokens
-            .get(3)
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .unwrap_or(0.0);
+        let z = tokens.get(3).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(0.0);
         let code = tokens.get(4).copied().unwrap_or("TOPO").to_string();
-        out.push(TopoPoint {
-            nr: tokens[0].to_string(),
-            x,
-            y,
-            z,
-            code,
-        });
+        out.push(TopoPoint { nr: tokens[0].to_string(), x, y, z, code });
     }
     out
 }
@@ -365,11 +326,7 @@ pub fn compute_stakeout(station: [f64; 3], target: [f64; 3]) -> StakeoutElement 
 /// Compute a radiated 3D point (`radiere`) from `station`, horizontal distance `dist_2d`, bearing in grads `bearing_gon`, and `dz`.
 pub fn compute_radiation(station: [f64; 3], dist_2d: f64, bearing_gon: f64, dz: f64) -> [f64; 3] {
     let rad = (bearing_gon * 0.9).to_radians();
-    [
-        round3(station[0] + dist_2d * rad.sin()),
-        round3(station[1] + dist_2d * rad.cos()),
-        round3(station[2] + dz),
-    ]
+    [round3(station[0] + dist_2d * rad.sin()), round3(station[1] + dist_2d * rad.cos()), round3(station[2] + dz)]
 }
 
 // ============================================================================
@@ -418,11 +375,7 @@ pub struct VolumeReport {
 /// using inverse-distance elevation interpolation per grid node so any point set (sparse survey or
 /// dense LiDAR ground) produces a watertight, deterministic triangulation.
 pub fn build_tin(points: &[[f64; 3]], grid_steps: usize) -> Vec<TinTriangle> {
-    let valid: Vec<[f64; 3]> = points
-        .iter()
-        .copied()
-        .filter(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite())
-        .collect();
+    let valid: Vec<[f64; 3]> = points.iter().copied().filter(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite()).collect();
     if valid.len() < 3 {
         return Vec::new();
     }
@@ -523,12 +476,7 @@ pub fn extract_contours(tin: &[TinTriangle], minor_step: f64, major_every: usize
                 }
             }
             if hits.len() >= 2 {
-                segments.push(ContourSegment {
-                    elevation_m: z,
-                    is_major,
-                    p1: hits[0],
-                    p2: hits[1],
-                });
+                segments.push(ContourSegment { elevation_m: z, is_major, p1: hits[0], p2: hits[1] });
             }
         }
     }
@@ -807,14 +755,7 @@ pub fn build_pad_inventory(parcel_id: &str, poly: &[[f64; 2]], offset_east_north
         3857 => "WGS 84 / Web Mercator".to_string(),
         _ => format!("EPSG:{epsg}"),
     };
-    Ok(PadInventory {
-        parcel_id: parcel_id.to_string(),
-        crs_name,
-        epsg,
-        measured_area_m2: round2(area),
-        perimeter_m: round2(perim),
-        rows,
-    })
+    Ok(PadInventory { parcel_id: parcel_id.to_string(), crs_name, epsg, measured_area_m2: round2(area), perimeter_m: round2(perim), rows })
 }
 
 fn round2(v: f64) -> f64 {
@@ -849,12 +790,7 @@ mod tests {
 
     #[test]
     fn tin_contours_and_volumes_are_computed() {
-        let pts = vec![
-            [0.0, 0.0, 100.0],
-            [20.0, 0.0, 102.0],
-            [20.0, 20.0, 104.0],
-            [0.0, 20.0, 102.0],
-        ];
+        let pts = vec![[0.0, 0.0, 100.0], [20.0, 0.0, 102.0], [20.0, 20.0, 104.0], [0.0, 20.0, 102.0]];
         let tin = build_tin(&pts, 4);
         assert_eq!(tin.len(), 32);
         let contours = extract_contours(&tin, 0.5, 5);

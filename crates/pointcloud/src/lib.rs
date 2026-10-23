@@ -54,8 +54,8 @@ pub use spectrum::Spectrum;
 pub use topo::{
     CLASS_CURB, CLASS_DITCH, CLASS_FENCE, CLASS_POLE, ContourSegment, PadInventory, PadInventoryRow, ParcelSubdivision, ProfileStation,
     StakeoutElement, TinTriangle, TopoClassifyReport, TopoPoint, VectorizedTopo, VolumeReport, build_pad_inventory, build_tin,
-    classify_topographic_ai, compute_cut_fill_volume, compute_radiation, compute_stakeout, extract_contours, extract_profile, format_coo,
-    parse_coo, subdivide_parcel_by_area, topo_class_name, vectorize_topography,
+    classify_topographic_ai, compute_cut_fill_volume, compute_radiation, compute_stakeout, extract_contours, extract_profile, format_coo, parse_coo,
+    subdivide_parcel_by_area, topo_class_name, vectorize_topography,
 };
 
 /// An axis-aligned box in world units.
