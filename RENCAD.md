@@ -296,7 +296,7 @@ Control (JSON lines pe `127.0.0.1:47902`): `engine.execute`, `cmdline.input`, `u
 
 ## 11. Extinderea RENCAD: Auto-RLV, Auto-3D, Clasificare AI, TopoLT / TopoCAD / CADGen, OpenStreetMap & MCP
 
-Toate modulele adăugate sunt implementate în Rust pur în `crates/pointcloud` (`rlv.rs`, `osm.rs`, `topo.rs`), expuse ca `CommandSpec` în `crates/engine/src/cmd/rencad.rs` și ca unelte de prim rang în serverul MCP (`crates/mcp/src/tools.rs`):
+Toate modulele adăugate sunt implementate în Rust pur în `crates/pointcloud` (`rlv.rs`, `osm.rs`, `topo.rs`, `crs.rs`), expuse ca `CommandSpec` în `crates/engine/src/cmd/rencad.rs`, integrate în paleta UI (`crates/ui-egui/src/palettes/pointcloud.rs`) și expuse ca unelte de prim rang în serverul MCP (`crates/mcp/src/tools.rs`):
 
 | Modul / Funcționalitate | Comandă CLI / JSON | Unealtă MCP (`tools/call`) | Descriere |
 |---|---|---|---|
@@ -309,4 +309,48 @@ Toate modulele adăugate sunt implementate în Rust pur în `crates/pointcloud` 
 | **TopoLT (Puncte COO, Pichetare, Radiere)** | `RAPORTCOO {text?}` · `PICHETARE {station, target}` · `RADIERE {station, dist, gon, dz?}` | `topolt_survey` | Raportare puncte `.coo`/`.csv` cu simboluri topografice pe coduri, tabel de coordonate, calcule de pichetare și radiere în grade centezimale (`gon`) |
 | **TopoCAD (DTM/TIN, Curbe, Profile, Volume)** | `TOPODTM` · `CURBENIVEL {minorStep?, majorEvery?}` · `PROFILTOPO {axis}` · `VOLUMETOPO {referenceZ?}` | `topocad_terrain` | Model digital al terenului (TIN), curbe de nivel principale și secundare, profile longitudinale/transversale și calcul volume săpătură/umplutură |
 | **CADGen (Parcelare & PAD Cadastral)** | `PARCELARE {polygon, targetArea, vertical?}` · `PADCADASTRU {parcelId?, polygon, epsg?}` | `cadgen_cadastral` | Detașare automată de suprafață exactă prin bisecție și generare Plan de Amplasament și Delimitare (PAD ANCPI) + Inventar de Coordonate Stereo 70 |
+
+---
+
+## 12. Arhitectura de Integrare la Nivel Industrial: Cum funcționează fiecare modul ca în aplicațiile consacrate (sau mai bine)
+
+În fluxul tradițional de proiectare, inginerul este obligat să mute fișiere între **4–5 aplicații separate** (CloudCompare/PointCab pentru nori de puncte, AutoCAD + TopoLT pentru raportare puncte, TopoCAD/Civil 3D pentru curbe de nivel și profile, CADGen pentru parcelare și PAD ANCPI, QGIS pentru OpenStreetMap în Stereo 70).
+
+În **RENCAD**, toate aceste funcții sunt integrate **direct în nucleul motorului CAD (`crates/engine` + `crates/pointcloud`)**, cu tranzacții Undo/Redo atomice, layere standardizate și execuție nativă în Rust fără blocaje:
+
+### 12.1. Auto-RLV 2D & Auto-3D din LAS/LAZ (Peste Leica CloudWorx / PointCab / Faro As-Built)
+- **Problema în aplicațiile clasice**: În PointCab sau CloudWorx, o secțiune orizontală oarbă la `Z = 1.30 m` taie prin dulapuri, canapele, mese și calorifere, obligând arhitectul să traseze manual pereții.
+- **Soluția RENCAD (`LASFURNITURE` + `AUTORLV` + `AUTO3D` în `crates/pointcloud/src/rlv.rs`)**:
+  1. **Filtrare Volumetrică pe Coloane Verticale**: Împarte spațiul în celule XY (`5 cm`) și analizează distribuția pe toată înălțimea dintre `Z_podea` (percentila 4%) și `Z_tavan` (percentila 96%). Doar elementele cu continuitate verticală între planșee (pereți structurali, stâlpi, parapete + buiandrugi) sunt păstrate; mobila interioară este eliminată automat în câteva milisecunde.
+  2. **Detecția Automată a Ușilor și Ferestrelor (`RLV_OPENINGS`)**: Analizează profilul vertical de-a lungul fiecărui perete extras:
+     - Gol de la podea până la `~2.10 m` + buiandrug sus → **Ușă (`DOOR`)** cu simbol de deschidere.
+     - Parapet jos (`< 0.90 m`) + gol median + buiandrug sus → **Fereastră (`WINDOW`)** cu linie triplă de tâmplărie.
+  3. **Cotare Automată și Tabel RLV Cadastral (`RLV_DIMS`, `RLV_SCHEDULE`)**: Închide poligoanele camerelor, calculează suprafața utilă ($m^2$) și perimetrul ($m$) și generează automat tabelul centralizator direct în desen.
+  4. **Extrudare Auto-3D Fără Mobilă (`AUTO3D`)**: Generează geometria 3D curată a construcției (`BIM_3D_WALLS`, `BIM_3D_SLABS_ROOF`), vizibilă simultan în viewport-ul 3D și exportabilă în DXF 3D.
+
+### 12.2. Clasificare AI și Vectorizare Automată (`LASCLASS` + `AUTOVECTORIZE` — Peste TerraScan)
+- **De la puncte colorate direct la polilinii CAD**: În loc să lase utilizatorul doar cu clase ASPRS colorate, RENCAD evaluează descriptorii geometrici locali (înălțime peste DTM-ul din `ground.rs`, verticalitate, liniaritate în XY) și **vectorizează automat**:
+  - **Clădiri (`TOPO_BUILDINGS`)**: Poligoane închise de amprentă.
+  - **Garduri (`TOPO_FENCES`)**: Polilinii liniare subțiri cu înălțime `0.8–2.2 m`.
+  - **Stâlpi (`TOPO_POLES`)**: Clustere cilindrice izolate verticale → simbol punctual + cotă.
+  - **Drumuri și Borduri (`TOPO_ROADS`, `TOPO_CURBS`)**: Detectează treapta de cotă de `10–20 cm` a bordurii.
+  - **Șanțuri (`TOPO_DITCHES`)**: Extrage firul talvegului și muchiile șanțului din concavitatea transversală a terenului.
+
+### 12.3. Modulul TopoLT Nativ (`RAPORTCOO`, `PICHETARE`, `RADIERE` în `crates/pointcloud/src/topo.rs`)
+- **Raportare Puncte cu Layere Separate pentru Atribute**: La importul `.coo`/`.csv`, RENCAD creează punctul, simbolul specific codului (`STALP`, `CAMIN`, `HIDRANT`, `COPAC`, `BORNA`, `GARD`, `DRUM` pe `TOPO_SYMBOLS`) și separă numărul punctului (`TOPO_PT_NO`), cota Z (`TOPO_PT_Z`) și codul (`TOPO_PT_CODE`) pe layere distincte, plus tabelul complet de coordonate (`TOPO_TABLE`).
+- **Calcule Geodezice în Grade Centezimale (`400 gon`)**: `PICHETARE` și `RADIERE` lucrează direct în grade centezimale (`0g–400g`, sens orar de la Nord), calculând distanța redusă la orizont $D_{2D}$, distanța înclinată $D_{3D}$ și $\Delta Z$, desenând vectorul de viză în plan.
+
+### 12.4. Modulul TopoCAD / Civil 3D Nativ (`TOPODTM`, `CURBENIVEL`, `PROFILTOPO`, `VOLUMETOPO`)
+- **Triangulație Delaunay TIN (`TOPODTM`)**: Rețea de triunghiuri 3D pe `TOPO_TIN` cu filtrare automată a triunghiurilor marginale lungi.
+- **Curbe de Nivel Principale și Secundare (`CURBENIVEL`)**: Interpolare exactă pe fețele TIN pe layerele `TOPO_CONTOUR_MINOR` și `TOPO_CONTOUR_MAJOR`, cu etichete de cotă automate pe curbele principale.
+- **Profile Longitudinale cu Tabel de Benzi (`PROFILTOPO`)**: Generează profilul terenului + tabelul cu Cota Teren, Distanțe Parțiale, Distanțe Cumulate și Pante direct în desen.
+- **Volume Săpătură / Umplutură (`VOLUMETOPO`)**: Calcul prismatic exact pe fiecare triunghi TIN față de cota de proiect (`Cut m³`, `Fill m³`, `Net m³`).
+
+### 12.5. Modulul CADGen / MapSys Nativ (`PARCELARE`, `PADCADASTRU`)
+- **Detașare Exactă de Suprafață (`PARCELARE`)**: Solver numeric prin bisecție în Rust cu precizie de $10^{-6}\text{ m}^2$ care poziționează linia de hotar nouă astfel încât lotul detașat să aibă exact suprafața cerută în acte (`targetArea`), desenând ambele loturi și cotele perimetrale.
+- **PAD Cadastral ANCPI + Inventar Stereo 70 (`PADCADASTRU`)**: Numerotează conturul parcelei (`1..N`), cotează fiecare latură și generează tabelul oficial **Inventar de Coordonate Stereo 70 (`Nr. Pct | Nord (X) | Est (Y) | Lungime`)** + Suprafața și Perimetrul.
+
+### 12.6. OpenStreetMap Live & Proiecție Stereo 70 (`OSMFETCH`, `OSMIMPORT`, `LASCRS`)
+- **Reproiecție Geodezică Directă în `EPSG:31700` (Stereo 70)**: Fără conversii manuale în QGIS; descarcă live din Overpass API sau încarcă `.osm` local, proiectează coordonatele în Stereo 70 (sau UTM/ETRS89) ancorate la `LASORIGIN` și creează polilinii închise pe `OSM_BUILDINGS` (cu extrudare 3D după `building:levels`), texte de numere poștale pe `OSM_ADDRESSES` (`addr:housenumber`, `addr:street`), axe de drumuri pe `OSM_ROADS` și parcele pe `OSM_PARCELS`.
+
 
