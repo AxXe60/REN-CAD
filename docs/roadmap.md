@@ -37,7 +37,8 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M5 | Full resolution, intensity as a spectrum, a 3D-cube grid (walls keep their height), crop box for the walls and the ceiling | done |
 | M6 | 3D camera (35° lens or true ortho, zoom anchored at the cursor, Top/Front/Iso); 3D drafting over the cloud, exported as DXF `LINE`s with Z | done |
 | M7 | Smart snapping (front layer only, `Exact`/`Smooth`), Z lock, axis ortho, per-stroke layers, closed polylines, `3DMEASURE` and the measure tool | done |
-| M9 | Front wall cut and depth cue in the vertex shader (clarity without a depth buffer); colour ramps over the 2%–98% window | done |
+| M9 | Front wall cut and depth cue in the vertex shader; colour ramps over the 2%–98% window | done |
+| M9b | Reading the picture: the clouds draw into the window's depth buffer, so a near point hides a far one; `LASRANGE` names the window a ramp reads, and the palette's sliders, colour legend and intensity profile show exactly what it reads; `LASCOLOR` carries the RGB exposure and contrast, with `auto` from the cloud's own luminance histogram | done |
 | M10a | The ground under the cloud: a morphological filter with a slope correction, classes beside the 16-byte vertex, `LASGROUND`, **Find ground** / **Ground only** | done |
 | M11a | Georeferencing: the CRS the file names (GeoTIFF keys or WKT), shown in the palette and `LASINFO`, written as a `.prj` sidecar next to an exported drawing | done |
 | M11b | The site frame: `LASORIGIN` ties the drawing's (0, 0, 0) to a world point; `LASCRS` declares the system's code for the files that name none | done |
@@ -59,7 +60,7 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M25 | **The cloud belongs to the drawing**: `LASOPEN {attach}` / `LASATTACH` — the drawing *refers* to the scan (the LAS file, the band, the grid, the colour mode and where the scan sits in the drawing) in an `XRECORD` of the named object dictionary; the file keeps no points and the scan is loaded from the disk when the file is opened (done) | done |
 | M26 | The scan that is not on this computer: a relative path beside the drawing, the search in the folders the survey uses, and the choice to look for it by hand (≈ 4–6 h) | planned |
 | M23 | The comparison grown up: a coarse-to-fine registration (ICP) before the comparison, and the least-square local plane instead of the plain nearest point — the two refinements the comparison literature measures (≈ 8–14 h) | planned |
-| M24 | The scan-to-BIM parts that need no learning: the walls detected from the vertical surfaces, the rooms from the wall surfaces, and the openings in them (the geometry route the open Scan-to-BIM tools take) (≈ 20–30 h) | planned |
+| M24 | The scan-to-BIM parts that need no learning — `AUTORLV` / `AUTO3D` run the Cloud2BIM stages: slabs from the vertical histogram, the storeys between them, the walls from a horizontal slice with parallel-face pairing, the closed room zones with the schedule, the opening search in every wall, the cloud-to-model deviation with its furniture clusters, and a self-checked IFC 4 STEP export. Automatic dimensions remain | ≈ 80% (all stages but automatic dimensions done) |
 | M11 | The 3D strokes as real drawing entities — waits for the 3D kernel, so the upstream's own 3D milestone is the blocker | planned |
 | M13 | A height/DSM grid over the band, with contours (≈ 12–18 h) | planned |
 | M14 | A local cache of the decimated pyramid next to the scan, so a 1.8 GB survey opens in a second the second time (≈ 6–10 h) | planned |
@@ -145,6 +146,8 @@ AutoLISP surface, AI features with openly licensed local models, and every remai
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-25 | minor | M24: scan-to-BIM Plan B landed — openings from each wall's elevation raster, cloud-to-model deviation with furniture clusters on `RLV_FURNITURE`, and a self-checked IFC 4 STEP export through `ifc`; automatic dimensions remain |
+| 2026-10-25 | minor | M24: scan-to-BIM Plan A landed — `AUTORLV` and `AUTO3D` now run the Cloud2BIM stages (slabs, storeys, walls, zones) instead of a bounding-box fake; openings, deviation and IFC are Plan B |
 | 2026-10-12 | minor | Block Editor for static blocks landed: "Use blocks" evidence updated; status and hours unchanged (REFEDIT and dynamic blocks remain) |
 | 2026-10-11 | minor | Alpha-gate evidence refreshed for merged work (#459, #525, #528, #160, #186, #564); statuses and hours unchanged |
 | 2026-10-10 | minor | Merged main: fmt fixed, Ukrainian catalog noted in M13, ready for real work 38% |

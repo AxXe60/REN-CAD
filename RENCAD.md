@@ -251,10 +251,15 @@ Exemplu:
 ## 8. Limite / ce nu e încă
 
 - LAZ doar citire; fără streaming COPC (fișierul se deschide dintr-o singură trecere).
-- Fără filtru pe clasificare, fără export ortho PNG/GeoTIFF, fără histogramă de intensitate.
-- Fără depth buffer în 3D: punctele nu se oclud reciproc (bine pentru nori translucizi). Snap-ul
-  prioritizează adâncimea, deci nu sare prin pereți, iar front wall cut + depth cue fac imaginea
-  lizibilă — dar rămân aproximații ale unui depth test adevărat.
+- Fără filtru pe clasificare și fără export ortho PNG/GeoTIFF. Histograma de intensitate există
+  (bin-uri `0..255`), împreună cu histograma de heights; amîndouă alegeau fereastra `2%–98%` a
+  rampei cînd aceasta e `auto`.
+- **Depth buffer**: norul 3D ocupă partea de adîncime a buffer-ului depth-stencil al ferestrei —
+  fiecare păățel al unui punct își scrie adîncimea de vizualizare, iar un punct mai apropiat le
+  ascunde pe cele din spate. Canvas-ul 2D rămîne 2D: el scrie doar partea de stencil (cu care își
+  taie viewport-urile), iar în vedere de plan norul se desenează jos-întâi, cu snap care
+  prioritizează adîncimea, deci nu sare prin pereți. Unde targetul nu are aspect de adîncime
+  (wasm fără depth buffer, ținte de test `Stencil8`), pipeline-ul 3D desenează fără sortarea asta.
 - Fereastra 2%–98% taie valorile extreme: un punct mult mai sus decât restul ia culoarea de sus,
   nu a lui. E prețul contrastului restului.
 - Stroke-urile 3D trăiesc în sesiune; persistă doar prin `3DEXPORT`.
@@ -300,9 +305,9 @@ Toate modulele adăugate sunt implementate în Rust pur în `crates/pointcloud` 
 
 | Modul / Funcționalitate | Comandă CLI / JSON | Unealtă MCP (`tools/call`) | Descriere |
 |---|---|---|---|
-| **Eliminare Mobilă din LAS** | `LASFURNITURE {index?, cell?, slabMargin?, minWallRatio?}` | `pointcloud_rlv` | Filtrare volumetrică pe coloane: păstrează pereții continui și plăcile podea/tavan, eliminând mobila interioară |
-| **Auto-RLV 2D + Tabel Camere** | `AUTORLV {index?, removeFurniture?}` | `pointcloud_rlv` | Detectează pereții (`RLV_WALLS`), golurile de uși și ferestre (`RLV_OPENINGS`), cotele automate (`RLV_DIMS`) și tabelul de suprafețe utile și perimetre (`RLV_SCHEDULE`) |
-| **Auto-3D Construcții (fără mobilă)** | `AUTO3D {index?, roof?}` | `pointcloud_auto3d` | Reconstruiește pereții 3D extrudați (`BIM_3D_WALLS`), planșeele podea/tavan și acoperișul 3D (`BIM_3D_SLABS_ROOF`), fără mobilier |
+| **Eliminare Mobilă din LAS** | `LASFURNITURE {index?, cell?, slabMargin?, minWallRatio?}` | — | Filtrare volumetrică pe coloane: păstrează pereții continui și plăcile podea/tavan, eliminând mobila interioară |
+| **Auto-RLV 2D + Tabel Camere** | `AUTORLV {index?, ifc?, params?}` | `pointcloud_rlv` | Pipeline Cloud2BIM: planșeele (`RLV_SLABS`), nivelurile, pereții detectați din felia orizontală (`RLV_WALLS`), camerele închise (`RLV_ZONES`) și tabelul de suprafețe utile și perimetre (`RLV_SCHEDULE`). Caută golurile din fiecare perete (`RLV_OPENINGS`), măsoară deviația nor–model și desenează ce nu poate fi explicat de model pe `RLV_FURNITURE`, iar cu `ifc` scrie un fișier IFC 4 STEP a cărui graf de entități e recitită și verificată de propriul cititor din acest repository. Rămân de făcut cotele automate (`RLV_DIMS`), pe care le listează în `notAvailable` |
+| **Auto-3D Construcții** | `AUTO3D {index?, ifc?, params?}` | `pointcloud_auto3d` | Extrudează pereții găsiți (`RLV_3D_WALLS`, două fețe per perete) și redesenează planșeele detectate (`RLV_3D_SLABS`). Citește benzile de înălțime ale fiecărui perete pentru a raporta golurile și poate scrie același model ca IFC 4 STEP când `ifc` e dat. Nu inventează acoperiș: apare doar un planșeu găsit deasupra ultimului nivel; cotele automate lipsesc |
 | **Clasificare AI & Vectorizare** | `AUTOVECTORIZE {index?}` | `pointcloud_classify` | Clasifică și vectorizează automat: clădiri (`TOPO_BUILDINGS`), garduri (`TOPO_FENCES`), stâlpi (`TOPO_POLES`), drum (`TOPO_ROADS`), borduri (`TOPO_CURBS`), șanțuri (`TOPO_DITCHES`) |
 | **OpenStreetMap Live & Local `.osm`** | `OSMIMPORT {xml?, json?, epsg?}` · `OSMFETCH {minLat, minLon, maxLat, maxLon, epsg?}` | `osm_import` | Importă clădiri, numere poștale (`addr:housenumber`, `addr:street`), drumuri și parcele în CRS-ul activ (implicit Stereo 70 `EPSG:31700`) |
 | **Sisteme de Coordonate (CRS)** | `LASCRS {epsg, falseEasting?, falseNorthing?}` | `crs_transform` | Stereo 70 (`EPSG:31700`), ETRS89 (`EPSG:4258` / `3035`), WGS 84 (`EPSG:4326`), Web Mercator (`EPSG:3857`), zonele UTM Nord/Sud |
@@ -320,13 +325,13 @@ Toate modulele adăugate sunt implementate în Rust pur în `crates/pointcloud` 
 
 ### 12.1. Auto-RLV 2D & Auto-3D din LAS/LAZ (Peste Leica CloudWorx / PointCab / Faro As-Built)
 - **Problema în aplicațiile clasice**: În PointCab sau CloudWorx, o secțiune orizontală oarbă la `Z = 1.30 m` taie prin dulapuri, canapele, mese și calorifere, obligând arhitectul să traseze manual pereții.
-- **Soluția RENCAD (`LASFURNITURE` + `AUTORLV` + `AUTO3D` în `crates/pointcloud/src/rlv.rs`)**:
-  1. **Filtrare Volumetrică pe Coloane Verticale**: Împarte spațiul în celule XY (`5 cm`) și analizează distribuția pe toată înălțimea dintre `Z_podea` (percentila 4%) și `Z_tavan` (percentila 96%). Doar elementele cu continuitate verticală între planșee (pereți structurali, stâlpi, parapete + buiandrugi) sunt păstrate; mobila interioară este eliminată automat în câteva milisecunde.
-  2. **Detecția Automată a Ușilor și Ferestrelor (`RLV_OPENINGS`)**: Analizează profilul vertical de-a lungul fiecărui perete extras:
-     - Gol de la podea până la `~2.10 m` + buiandrug sus → **Ușă (`DOOR`)** cu simbol de deschidere.
-     - Parapet jos (`< 0.90 m`) + gol median + buiandrug sus → **Fereastră (`WINDOW`)** cu linie triplă de tâmplărie.
-  3. **Cotare Automată și Tabel RLV Cadastral (`RLV_DIMS`, `RLV_SCHEDULE`)**: Închide poligoanele camerelor, calculează suprafața utilă ($m^2$) și perimetrul ($m$) și generează automat tabelul centralizator direct în desen.
-  4. **Extrudare Auto-3D Fără Mobilă (`AUTO3D`)**: Generează geometria 3D curată a construcției (`BIM_3D_WALLS`, `BIM_3D_SLABS_ROOF`), vizibilă simultan în viewport-ul 3D și exportabilă în DXF 3D.
+- **Soluția RENCAD (`AUTORLV` + `AUTO3D` în `crates/pointcloud/src/rlv.rs` și `crates/pointcloud/src/bim/`)**: pipeline-ul Cloud2BIM (Zbirovský & Nezerka, arXiv:2503.11498v1), fără învățare automată:
+  1. **Planșee și niveluri**: histograma verticală pe bin-uri de `5 cm`; un bin la cel puțin `50%` din cel mai înalt este candidat de planșeu, fețele vecine se împerechează într-un planșeu, iar un nivel este banda dintre două planșee, retrasă cu `0.10 m` pe fiecare față.
+  2. **Pereți**: felie orizontală la `0.9–1.0` din înălțimea nivelului, mască de densitate pe celule de `5 cm`, închidere morfologică, contururi simplificate, apoi **împerecherea fețelor paralele** (0.06–0.60 m) într-o singură axă cu grosimea ei. O față singură pe conturul exterior devine perete exterior sintetizat la `0.30 m`; una din interior (curte) nu este inventată.
+  3. **Camere**: capetele axelor se apropie de pereții vecini, fețele se decalează cu jumătate din grosime, iar contururile se închid în poligoane cu suprafață utilă și perimetru (`RLV_ZONES`), tolerând un colț lipsă de până la `0.40 m`.
+  4. **Goluri, deviație, IFC — dar fără cotare automată**: pentru fiecare perete se citește banda lui de înălțime (o singură trecere în streaming peste scan), fața devine un raster `(u, z)` la `2 cm`, pragul de densitate se referă la a 10-a cea mai densă celulă, golurile se umplu în raster și devin uși/ferestre pe `RLV_OPENINGS`. Toate punctele se măsoară apoi față de model (RMSE, medie, max în mm, prag `50 mm`), iar ce nu poate fi explicat de pereți și planșee se grupează în celule de `10 cm` și se desenează pe `RLV_FURNITURE`. Cu `ifc` se scriu planșeele, nivelurile, pereții, golurile și relațiile `IfcRelVoidsElement` / `IfcRelFillsElement` într-un fișier IFC 4 STEP a cărui graf e recitită de propriul cititor din acest repository. **Cotele automate (`RLV_DIMS`) rămân de implementat** — comanda le listează în `notAvailable` și nu desenează nimic pentru ele. Numerele măsurate pe un scan real, inclusiv faptul că la pragul implicit `0.5` acest scan nu scoate niciun gol, sînt în `docs/pointcloud.md`.
+  5. **Tabelul RLV** (`RLV_SCHEDULE`) se completează din camerele găsite: suprafață utilă, perimetru și înălțime liberă pe cameră.
+  6. **Extrudare Auto-3D**: pereții găsiți devin pereți extruzi pe înălțimea nivelului (`RLV_3D_WALLS`), iar planșeele detectate se redesenează ca suprafețe 3D (`RLV_3D_SLABS`), vizibile în viewport-ul 3D. Un acoperiș apare doar dacă scanul are un planșeu deasupra ultimului nivel; nu se inventează o șarpantă.
 
 ### 12.2. Clasificare AI și Vectorizare Automată (`LASCLASS` + `AUTOVECTORIZE` — Peste TerraScan)
 - **De la puncte colorate direct la polilinii CAD**: În loc să lase utilizatorul doar cu clase ASPRS colorate, RENCAD evaluează descriptorii geometrici locali (înălțime peste DTM-ul din `ground.rs`, verticalitate, liniaritate în XY) și **vectorizează automat**:

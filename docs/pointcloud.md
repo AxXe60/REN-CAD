@@ -1,6 +1,6 @@
 # Point clouds (LAS/LAZ) — RENCAD
 
-> **Last reviewed:** 2026-10-21 · **Status:** M11 — the ground filter, the scan's coordinate system, the site frame · **Fork addition**
+> **Last reviewed:** 2026-10-25 · **Status:** M12 — the ground filter, the scan's coordinate system, the site frame, the colouring · **Fork addition**
 
 RENCAD is the working name of this fork of CADCraft (the crates and the binary keep their upstream
 names so the weekly rebase stays a fast-forward). The fork adds point cloud support: M1 read a
@@ -17,9 +17,14 @@ the snap keeps only the **front layer** under the cursor (so it cannot snap thro
 average the scan noise away, the stroke can be held in a horizontal plane (**Z lock**) or on one
 cardinal axis (**ortho**), every stroke carries a **layer**, a polyline can be **closed**, and a
 **measure** tool reports the length, the run in plan and the rise of a segment. M9 makes the picture
-readable without a depth buffer: a **front wall cut** drops the points between the camera and the
-target, a **depth cue** fades the far ones into the background, and the colour ramps run over the
-**2%–98% window** so a few outliers cannot flatten the contrast of the rest.
+readable while the view still had no depth buffer: a **front wall cut** drops the points between the
+camera and the target, a **depth cue** fades the far ones into the background, and the colour ramps
+run over the **2%–98% window** so a few outliers cannot flatten the contrast of the rest. M12 makes
+the colouring and the depth honest: every point carries the colour of its **own** record however the
+band or the grid thinned the file, the 3D points write the window's depth buffer so the wall nearest
+the eye is the wall that is seen, and the picture the user set up — the two windows the ramps read
+through, the two multipliers that lift a dark photo, the opacity — survives a re-read and repaints
+the moment it moves.
 
 ## Commands
 
@@ -115,6 +120,31 @@ and `single:#rrggbb` (or just `#rrggbb`) one flat colour.
 {"index":0,"color":"intensity","message":"Ap 1: colour intensity"}
 ```
 
+A photo is not a ramp, and a scanner's own colours arrive dark: `exposure` (0.25..=4) multiplies
+the RGB and `contrast` (0.25..=4) stretches it about mid grey. `auto: true` takes both from the
+finest level: every point's luminance is put on a sorted list and the 2%–98% span of that list is
+stretched towards four fifths of the scale (the contrast), and the mean is then lifted to 0.55 on
+top of that stretch (the exposure). Both answers stay inside the same bounds as the sliders.
+
+Two things the automatic answer does not do. A file whose colour has no spread — every point the
+same value, which is what a scan without an RGB column reads as — gets `1.0, 1.0`: stretching a
+flat field past its clamp paints the whole cloud white. And no multiplier gives back colour the
+file never recorded; `auto` only re-scales what is already there.
+
+```json
+{"index":0,"auto":true,"color":"rgb","exposure":1.1153893,"contrast":0.8812240,
+ "message":"Ap 6: colour rgb"}
+```
+
+The answer above is `Auto RGB` on the 41.7-million-point scan measured below: its own luminance band
+is already wide, so the automatic contrast is *below* 1 and the picture barely moves. Auto is an
+answer from the statistics, not a promise of a better picture.
+
+The multipliers are applied where the point's colour is built, so they cost no re-read and no second
+buffer. The file's own widths are settled once for the whole cloud, at load: if any channel of any
+point exceeds 255 the file is read as 16-bit and every channel is divided by 257, because a cloud
+drawn from two different widths at once would show half of it black.
+
 ### `LASPECTRUM {spectrum?, index?}`
 
 Chooses the colour scale the intensity (and the elevation) band is read on. Six scales, all drawn
@@ -135,10 +165,46 @@ in code — nothing imported, nothing licensed:
 
 Without a name the command walks to the next scale — the palette's row of buttons does the same.
 
+### `LASRANGE {target, min, max, index?}` · `LASRANGE {target, reset: true, index?}`
+
+Names the window the elevation or the intensity ramp reads, instead of the band's own 2%–98% slice.
+The points keep their numbers; only the colours move, so the same wall can be read as a storey
+(`0.90..3.75 m`) or as the ceiling detail (`6.19..8.12 m`) without a second pass over the file.
+`target` takes `elevation` (`height`, `z`), or `intensity` (`return`, `i`). The intensity endpoints
+are on the 0..255 scale the ramp is drawn on, whatever the file's own width; elevation is in metres.
+
+```json
+{"index":0,"target":"elevation","min":6.1936,"max":8.1222,
+ "message":"Ap 6: the elevation ramp reads 6.19 m to 8.12 m","window":[6.1936,8.1222]}
+```
+
+```json
+{"index":0,"target":"intensity","min":60,"max":180,
+ "message":"Ap 6: the intensity ramp reads 60 to 180","window":[60,180]}
+```
+
+`reset` hands the window back to the band and the answer says what the band's own window is;
+`window` is `null` then. An endpoint that is not a number, out of 0..255 for an intensity, or a
+`max` below the `min` is refused before anything is touched, and the error says
+`` `max` must not be below `min` ``. Two elevation endpoints more than 10⁹ m from the origin are
+refused too: they are finite numbers, but a span that wide overflows to infinity and every point
+reads the ramp's first colour. An equal pair is not refused — a window of no span simply draws the
+ramp's middle colour.
+
+The palette draws the two sliders under the ramp (Height window / Intensity window) with an **Auto**
+button beside them, and the row of colour chips under the sliders — the legend — re-reads its ends
+from the same window and takes every chip from the same `Spectrum::apply` the points are coloured
+with, so a legend can never promise a colour the drawing does not produce.
+
 ### `LASDECIMATE {cell, index?}`
 
-Re-reads the file at a new grid cell, keeping the band, the name, the colour mode and the crop —
-no need to `LASCLOSE`/`LASOPEN`. `cell: 0` drops the grid and keeps every point of the band (the
+Re-reads the file at a new grid cell. What comes back is the file's points; the cloud's life in the
+drawing is carried over — the band, the name, the colour mode and scale, the crop, the place and
+the tie to the document, the two colour windows, the two RGB multipliers, the opacity and whether
+the cloud is shown. What a re-read does lose is anything measured on the points it replaced: the
+ground classification `LASGROUND` wrote, and the per-point deviations the `Deviation` colour reads
+— after a grid change that mode is the legend's "no data" grey until `LASCMP` runs again. No
+need to `LASCLOSE`/`LASOPEN`. `cell: 0` drops the grid and keeps every point of the band (the
 palette's **All** button), so the finest level is the LAS itself.
 
 ```json
@@ -189,6 +255,15 @@ the first cloud gets when it opens.
 {"index":0,"name":"Ap 1","framed":true,"center":[-2.595,-0.854],"height":21.15}
 ```
 
+### `AUTORLV {index?, params?}` · `AUTO3D {index?, params?}`
+
+The scan-to-BIM model of the cloud: floor and ceiling slabs, the storeys between them, the walls and
+the closed rooms. `AUTORLV` is the 2D releveu (wall axes on `RLV_WALLS`, room rings on `RLV_ZONES`,
+slab outlines on `RLV_SLABS`, the room schedule on `RLV_SCHEDULE`); `AUTO3D` extrudes the same walls
+and re-draws the same slabs as 3D faces (`RLV_3D_WALLS`, `RLV_3D_SLABS`). Both refuse when no cloud
+is open — they model the scan on screen, never a made-up apartment. The `params` object is the
+pipeline's knobs; see [Auto-RLV and Auto-3D](#auto-rlv-and-auto-3d-scan-to-bim).
+
 ## The Point Cloud palette
 
 The fork adds a **Point Cloud** panel to the right dock (between Layers and Properties, opened by
@@ -204,6 +279,18 @@ script cannot drift apart.
   **Close** drops the cloud and **Show** hides it without closing.
 - **Colour**: RGB, Elevation, Intensity, or the colour picker for a flat colour (`single:#rrggbb`).
   Intensity shows the band's return range next to the point count.
+- Under **RGB**, the two sliders that make a dark scan readable — **RGB exposure** and **RGB
+  contrast** — and **Auto RGB**, which takes both from the finest level's sorted luminance: the
+  2%–98% span sets the contrast, the mean sets the exposure. A cloud with no colour spread gets
+  neutral values rather than a white field.
+- Under **Elevation** or **Intensity**, the **Height window** / **Intensity window** pair of sliders
+  and **Auto** (`LASRANGE`): the ends the ramp is read on. Under them the **legend** — one chip per
+  colour of the ramp, the two ends named — or one chip per class the scan carries in class colours.
+  The comparison's key adds a last chip for the grey of a point the reference has nothing for,
+  because at the edge of a wall that grey is most of the picture. Every chip is the colour the
+  points get, from the same function the drawing uses.
+- **Scan info** carries the **Intensity profile**: the band's 64-bin return histogram with the window
+  marked on it, so the sliders are set against what the scan returns.
 - **Grid** and **Apply** re-read the file at a new decimation cell; **All** keeps every point of
   the LAS band (no grid). The count line says whether the finest level is the source points.
 - **Remove walls / ceiling** enables a crop box: one min/max pair per axis. Lower the Z maximum to
@@ -294,10 +381,14 @@ The palette's **Z Band** panel draws the scan's height profile (64 bins, compute
 read) with the cut marked on it, and the band can be walked up and down with the jog buttons while
 its thickness stays locked — the way a floor slab is found in a storey scan.
 
-### Clarity without a depth buffer
+### Clarity: a depth buffer and two cues
 
-The 3D pipeline has no depth attachment (the 2D canvas owns the pass), so the near and the far
-geometry are mixed. Two things stand in for the depth test:
+The 3D pipeline draws into the window's depth-stencil buffer. The 2D canvas owns the stencil half of
+that buffer and writes no depth, so the clouds own the depth half: every square writes its own view
+depth and is tested against it before another is drawn (`CompareFunction::Less`), which means a near
+wall hides what is behind it instead of piling every point along the ray into one slab of pixels.
+A target without a depth aspect — a `Stencil8` test target, or a web build that got no depth buffer —
+compiles to the same pipeline with the depth test off, and the two cues below carry the picture alone.
 
 - **The front wall cut** (`Cut` in the palette, `{"cut": 0.3}` in the control channel): the points
   between the eye and that fraction of the distance to the target are dropped in the vertex shader
@@ -311,25 +402,41 @@ geometry are mixed. Two things stand in for the depth test:
   them down to a single pixel, which left one-pixel gaps between them wherever the level drew its
   points close together, so the depth is told by the fade and not by a smaller point.
 
-Both live in the vertex shader of `crates/ui-egui/src/gpu3d.rs` and need no extra attachment: the
-depth is `dot(point − eye, forward)`, which works in the orthographic projection too (where
-`clip.w` is always 1). The uniform is a `repr(C)` struct of `f32` arrays, cast into the buffer with
-`bytemuck`, so the 16-byte vertex layout and the uniform layout are both exactly what the shader
-expects.
+Both live in the vertex shader of `crates/ui-egui/src/gpu3d.rs`. The depth is
+`dot(point − eye, forward)`, which works in the orthographic projection too (where `clip.w` is
+always 1), and it is what the cue fades on; the buffer's own depth is what hides a far point. The
+uniform is a `repr(C)` struct of `f32` arrays, cast into the buffer with `bytemuck`, so the 20-byte
+instance record (`[x, y, z]` and `size` as `f32`, then RGBA8 — `VERTEX3D_SIZE`) and the uniform
+layout are both exactly what the shader expects.
 
 ### Colour ramps that survive outliers
 
 `Elevation` and `Intensity` map the value to the blue→red ramp. A single spike through the
 ceiling or one hot return would stretch the range and flatten the contrast of the other 99% of the
-points, so the ramp runs over the **2%–98% window** instead, computed at load time from a
-histogram (65 536 bins for Z, 256 for the intensity — no sorting of four million points). The
-values outside the window are clamped to its ends.
+points, so the ramp runs over the **2%–98% window** by default, computed at load time from a
+histogram over the points the level holds — 65 536 bins for the height, and 65 536 raw counts for
+the return, which are folded into the 256 bins of the 0..255 scale the ramp is drawn on before the
+percentiles are read (no sorting of four million points). The values outside the window are clamped
+to its ends.
+
+The window is a default, not a sentence: `LASRANGE` names the ends, the palette puts two sliders and
+an **Auto** button under the ramp, and the legend row re-reads its ends from the same numbers. The
+band's own profile is drawn too — the intensity histogram of 64 bins, folded from the 65 536 return
+counts of that same walk, so a return lands in the bin the ramp reads it in — with the window
+marked on it, so the choice of ends is made against what the scan actually returns, not by dragging
+blind.
+
+Both ramps and the class colours are drawn from the same functions the points use
+(`Spectrum::apply`, `deviation_color`, `class_color`), so a legend cannot promise a colour the
+drawing does not produce. A cloud whose points carry a class the classifier never writes — ASPRS 0,
+the state of most cleaned exports — gets a chip named by its number, because the grey it draws still
+needs a name.
 
 ### Seeing through the cloud
 
-A dense cloud hides the drawing under it, and without a depth buffer the points in front and
-behind pile up: a wall seen edge-on becomes a solid slab of pixels, and the line drawn over it
-disappears.
+A dense cloud hides the drawing under it. The depth test makes that honest — a wall seen edge-on is
+one solid surface, not a pile of every point along the ray — but an honest wall is still a wall
+between the surveyor and the line drawn under it.
 
 `LASOPACITY {opacity?, index?}` makes the cloud transparent (5%..=100%; without a value it
 toggles between opaque and a third). Two things happen at once:
@@ -681,6 +788,157 @@ The strokes live beside the clouds in `Session::sketch`, not in the drawing mode
 are 2D (Z=0), so 3D geometry that must not disturb snaps, grips, undo or save stays a fork field
 until the 3D kernel can carry it.
 
+## Auto-RLV and Auto-3D (scan-to-BIM)
+
+`AUTORLV` and `AUTO3D` turn a scan into building parts. The pipeline follows Zbirovský & Nezerka,
+*Cloud2BIM: An open-source automatic pipeline for efficient conversion of large-scale point clouds
+into IFC format* (arXiv:2503.11498v1) for the modelling stages; where the paper publishes no number,
+the value is this fork's and is labelled so in `BimOptions`
+(`crates/pointcloud/src/bim/mod.rs`). The commands model **slabs, storeys, walls and rooms**, detect
+**openings** in every wall, measure the **cloud-to-model deviation** and route what the model cannot
+explain to `RLV_FURNITURE`, and `AUTORLV` writes an **IFC 4 STEP** file when `ifc` names a path.
+Automatic dimensions are the one stage still to come, and the reply says so in `notAvailable`.
+
+### The stages
+
+| Stage | Module | What it does |
+|---|---|---|
+| slabs | `bim/raster.rs`, `bim/slabs.rs` | A 5 cm vertical histogram of the band. A run of bins at least half as tall as the tallest is a slab candidate; a single below-cut bin with candidates on both sides joins the run, so the trough inside a rough floor is not read as two faces; neighbouring runs are paired into one slab a storey apart, and a lone face is thickened by `single_sided_slab_thickness`. The plan comes from a 5 cm density mask. |
+| storeys | `bim/storeys.rs` | The band between one slab's top and the next slab's base, each face pulled back by `safety_margin` (0.10 m) so floor and ceiling points cannot enter a wall slice. |
+| walls | `bim/walls.rs` | A horizontal slice at 0.9–1.0 of the storey's clear height, a 5 cm density mask at `threshold`, closing with radius `close_radius` cells, contours simplified by `epsilon` (never finer than one cell, because a 45° face cannot be placed more precisely than the lattice) and `angle_tolerance`, collinear pieces joined, then **parallel faces paired** 0.06–0.60 m apart into one wall axis with its thickness. A lone face on the outer contour becomes an exterior wall of `exterior_wall_thickness`, set half a thickness outside the face; a lone face inside the building (a courtyard) is never thickened. |
+| zones | `bim/zones.rs` | Axis ends snapped onto other walls within `zone_gap`, each wall body laid out as the rectangle it occupies, probes 1 mm outside each face at seven stations, and the rectangle soup traced into closed rings; rings below `min_zone_area` are dropped. |
+| openings | `bim/openings.rs` | Each wall body plus `opening_band` (0.05 m) on every side is read once from the LAS, thinned to `opening_decimate` (5 mm) and projected onto the wall's `(u, z)` elevation at `opening_cell` (2 cm). A cell counts as wall when its density reaches `opening_threshold` (0.5) of the rank-`opening_rank` (10th) densest cell, so nine density spikes cannot move the reference; a radius-1 closing bridges a 4 cm sampling crack. An empty region that touches neither wall end nor the top is kept when 0.60–1.60 m wide: a hole whose sill is at most `door_max_sill` (0.30 m) above the storey base and at least `door_min_height` (1.90 m) tall is a **door**; a hole whose sill is at least `window_min_sill` (0.50 m) up is a **window**. |
+| deviation | `bim/deviate.rs` | Every cloud point is measured against the wall bodies and slabs: zero inside a body, otherwise the gap to the nearest face. The report carries the point count, RMSE, mean and max in mm and how many points lie above `deviation_threshold` (50 mm); off-model points are binned at `deviation_cell` (0.10 m) and connected clusters of at least `min_furniture_points` (50) become furniture footprints, at most `max_furniture_clusters` (4,096). |
+| IFC | `bim/ifc.rs` | With `ifc` set to a path, `AUTORLV` writes ISO 10303-21 STEP (`FILE_SCHEMA(('IFC4'))`): project, site, building and storeys, walls, slabs, spaces, openings, doors and windows, with `IfcRelVoidsElement`/`IfcRelFillsElement` links whenever there are openings, IFC base64 GUIDs and `\X2\` escapes for non-ASCII names. The writer then reads its own text back — unique ids, every `#N` reference resolved, the project present and, when the building has openings, the void/fill relationships — and the reply cites the checked entity counts. |
+
+`extract_auto_rlv` returns `AutoRlvResult`: per storey a `StoreyModel` with its walls and zones, the
+slabs, and one `RoomScheduleRow` per closed room (code `E01`…, name `Spațiu`, usable area in m²,
+perimeter in m, clear height). `AUTORLV` then detects the openings wall by wall, measures the cloud
+against the model, and draws `RLV_WALLS` wall axes, `RLV_ZONES` room rings, `RLV_SLABS` slab plans,
+`RLV_OPENINGS` two jamb lines per opening, `RLV_FURNITURE` one plan rectangle per deviation cluster,
+and the schedule text on `RLV_SCHEDULE`. `AUTO3D` reads the same model and extrudes each wall axis
+into two face planes; it adds no roof, because a roof is a slab the stage found above the top storey,
+not an invention.
+
+### Ours, and the paper's
+
+Adopted from the paper's Table 6: `z_step` 0.05 m, a slab at 0.5 × the tallest bin,
+`safety_margin` 0.1 m, the slice window [0.9, 1.0], a mask `threshold` of 0.01, the 5 × 5 closing
+kernel (`close_radius` 2), `epsilon` 0.02 m, `angle_tolerance` 3°, and the rank-10 opening threshold
+(`max10`). The paper's 1 m dilation/erosion and its `smoothing_factor` belong to its pixel-grid
+pipeline; this one closes a metric mask, so neither has a counterpart here.
+
+This fork's values, because the paper gives none or contradicts itself:
+
+| Parameter | Default | Why |
+|---|---|---|
+| `cell` | 0.05 m | A metric raster cell; the paper's `grid_coefficient` contradicts its own figure by 50×. |
+| `single_sided_slab_thickness` | 0.20 m | The paper's `bfs`/`tfs` are undefined; this names the one thing they are used for. |
+| `min_wall_length` | 0.40 m | Table 5 publishes none. |
+| `min_wall_thickness` / `max_wall_thickness` | 0.06 / 0.60 m | Table 5 publishes none. |
+| `zone_gap` | 0.40 m | Snap reach for axis ends: closes the paper's own 35 cm corner failure without bridging a door (≥ 0.8 m). |
+| `min_zone_area` | 0.5 m² | Table 5 publishes none. |
+| `exterior_wall_thickness` | 0.30 m | Used only when the scan has no exterior face. |
+| `opening_cell` | 0.02 m | The paper gives a rank and no cell; 2 cm is finer than the 5 cm plan lattice and resolves a jamb. |
+| `opening_threshold` | 0.5 | The paper gives the rank and no percentage; half the rank-10 density keeps a sampled face and drops a hole. |
+| `min_opening_width` / `max_opening_width` | 0.60 / 1.60 m | The paper names the width test and publishes no number: 0.60 m is an interior door, 1.60 m a wide window. |
+| `door_min_height` / `door_max_sill` | 1.90 / 0.30 m | A door reaches head height and starts at the floor. |
+| `window_min_sill` | 0.50 m | Above the door sill; the 0.30–0.50 m gap is refused rather than guessed at. |
+| `opening_band` / `opening_decimate` / `max_wall_band_points` | 0.05 m / 5 mm / 200,000 | The band is the wall body plus reading margin, the points are thinned to the 5 mm the spec asks for, and one wall's stream is capped so a dense wall cannot exhaust memory. |
+| `deviation_threshold` | 0.05 m | The spec names 50 mm; the paper gives no number. |
+| `deviation_cell` / `min_furniture_points` / `max_furniture_clusters` | 0.10 m / 50 / 4,096 | A cell that bridges the sampling gaps of a thinned scan while separating two pieces of furniture; 50 points is an object rather than speckle; the cap bounds the report. |
+
+`AUTORLV` and `AUTO3D` take these through `params`; `AUTORLV` also takes `ifc`, the path to write
+(it is a command parameter beside `index`, not a `BimOptions` key). Without `ifc`, nothing is
+written:
+
+```json
+{"index":0,"ifc":"C:/releveu.ifc",
+ "params":{"cell":0.05,"z_step":0.05,"slab_ratio":0.5,"slice_from":0.9,"slice_to":1.0,
+ "threshold":0.01,"close_radius":2,"epsilon":0.02,"exterior_wall_thickness":0.3,
+ "exterior_scan":false,"zone_gap":0.4,"min_zone_area":0.5,
+ "opening_cell":0.02,"opening_threshold":0.5,"opening_rank":10,
+ "min_opening_width":0.6,"max_opening_width":1.6,"door_min_height":1.9,
+ "door_max_sill":0.3,"window_min_sill":0.5,"opening_band":0.05,
+ "opening_decimate":0.005,"max_wall_band_points":200000,
+ "deviation_threshold":0.05,"deviation_cell":0.1,
+ "min_furniture_points":50,"max_furniture_clusters":4096}}
+```
+
+Hostile values are refused with a message, not guessed at: a zero or NaN cell, a slice window
+outside the storey, a threshold of zero, a minimum thickness above the maximum, an angle tolerance
+over 90°, an exterior thickness of zero, an opening cell or decimation of zero, a rank of zero, a
+width or height of zero, or a furniture budget of zero. `#![deny(clippy::unwrap_used, …)]` holds
+throughout `bim/`, every index is `get()`, a raster is capped by a cell budget so a 100 km LAS
+cannot ask for a 10⁹-cell grid, a wall band and the furniture clusters have their own budgets, and
+loops are bounded.
+
+### Measured on the Ap 6 scan (2026-10-25)
+
+The 41.7-million-point section export used for the rendering work, driven over the control channel
+on a release build (Windows, DX12):
+
+| Step | Result |
+|---|---|
+| `LASOPEN` at the default 5 mm grid | **15.9 s this run** (17.0 s and 20.1 s on two earlier ones) — 5,826,743 points from 41,760,735, 7 levels |
+| `AUTORLV` (defaults, with openings, deviation and IFC) | **46.2 s** — 2 slabs, 1 storey, 70 walls, 0 rooms, 0 openings, 41 furniture clusters, Su = 0.00 m²; the four modelling stages alone take **0.50 s**, the fine wall-band read **4.9 s** and the deviation **39.5 s** |
+| Slabs | floor top 1.027 m and ceiling base 3.483 m, both single-sided at 0.20 m; 1,176 and 1,174 plan vertices |
+| Storey | base 1.127 m, top 3.383 m, clear height 2.256 m |
+| `AUTO3D` (defaults, with the opening read) | **5.5 s** — 70 wall planes (140 face quads in the 3D sketch), 2 slab faces, 0 openings, no roof; it was 0.52 s before the opening read was wired in |
+| Entities in the drawing | `RLV_WALLS` **70** LINE, `RLV_SLABS` **2** LWPOLYLINE, `RLV_FURNITURE` **41** LWPOLYLINE, `RLV_OPENINGS` / `RLV_ZONES` / `RLV_SCHEDULE` empty; `RLV_3D_WALLS` 70 axis LINE plus 140 closed quads in the 3D sketch, `RLV_3D_SLABS` 2 closed quads (142 3D polygons in all) |
+
+The slab histogram is where this scan first failed. Its ceiling's tallest 5 cm bin holds 948,085
+points, so the 50 % cut sits at 474,042; the floor's tallest bin holds 429,129, 45 % of that, and
+the old rule split the floor into a 0.93–0.98 m face and a 1.03–1.13 m face. Three faces then paired
+into a phantom 2.4 m slab and the pipeline reported **zero storeys**. The one-bin bridge described
+in the slab row restores the floor face and the ceiling face: **2 slabs, 1 storey**.
+
+**0 rooms is the measured truth on this scan, not a failed command.** The wall stage finds 70 axes
+at the paper's [0.9, 1.0] slice, but every room-sized loop is open at a doorway or passage: the
+collinear gaps between wall ends run from 0.6 m to over 2 m, and `zone_gap` is 0.40 m precisely so a
+door (≥ 0.8 m) is not bridged. The tracer does find loops where the walls really close — slices at
+0.5–0.6 and 0.6–0.7 of the clear height return 1 and 3 zones — but they are 0.5–1.9 m² pockets
+between wall and furniture fragments, not rooms. The openings stage can now find holes in the wall
+bodies (none inside this scan's fragments at the default threshold, below), but the zone tracer
+still does not use them: it would rather leave a room open than invent a wall across a door.
+
+Plan B, measured on that same open file over the control channel:
+
+- **Openings** at the default `opening_threshold` 0.5: **0** on 70 walls. The walls are fragments
+  (median 0.70 m, 51 of them at least 0.60 m); on the walls whose densest 2 cm cell holds 100–600
+  points, the 50 % cut leaves 0–1 % of the cells occupied, so the empty region percolates to the
+  wall's top edge and is rejected. Lowering `opening_threshold` to 0.1–0.2 finds **one window**,
+  1.08 × 0.58 m, sill 1.99 m, inside one wall body. **No doorway is found at any threshold**: this
+  scan's doorways are full-height gaps between two wall fragments, with no lintel above, and the
+  stage looks for holes inside a wall body. The default stays as the spec set it; a scan like this
+  one answers through a `params` override.
+- **Deviation**: the 5,826,743 points measure against 2 slabs and 70 wall axes at RMSE **291.6 mm**,
+  mean 170.9 mm, max 4,751 mm, with 3,248,080 points above 50 mm and **41 furniture clusters**. The
+  number is high because the model explains only the walls and the two slab faces: furniture,
+  fittings, wall runs the wall stage did not model and points outside the slab plan are all
+  off-model, which is exactly what `RLV_FURNITURE` draws.
+- **IFC**: 175,885 bytes, **3,747 entities**, 4,116 references, 70 `IFCWALL`, 2 `IFCSLAB`, one each
+  of `IFCPROJECT`, `IFCSITE`, `IFCBUILDING`, `IFCBUILDINGSTOREY`; 0 spaces, openings, doors and
+  windows because the model has none. The writer's own reader closed the whole graph before the
+  reply cited those counts.
+
+The time moved with Plan B: `AUTORLV` is 46.2 s instead of the 0.50 s of the four modelling stages
+— 4.9 s for the one streaming pass over 41.7 M points that reads 71 wall bands, and 39.5 s for the
+deviation (measured in a scratch harness on 6.0 M points; the app holds 5,826,743). That is the
+price of reading every wall's elevation and testing every point against the model; the modelling
+stages alone still take 0.50 s.
+
+### What the commands do not do yet
+
+- **Automatic dimensions** are not placed; `RLV_DIMS` stays empty and the reply lists `dimensions`
+  in `notAvailable`.
+
+Everything else is computed, not promised. The IFC file is text this repository writes from the
+public ISO 10303-21 encoding and the IFC 4 attribute tables, and its entity graph is checked by this
+repository's own reader; it has not been round-tripped through a commercial BIM application, so how
+a third-party application accepts it is untested. The fabricated six-wall box, the invented openings
+and the fixed-fraction rooms the command used to draw are gone.
+
 ## Measured on real data (Ap 1, Bucharest)
 
 | Step | Result |
@@ -699,6 +957,14 @@ until the 3D kernel can carry it.
 The LOD keeps the drawn count proportional to the screen, not to the file: ~550k is what a
 1600×1000 canvas can show at ~2 px per point, and panning inside the built area only moves the
 buffer.
+
+The plan view paints the points it keeps **from the bottom up** (`canvas::plan_order`). The 2D
+pipeline blends premultiplied squares in list order and has no depth buffer, so the last square
+drawn in a pixel is the one seen; file order is scan order, which puts a floor point after a
+ceiling point as often as before it, and the plan then mixes every surface in the building into a
+salt-and-pepper. Sorting the kept points by height, lowest first, leaves the highest point in each
+pixel — the surface a top view looks at. The sort walks the screen-sized set the view keeps, not
+the file.
 
 ### The commands, measured (the whole 3 899 545-point scan, release build)
 
@@ -729,6 +995,33 @@ What made the difference:
 What is still slow, and why: the classification gives every point of every level the class of its
 nearest sampled point, and that is a nearest-neighbour search over the whole pyramid. The next
 step is for the coarse levels to inherit from the fine one.
+
+### A second scan (Ap 6), and the colour window measured on it
+
+A 41.7-million-point section export, driven over the control channel on a release build (Windows,
+DX12, a 1500×950 window, the camera set once to `iso` + 35° perspective + fit and never touched
+again, so the only thing that can move between two captures is colour).
+
+| Step | Result |
+|---|---|
+| File | **41,760,735 points**, point format 3, RGB and intensity, 0.1 mm scale, no CRS, 9.2 × 14.3 × 9.6 m |
+| `LASOPEN` at the default 5 mm grid | 5,826,743 points, 7 levels — **17.5 s** |
+| On screen at fit | 464,954 points |
+| `LASRANGE` elevation, intensity, reset | 4 ms, 13 ms, 19 ms; the mesh rebuilds on the next frame |
+| `LASCOLOR rgb` / `Auto RGB` | 20 ms / 131 ms (the auto answer walks and sorts one level) |
+| Elevation band 0.90–3.75 m → window 6.19–8.12 m | 114,020 of 1,425,000 px changed (8.0%), **the same 145,464 lit px** |
+| Intensity band 0–255 → window 60–180 | 101,937 px changed (7.2%), the same lit px |
+| Class colours | one chip, `class 0` — the file carries ASPRS 0 on every point |
+
+The unchanged lit-pixel count is the point of the last two rows: a window is a colour change and
+nothing else. The same camera, the same points, the same buffer size — only the ramp moved.
+
+`Auto RGB` on this scan answers exposure 1.12× and contrast 0.88×, and the picture is barely
+different (mean channel change 1.3 of 255). That is the algorithm working as designed, not failing:
+the band's own 2%–98% luminance span is already 0.91 of the scale, so there is no contrast to win,
+and a small lift is all the statistics justify. The scan looks flat in its own colours because it is
+concrete and dust — its mean saturation is 24 of 255 against the elevation ramp's 139 — and the way
+to read it is the ramp and the window, not a stronger multiplier on a photograph of grey.
 
 ## Design
 
