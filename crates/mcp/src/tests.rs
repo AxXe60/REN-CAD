@@ -260,9 +260,77 @@ fn a_lazy_bridge_starts_without_the_app_and_says_how_to_open_it() {
     app.join().unwrap();
 }
 
+/// A 6 x 4 m room split in two by a partition at x = 3, 0.20 m walls, floor at z = 0 and ceiling
+/// at z = 2.80. Only the surfaces an interior scan sees are sampled, so the modelling commands
+/// must find five walls and two rooms — a bounding box would report six walls and one room.
+fn headless_with_room_scan() -> Headless {
+    use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, DEFAULT_MAX_POINTS, Pt, Slice};
+
+    let mut pts = Vec::new();
+    // Dense floor and ceiling planes: the slab histogram's tallest bin must be a plane, never a
+    // wall level.
+    let mut i = 0;
+    while i <= 300 {
+        let x = f64::from(i) * 0.02;
+        let mut j = 0;
+        while j <= 200 {
+            let y = f64::from(j) * 0.02;
+            pts.push([x, y, 0.0]);
+            pts.push([x, y, 2.8]);
+            j += 1;
+        }
+        i += 1;
+    }
+    let levels = [0.1, 0.9, 1.7, 2.45, 2.55, 2.65];
+    let mut k = 0;
+    while k <= 300 {
+        let t = -0.01 + 0.02 * f64::from(k);
+        for z in levels {
+            pts.push([t, 0.2, z]);
+            pts.push([t, 3.8, z]);
+        }
+        k += 1;
+    }
+    let mut k = 0;
+    while k <= 200 {
+        let t = -0.01 + 0.02 * f64::from(k);
+        for z in levels {
+            pts.push([0.2, t, z]);
+            pts.push([5.8, t, z]);
+        }
+        k += 1;
+    }
+    let mut u = 2.91;
+    while u <= 3.09 + 1e-9 {
+        let mut y = 0.2;
+        while y <= 3.8 + 1e-9 {
+            for z in levels {
+                pts.push([u, y, z]);
+            }
+            y += 0.1;
+        }
+        u += 0.02;
+    }
+
+    let mut bounds = Bounds3::EMPTY;
+    let mut sliced = Vec::with_capacity(pts.len());
+    for p in &pts {
+        bounds.add(p[0], p[1], p[2]);
+        sliced.push(Pt { x: p[0], y: p[1], z: p[2], rgb: None, intensity: 100, class: 1 });
+    }
+    let total = sliced.len() as u64;
+    let slice = Slice { points: sliced, total, in_band: total, bounds };
+    let cloud = Cloud::from_slice("room".to_string(), String::new(), 0.0, 2.8, None, slice, DEFAULT_MAX_POINTS, CloudColor::Elevation);
+    let mut h = Headless::default();
+    h.session.clouds.push(cloud);
+    h
+}
+
+/// The modelling tools run on the room scan loaded above, and every claim in their reply is
+/// checked against the drawing they made.
 #[test]
 fn rencad_mcp_tools_execute_end_to_end() {
-    let mut s = Server::new(Box::new(Headless::default()));
+    let mut s = Server::new(Box::new(headless_with_room_scan()));
     call(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
 
     let crs = tool(&mut s, "crs_transform", json!({"epsg": 31700}));
@@ -272,11 +340,25 @@ fn rencad_mcp_tools_execute_end_to_end() {
     assert!(osm["buildings"].as_u64().unwrap_or(0) >= 1, "{osm}");
     assert!(osm["addresses"].as_u64().unwrap_or(0) >= 1, "{osm}");
 
-    let rlv = tool(&mut s, "pointcloud_rlv", json!({"removeFurniture": true}));
-    assert!(rlv["totalUsableAreaM2"].as_f64().unwrap_or(0.0) > 10.0, "{rlv}");
+    let rlv = tool(&mut s, "pointcloud_rlv", json!({"index": 0}));
+    assert_eq!(rlv["walls"].as_u64(), Some(5), "four room sides and the partition, not a bounding box: {rlv}");
+    assert_eq!(rlv["zones"].as_u64(), Some(2), "the partition splits the room in two: {rlv}");
+    assert_eq!(rlv["slabs"].as_u64(), Some(2), "floor and ceiling: {rlv}");
+    assert_eq!(rlv["rooms"].as_array().map(Vec::len), Some(2), "{rlv}");
+    assert!(rlv["totalUsableAreaM2"].as_f64().unwrap_or(0.0) > 15.0, "{rlv}");
+    assert_eq!(rlv["notAvailable"], json!(["dimensions"]), "{rlv}");
+    assert!(rlv["openings"]["count"].as_u64().is_some(), "the wall search reports: {rlv}");
+    assert!(rlv["deviation"]["rmseMm"].as_f64().is_some(), "the deviation is measured: {rlv}");
+    assert_eq!(rlv["drawn"]["walls"].as_u64(), rlv["walls"].as_u64(), "{rlv}");
+    let walls = tool(&mut s, "query_entities", json!({"layer": "RLV_WALLS"}));
+    assert_eq!(walls["count"], 5, "the reply and the drawing agree: {walls}");
+    let zones = tool(&mut s, "query_entities", json!({"layer": "RLV_ZONES"}));
+    assert_eq!(zones["count"], 2, "{zones}");
 
-    let b3d = tool(&mut s, "pointcloud_auto3d", json!({"roof": true}));
-    assert!(b3d["walls3d"].as_u64().unwrap_or(0) >= 4, "{b3d}");
+    let b3d = tool(&mut s, "pointcloud_auto3d", json!({"index": 0}));
+    assert_eq!(b3d["walls3d"].as_u64(), Some(5), "the same five walls, extruded: {b3d}");
+    assert_eq!(b3d["slabs"].as_u64(), Some(2), "{b3d}");
+    assert_eq!(b3d["notAvailable"], json!(["dimensions"]), "{b3d}");
 
     let cls = tool(&mut s, "pointcloud_classify", json!({}));
     assert!(cls["vectorized"]["fences"].as_u64().unwrap_or(0) >= 1, "{cls}");
