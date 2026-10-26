@@ -36,10 +36,10 @@ People trust CADCraft with their drawings; a crash loses their work. **This outr
 
 ## Running and looking at the app
 - `cargo run --release -p cadcraft -- --sample --control PORT` (sample drawing + control channel). Pick a free port; other crafting apps use control ports too.
-- Drive it with JSON lines on `127.0.0.1:PORT`:
-  - `{"id":1,"method":"cmdline.input","params":{"text":"circle 0,0 5"}}` — type at the command line exactly like a user (prompts, keywords, `@dx,dy`, `@d<a`, direct distance entry).
-  - `{"id":2,"method":"engine.execute","params":{"command":"line","params":{"points":[[0,0],[10,0]]}}}` — JSON form.
-  - `{"id":3,"method":"ui.screenshot","params":{"path":"/tmp/shot.png"}}` then read the PNG.
+- Drive it with JSON lines on `127.0.0.1:PORT`. Every request carries `"token":"<session token>"`, read from `%LOCALAPPDATA%\cadcraft-control-<port>.token` (`$XDG_RUNTIME_DIR`, else `~/.cache`, on Unix); a request without it is refused with `unauthorized`.
+  - `{"id":1,"token":"…","method":"cmdline.input","params":{"text":"circle 0,0 5"}}` — type at the command line exactly like a user (prompts, keywords, `@dx,dy`, `@d<a`, direct distance entry).
+  - `{"id":2,"token":"…","method":"engine.execute","params":{"command":"line","params":{"points":[[0,0],[10,0]]}}}` — JSON form.
+  - `{"id":3,"token":"…","method":"ui.screenshot","params":{"path":"/tmp/shot.png"}}` then read the PNG.
   - Methods: `crates/ui-egui/src/control.rs`; protocol doc: `docs/control-protocol.md`.
 - **For UI work, look at the result** (screenshot, read the PNG) and compare with `plan/autocad/screenshots/`. If no frame is presented (screen locked) use `ui.render` or `cadcraft-cli`.
 - Headless: `cadcraft-cli run --sample --script 'LINE 0,0 10,10\n' --export out.png`; `cadcraft-cli info file.dxf`; `cadcraft-cli mcp`.
