@@ -745,7 +745,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     });
 
     // ---------- input ----------
-    let resp = ui.interact(rect, ui.id().with("view3d"), Sense::click_and_drag());
+    let resp = ui.interact(rect, ui.scope_id().with("view3d"), Sense::click_and_drag());
     let (shift, wheel, middle, pointer_delta, pointer, inside) = ui.input(|i| {
         let pointer = i.pointer.hover_pos();
         (i.modifiers.shift, i.smooth_scroll_delta.y, i.pointer.middle_down(), i.pointer.delta(), pointer, pointer.is_some_and(|p| rect.contains(p)))

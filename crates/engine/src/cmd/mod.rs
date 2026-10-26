@@ -35,7 +35,7 @@ mod props;
 mod rencad;
 pub use draw2::breakline::BreaklineOptions;
 pub use props::MatchProps;
-pub(crate) use props::set_current_color_value;
+pub(crate) use props::{current_color_value, set_current_color_value};
 mod qselect;
 mod selecttools;
 mod settings;

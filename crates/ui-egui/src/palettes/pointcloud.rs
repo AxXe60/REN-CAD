@@ -26,10 +26,10 @@ fn num(n: usize) -> String {
 pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     super::section_header(ui, "Point Cloud");
-    let sel_id = egui::Id::new("cc_pc_selected");
-    let path_id = egui::Id::new("cc_pc_path");
-    let cell_id = egui::Id::new("cc_pc_cell");
-    let pick_id = egui::Id::new("cc_pc_color");
+    let sel_id = egui::Id::unique("cc_pc_selected");
+    let path_id = egui::Id::unique("cc_pc_path");
+    let cell_id = egui::Id::unique("cc_pc_cell");
+    let pick_id = egui::Id::unique("cc_pc_color");
 
     if app.session.clouds.is_empty() {
         ui.add_space(6.0);
@@ -38,10 +38,11 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new("No cloud open.").color(t.text_dim).size(12.0));
         });
         let mut path = ui.data(|d| d.get_temp::<String>(path_id)).unwrap_or_default();
+        let field_label = ui.label(egui::RichText::new("Point cloud file").color(t.text_dim).size(11.0));
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             let edit = egui::TextEdit::singleline(&mut path).hint_text("path to .las / .laz").desired_width(ui.available_width() - 70.0);
-            ui.add(edit);
+            ui.add(edit).labelled_by(field_label.id);
             if ui.button("Open").on_hover_text("Open at full resolution; the Grid slider thins it").clicked() {
                 open(app, &path);
             }

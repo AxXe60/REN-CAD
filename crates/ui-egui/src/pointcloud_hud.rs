@@ -80,7 +80,7 @@ impl Default for PointCloudHudState {
 /// The bar is anchored to the top of the window, below the menu and the toolbars: the canvas sits
 /// under that strip and the bar must not cover the app's own buttons.
 pub fn draw_viewport_floating_hud(ctx: &egui::Context, _panel_rect: Rect, state: &mut PointCloudHudState, actions: &mut Vec<PointCloudUiAction>) {
-    egui::Area::new(Id::new("rencad_pointcloud_hud")).order(Order::Foreground).anchor(Align2::CENTER_TOP, Vec2::new(0.0, 66.0)).show(ctx, |ui| {
+    egui::Area::new(Id::unique("rencad_pointcloud_hud")).order(Order::Foreground).anchor(Align2::CENTER_TOP, Vec2::new(0.0, 66.0)).show(ctx, |ui| {
         let frame = egui::Frame::NONE
             .fill(Color32::from_rgba_unmultiplied(24, 26, 31, 230))
             .stroke(Stroke::new(1.0, Color32::from_rgb(58, 64, 76)))

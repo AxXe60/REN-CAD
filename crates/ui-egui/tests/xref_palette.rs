@@ -51,6 +51,10 @@ fn xref_opens_the_palette_and_its_buttons_manage_the_xref() {
         app,
     );
     h.run_steps(4);
+    // The fork's right dock stacks four palettes (Layers, Point Cloud, Properties, External
+    // References), so the palette's action row needs a taller group before it is on screen.
+    h.state_mut().run("ui.dock", json!({"action":{"ResizeGroup":{"panel":"externalReferences","height":460.0}}})).unwrap();
+    h.run_steps(3);
     h.get_by_label("site");
     h.get_by_label("Loaded");
     h.get_by_label("Unload").click();
