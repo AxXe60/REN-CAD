@@ -10,6 +10,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod bim;
 mod classify;
 mod cloud;
 mod cluster;
@@ -29,13 +30,14 @@ mod snap;
 mod spectrum;
 pub mod topo;
 
+pub use bim::{BimError, BimOptions, Slab, Storey};
 pub use classify::{
     ALL_CLASSES, CLASS_BUILDING, CLASS_HIGH_VEG, CLASS_LOW_POINT, CLASS_LOW_VEG, CLASS_MED_VEG, ClassifyMode, ClassifyOptions, ClassifyResult, Shape,
     class_color, class_from_name, class_name, classify_level, heights_above_ground, sample_level, shape_of,
 };
 pub use cloud::{ALL_POINTS_LIMIT, Clip, Cloud, CloudColor, CloudLevel, CloudVtx, DEFAULT_MAX_POINTS};
 pub use cluster::{Cluster, clusters_of, feature_name, features_of, kmeans, suggest};
-pub use compare::{DeviationStats, deviation_color, distances, distances_with_grid, stats};
+pub use compare::{DEVIATION_NO_DATA, DeviationStats, deviation_color, distances, distances_with_grid, stats};
 pub use crs::{Crs, epsg_from_wkt};
 pub use dxf::{SKETCH_RGB, write_points_dxf, write_strokes_dxf};
 pub use geo::{LatLon, grid_from_lat_lon};
@@ -44,11 +46,11 @@ pub use measure::{Measure, measure, readout};
 pub use osm::{OsmAddress, OsmBuilding, OsmDataset, OsmParcel, OsmPole, OsmRoad, build_overpass_query, parse_osm_xml, parse_overpass_json};
 pub use read::{CloudInfo, read_info};
 pub use rlv::{
-    Auto3dBuilding, AutoRlvResult, CLASS_FURNITURE, FurnitureFilterResult, OpeningKind, RlvDimension, RlvOpening, RoomScheduleRow, SlabOrRoof3d,
-    Wall3d, WallSegment, extract_auto_3d_building, extract_auto_rlv, filter_interior_furniture,
+    Auto3dBuilding, AutoRlvResult, CLASS_FURNITURE, FurnitureFilterResult, RoomScheduleRow, Slab3d, StoreyModel, Wall3d, extract_auto_3d_building,
+    extract_auto_rlv, filter_interior_furniture,
 };
 pub use sketch::{DEFAULT_LAYER, Sketch3d, Stroke3};
-pub use slice::{Pt, Slice, slice, slice_capped};
+pub use slice::{Band, Pt, Slice, normalize_rgb, rgb_channel, slice, slice_bands_capped, slice_capped};
 pub use snap::{FRONT_LAYER_M, SMOOTH_RADIUS_M, SnapHit, SnapMode, axis_locked, front_layer, nearest, smooth_centroid, z_locked};
 pub use spectrum::Spectrum;
 pub use topo::{
@@ -97,6 +99,8 @@ pub enum Error {
     NoPoints { z0: f64, z1: f64 },
     #[error("decimation cell must be a positive number of metres")]
     BadDecimation,
+    #[error("more than {limit} wall bands were asked of one read")]
+    TooManyBands { limit: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

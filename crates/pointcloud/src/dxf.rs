@@ -19,6 +19,7 @@ fn s(tags: &mut Vec<Tag>, code: i32, text: &str) {
 /// Write `points` to `path` on `layer`. Returns the number of POINT entities written.
 pub fn write_points_dxf(path: &Path, points: &[Pt], layer: &str) -> Result<usize> {
     let layer = if layer.trim().is_empty() { "PC-SLICE" } else { layer.trim() };
+    let sixteen_bit = points.iter().filter_map(|point| point.rgb.as_ref()).flatten().any(|channel| *channel > 255);
     let mut tags: Vec<Tag> = Vec::with_capacity(64 + points.len() * 8);
 
     // HEADER: R2000, metres.
@@ -61,7 +62,9 @@ pub fn write_points_dxf(path: &Path, points: &[Pt], layer: &str) -> Result<usize
         tags.push(Tag::new(30, Value::Real(p.z)));
         match p.rgb {
             Some([r, g, b]) => {
-                let rgb = (i64::from(r) << 16) | (i64::from(g) << 8) | i64::from(b);
+                let rgb = (i64::from(crate::rgb_channel(r, sixteen_bit)) << 16)
+                    | (i64::from(crate::rgb_channel(g, sixteen_bit)) << 8)
+                    | i64::from(crate::rgb_channel(b, sixteen_bit));
                 tags.push(Tag::new(420, Value::Int(rgb)));
             }
             None => tags.push(Tag::new(62, Value::Int(7))),
@@ -198,6 +201,23 @@ mod tests {
         assert!(text.contains("POINT"));
         assert!(text.contains("PC-SLICE"));
         assert!(text.contains("420"));
+    }
+
+    #[test]
+    fn mixed_scale_dxf_true_colour_matches_set_wide_conversion() {
+        let dir = std::env::temp_dir().join("cadcraft-pc-test");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("slice-mixed-scale.dxf");
+        let points = [
+            Pt { x: 0.0, y: 0.0, z: 0.0, rgb: Some([65535, 128, 257]), intensity: 0, class: 1 },
+            Pt { x: 1.0, y: 0.0, z: 0.0, rgb: Some([257, 257, 0]), intensity: 0, class: 1 },
+            Pt { x: 2.0, y: 0.0, z: 0.0, rgb: Some([128, 128, 128]), intensity: 0, class: 1 },
+        ];
+        assert_eq!(write_points_dxf(&path, &points, "PC-SLICE").unwrap_or(0), 3);
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let tags = cadcraft_dxf::parse_ascii(&text).unwrap_or_default();
+        let colors: Vec<i64> = tags.iter().filter(|tag| tag.code == 420).map(|tag| tag.value.as_i64()).collect();
+        assert_eq!(colors, vec![16_711_681, 65_792, 0]);
     }
 
     #[test]

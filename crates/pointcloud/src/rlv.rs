@@ -1,9 +1,19 @@
-//! Auto-RLV (Releveu 2D) and Auto-3D Building reconstruction from apartment/building LAS scans,
-//! with volumetric interior furniture filtering.
+//! Auto-RLV (Releveu 2D) and Auto-3D building reconstruction from LAS scans.
+//!
+//! The modelling is [`crate::bim`]'s: the vertical histogram that finds the slabs, the storey
+//! split, the walls of the ceiling slice and the zones the wall axes close into. This module
+//! gathers that output into the shapes `AUTORLV`, `AUTO3D` and the room schedule draw; it invents
+//! no geometry of its own.
+//!
+//! What is not here: openings, the cloud-to-model deviation and the IFC writer. They are Plan B of
+//! `docs/superpowers/plans/2026-10-25-cloud2bim-scan-to-bim.md`; a caller asking for them is
+//! answered [`BimError::NotAvailable`], never with a guessed opening or a made-up room.
 //!
 //! Designed under the `never-crash` standard: no `unwrap`, `expect`, `panic`, `todo`, or `unsafe`.
 
 use std::collections::HashMap;
+
+use crate::bim::{self, BimError, BimOptions, Slab, Storey, Wall, Zone};
 
 /// Class code assigned to interior furniture / clutter points removed before RLV & 3D extraction.
 pub const CLASS_FURNITURE: u8 = 22;
@@ -25,51 +35,6 @@ pub struct FurnitureFilterResult {
     pub keep_mask: Vec<bool>,
 }
 
-/// A detected 2D wall segment in the horizontal RLV plan.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WallSegment {
-    pub p1: [f64; 2],
-    pub p2: [f64; 2],
-    pub thickness: f64,
-    pub height: f64,
-}
-
-/// Kind of architectural opening detected along a wall.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OpeningKind {
-    Door,
-    Window,
-}
-
-impl OpeningKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Door => "door",
-            Self::Window => "window",
-        }
-    }
-}
-
-/// A door or window opening detected in the wall vertical profile.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RlvOpening {
-    pub kind: OpeningKind,
-    pub center: [f64; 2],
-    pub width: f64,
-    pub sill_z: f64,
-    pub head_z: f64,
-    pub orientation_rad: f64,
-}
-
-/// An automatic RLV dimension line placed inside a room or along a wall.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RlvDimension {
-    pub p1: [f64; 2],
-    pub p2: [f64; 2],
-    pub length_m: f64,
-    pub label: String,
-}
-
 /// One row of the automatic RLV room schedule table (`RLV_SCHEDULE`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoomScheduleRow {
@@ -82,22 +47,53 @@ pub struct RoomScheduleRow {
     pub boundary: Vec<[f64; 2]>,
 }
 
-/// Full output of the `AUTORLV` command.
+/// One storey of the model: the walls standing in it and the rooms they close.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoreyModel {
+    /// The void between two slabs, with [`BimOptions::safety_margin`] already taken off its ends.
+    pub storey: Storey,
+    /// The wall axes, measured where both faces were scanned and synthesised where only the room
+    /// side was.
+    pub walls: Vec<Wall>,
+    /// The closed room polygons the axes make, inside the wall faces.
+    pub zones: Vec<Zone>,
+    /// [`Self::zones`] as the schedule reads them, in the same order.
+    pub rooms: Vec<RoomScheduleRow>,
+}
+
+/// Full output of the `AUTORLV` command: the slabs the scan has, and each storey's walls and rooms.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AutoRlvResult {
+    /// The walking surface of the lowest slab.
     pub floor_z: f64,
+    /// The underside of the highest slab.
     pub ceiling_z: f64,
-    pub clear_height_m: f64,
-    pub furniture_removed: usize,
-    pub walls: Vec<WallSegment>,
-    pub openings: Vec<RlvOpening>,
-    pub dimensions: Vec<RlvDimension>,
-    pub rooms: Vec<RoomScheduleRow>,
+    /// Every horizontal surface the histogram found, ordered by `base_z`.
+    pub slabs: Vec<Slab>,
+    /// The storeys between them, in the same order.
+    pub storeys: Vec<StoreyModel>,
     pub total_usable_area_m2: f64,
     pub total_perimeter_m: f64,
 }
 
-/// A 3D extruded wall solid for `AUTO3D`.
+impl AutoRlvResult {
+    /// How many wall axes the pipeline found, across every storey.
+    pub fn walls(&self) -> usize {
+        self.storeys.iter().map(|s| s.walls.len()).sum()
+    }
+
+    /// How many closed rooms it found.
+    pub fn zones(&self) -> usize {
+        self.storeys.iter().map(|s| s.zones.len()).sum()
+    }
+
+    /// How many rows the schedule holds: one per zone.
+    pub fn rooms(&self) -> usize {
+        self.storeys.iter().map(|s| s.rooms.len()).sum()
+    }
+}
+
+/// A 3D wall for `AUTO3D`, extruded from the axis between the storey's floor and ceiling.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Wall3d {
     pub base_p1: [f64; 3],
@@ -106,25 +102,25 @@ pub struct Wall3d {
     pub thickness: f64,
 }
 
-/// A 3D horizontal slab (floor or ceiling) or pitched roof facet for `AUTO3D`.
+/// A horizontal slab face for `AUTO3D`, at the elevation a person sees from the room.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SlabOrRoof3d {
+pub struct Slab3d {
+    /// `floor_slab`, `ceiling_slab` or `slab`.
     pub kind: &'static str,
     pub vertices: Vec<[f64; 3]>,
     pub elevation_m: f64,
     pub thickness_m: f64,
 }
 
-/// Full output of the `AUTO3D` building reconstruction (structure only, no furniture).
+/// Full output of the `AUTO3D` building reconstruction: the walls and slabs the scan has. The wall
+/// slice sits above furniture height, so what stands in the rooms below it cannot become a wall,
+/// and nothing is invented for what the scan did not show.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Auto3dBuilding {
     pub floor_z: f64,
     pub ceiling_z: f64,
-    pub roof_ridge_z: f64,
-    pub furniture_removed: usize,
     pub walls_3d: Vec<Wall3d>,
-    pub slabs_and_roof: Vec<SlabOrRoof3d>,
-    pub openings: Vec<RlvOpening>,
+    pub slabs: Vec<Slab3d>,
 }
 
 /// Filter out interior furniture and clutter from an apartment/building scan by checking vertical
@@ -133,6 +129,10 @@ pub struct Auto3dBuilding {
 /// Structural walls and columns span at least `min_wall_ratio` of the room height, while floor and
 /// ceiling slabs lie within `slab_margin` of the 5th/95th Z percentiles. Isolated low clusters
 /// (sofas, tables, beds, cabinets) inside the room volume are marked `false` in `keep_mask`.
+///
+/// This is the `LASFURNITURE` filter, not part of `AUTORLV`: the Cloud2BIM pipeline defends the
+/// walls with its own ceiling slice, and deleting a point before measuring would hide it from the
+/// deviation stage Plan B adds.
 pub fn filter_interior_furniture(points: &[[f64; 3]], cell_xy: f64, slab_margin: f64, min_wall_ratio: f64) -> FurnitureFilterResult {
     if points.is_empty() {
         return FurnitureFilterResult::default();
@@ -201,235 +201,133 @@ pub fn filter_interior_furniture(points: &[[f64; 3]], cell_xy: f64, slab_margin:
     FurnitureFilterResult { total_points: points.len(), structural_points, furniture_points, floor_z, ceiling_z, keep_mask }
 }
 
-/// Extract a complete 2D Releveu (`AutoRlvResult`) from a point cloud:
-/// 1. Filters interior furniture volumetrically (`filter_interior_furniture`).
-/// 2. Projects structural wall points into a horizontal plan and fits orthogonal & arbitrary wall segments.
-/// 3. Detects door and window openings along the walls.
-/// 4. Partitions the interior footprint into rooms with usable areas (m²), perimeters (m), clear height (m) and automatic dimensions.
-pub fn extract_auto_rlv(points: &[[f64; 3]], remove_furniture: bool) -> AutoRlvResult {
-    let filter = filter_interior_furniture(points, 0.15, 0.18, 0.62);
-    let clear_h = (filter.ceiling_z - filter.floor_z).max(2.40);
-
-    let mut min_x = f64::INFINITY;
-    let mut max_x = f64::NEG_INFINITY;
-    let mut min_y = f64::INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-
-    for (idx, p) in points.iter().enumerate() {
-        if remove_furniture && !filter.keep_mask.get(idx).copied().unwrap_or(false) {
-            continue;
+/// The whole Cloud2BIM model of a scan: [`bim::slabs::find`], [`bim::storeys::split`], and then
+/// [`bim::walls::extract`] and [`bim::zones::build`] in every storey.
+///
+/// The options are the pipeline's own ([`BimOptions`]); nothing here reads the file, the selection
+/// or the UI. A cloud the histogram finds no surface in is [`BimError::Empty`] — the command says
+/// so rather than drawing an empty frame — and a scan whose slabs stand too close for a room keeps
+/// its slabs and reports no storey, because that is what the scan shows.
+///
+/// # Errors
+///
+/// Whatever the stages refuse: [`BimError::InvalidCell`] for an unusable option,
+/// [`BimError::TooLarge`] for a budget, [`BimError::Empty`] when nothing can be built.
+pub fn extract_auto_rlv(points: &[[f64; 3]], opts: &BimOptions) -> Result<AutoRlvResult, BimError> {
+    let slabs = bim::slabs::find(points, opts)?;
+    let storeys = bim::storeys::split(&slabs, opts);
+    let mut models = Vec::with_capacity(storeys.len());
+    let mut code = 1usize;
+    for storey in &storeys {
+        let walls = bim::walls::extract(points, storey, opts)?;
+        let zones = bim::zones::build(&walls, opts)?;
+        let clear_height = round2(storey.top_z - storey.base_z);
+        let mut rooms = Vec::with_capacity(zones.len());
+        for zone in &zones {
+            rooms.push(RoomScheduleRow {
+                code: format!("E{code:02}"),
+                name: "Spațiu".to_string(),
+                area_m2: round2(zone.area),
+                perimeter_m: round2(zone.perimeter),
+                clear_height_m: clear_height,
+                center: ring_centroid(&zone.ring),
+                boundary: zone.ring.clone(),
+            });
+            code = code.saturating_add(1);
         }
-        if p[0].is_finite() && p[1].is_finite() {
-            min_x = min_x.min(p[0]);
-            max_x = max_x.max(p[0]);
-            min_y = min_y.min(p[1]);
-            max_y = max_y.max(p[1]);
-        }
+        models.push(StoreyModel { storey: *storey, walls, zones, rooms });
     }
-
-    if !min_x.is_finite() || !max_x.is_finite() || (max_x - min_x) < 0.5 || (max_y - min_y) < 0.5 {
-        min_x = 0.0;
-        min_y = 0.0;
-        max_x = 9.60;
-        max_y = 6.80;
-    }
-
-    let w = (max_x - min_x).max(3.0);
-    let h = (max_y - min_y).max(3.0);
-    let x_mid = min_x + w * 0.56;
-    let y_mid = min_y + h * 0.48;
-
-    // Outer perimeter walls (25 cm structural thickness) + interior partition walls (12.5 cm).
-    let walls = vec![
-        WallSegment { p1: [min_x, min_y], p2: [max_x, min_y], thickness: 0.25, height: clear_h },
-        WallSegment { p1: [max_x, min_y], p2: [max_x, max_y], thickness: 0.25, height: clear_h },
-        WallSegment { p1: [max_x, max_y], p2: [min_x, max_y], thickness: 0.25, height: clear_h },
-        WallSegment { p1: [min_x, max_y], p2: [min_x, min_y], thickness: 0.25, height: clear_h },
-        WallSegment { p1: [x_mid, min_y], p2: [x_mid, max_y], thickness: 0.125, height: clear_h },
-        WallSegment { p1: [x_mid, y_mid], p2: [max_x, y_mid], thickness: 0.125, height: clear_h },
-    ];
-
-    let openings = vec![
-        RlvOpening {
-            kind: OpeningKind::Door,
-            center: [x_mid, min_y + (y_mid - min_y) * 0.5],
-            width: 0.90,
-            sill_z: filter.floor_z,
-            head_z: filter.floor_z + 2.10,
-            orientation_rad: std::f64::consts::FRAC_PI_2,
-        },
-        RlvOpening {
-            kind: OpeningKind::Door,
-            center: [x_mid, y_mid + (max_y - y_mid) * 0.45],
-            width: 0.80,
-            sill_z: filter.floor_z,
-            head_z: filter.floor_z + 2.10,
-            orientation_rad: std::f64::consts::FRAC_PI_2,
-        },
-        RlvOpening {
-            kind: OpeningKind::Window,
-            center: [min_x + (x_mid - min_x) * 0.5, max_y],
-            width: 1.80,
-            sill_z: filter.floor_z + 0.90,
-            head_z: filter.floor_z + 2.15,
-            orientation_rad: 0.0,
-        },
-        RlvOpening {
-            kind: OpeningKind::Window,
-            center: [x_mid + (max_x - x_mid) * 0.5, max_y],
-            width: 1.40,
-            sill_z: filter.floor_z + 0.90,
-            head_z: filter.floor_z + 2.15,
-            orientation_rad: 0.0,
-        },
-    ];
-
-    let r1_w = (x_mid - min_x - 0.30).max(1.0);
-    let r1_h = (h - 0.30).max(1.0);
-    let r2_w = (max_x - x_mid - 0.30).max(1.0);
-    let r2_h = (max_y - y_mid - 0.25).max(1.0);
-    let r3_w = r2_w;
-    let r3_h = (y_mid - min_y - 0.25).max(1.0);
-
-    let rooms = vec![
-        RoomScheduleRow {
-            code: "E01".to_string(),
-            name: "Camera de zi (Living)".to_string(),
-            area_m2: round2(r1_w * r1_h),
-            perimeter_m: round2(2.0 * (r1_w + r1_h)),
-            clear_height_m: round2(clear_h),
-            center: [(min_x + x_mid) * 0.5, (min_y + max_y) * 0.5],
-            boundary: vec![[min_x, min_y], [x_mid, min_y], [x_mid, max_y], [min_x, max_y]],
-        },
-        RoomScheduleRow {
-            code: "E02".to_string(),
-            name: "Dormitor".to_string(),
-            area_m2: round2(r2_w * r2_h),
-            perimeter_m: round2(2.0 * (r2_w + r2_h)),
-            clear_height_m: round2(clear_h),
-            center: [(x_mid + max_x) * 0.5, (y_mid + max_y) * 0.5],
-            boundary: vec![[x_mid, y_mid], [max_x, y_mid], [max_x, max_y], [x_mid, max_y]],
-        },
-        RoomScheduleRow {
-            code: "E03".to_string(),
-            name: "Bucătărie + Hol".to_string(),
-            area_m2: round2(r3_w * r3_h),
-            perimeter_m: round2(2.0 * (r3_w + r3_h)),
-            clear_height_m: round2(clear_h),
-            center: [(x_mid + max_x) * 0.5, (min_y + y_mid) * 0.5],
-            boundary: vec![[x_mid, min_y], [max_x, min_y], [max_x, y_mid], [x_mid, y_mid]],
-        },
-    ];
-
-    let dimensions = vec![
-        RlvDimension { p1: [min_x, min_y + 0.45], p2: [x_mid, min_y + 0.45], length_m: round2(r1_w), label: format!("{:.2} m", r1_w) },
-        RlvDimension { p1: [min_x + 0.45, min_y], p2: [min_x + 0.45, max_y], length_m: round2(r1_h), label: format!("{:.2} m", r1_h) },
-        RlvDimension { p1: [x_mid, max_y - 0.45], p2: [max_x, max_y - 0.45], length_m: round2(r2_w), label: format!("{:.2} m", r2_w) },
-        RlvDimension { p1: [max_x - 0.45, y_mid], p2: [max_x - 0.45, max_y], length_m: round2(r2_h), label: format!("{:.2} m", r2_h) },
-    ];
-
-    let total_usable_area_m2 = round2(rooms.iter().map(|r| r.area_m2).sum());
-    let total_perimeter_m = round2(rooms.iter().map(|r| r.perimeter_m).sum());
-
-    AutoRlvResult {
-        floor_z: round2(filter.floor_z),
-        ceiling_z: round2(filter.ceiling_z),
-        clear_height_m: round2(clear_h),
-        furniture_removed: filter.furniture_points,
-        walls,
-        openings,
-        dimensions,
-        rooms,
-        total_usable_area_m2,
-        total_perimeter_m,
-    }
+    let floor_z = slabs.first().map(|s| round2(s.top_z)).unwrap_or(0.0);
+    let ceiling_z = slabs.last().map(|s| round2(s.base_z)).unwrap_or(floor_z);
+    let total_usable_area_m2 = round2(models.iter().flat_map(|m| m.rooms.iter()).map(|r| r.area_m2).sum());
+    let total_perimeter_m = round2(models.iter().flat_map(|m| m.rooms.iter()).map(|r| r.perimeter_m).sum());
+    Ok(AutoRlvResult { floor_z, ceiling_z, slabs, storeys: models, total_usable_area_m2, total_perimeter_m })
 }
 
-/// Reconstruct a 3D structural model (`Auto3dBuilding`: extruded 3D walls, floor slab, ceiling slab
-/// and roof geometry) directly from the point cloud, excluding interior furniture.
-pub fn extract_auto_3d_building(points: &[[f64; 3]], include_roof: bool) -> Auto3dBuilding {
-    let rlv = extract_auto_rlv(points, true);
-    let floor_z = rlv.floor_z;
-    let ceiling_z = rlv.ceiling_z;
-
+/// Reconstruct a 3D structural model (`Auto3dBuilding`: the wall planes and the slab faces) from
+/// the same model `AUTORLV` draws, without furniture and without a guessed roof.
+///
+/// A wall is extruded from its axis between the base of its storey and the storey's top. A slab
+/// face sits where a person sees it from the room — the walking surface for the floor, the
+/// underside for everything above it — and carries the slab's measured or named thickness.
+///
+/// # Errors
+///
+/// The same refusals as [`extract_auto_rlv`], because this is that model read in 3D.
+pub fn extract_auto_3d_building(points: &[[f64; 3]], opts: &BimOptions) -> Result<Auto3dBuilding, BimError> {
+    let rlv = extract_auto_rlv(points, opts)?;
     let walls_3d: Vec<Wall3d> = rlv
-        .walls
+        .storeys
         .iter()
-        .map(|w| Wall3d { base_p1: [w.p1[0], w.p1[1], floor_z], base_p2: [w.p2[0], w.p2[1], floor_z], top_z: ceiling_z, thickness: w.thickness })
+        .flat_map(|storey| storey.walls.iter())
+        .map(|w| Wall3d {
+            base_p1: [w.from[0], w.from[1], w.base_z],
+            base_p2: [w.to[0], w.to[1], w.base_z],
+            top_z: w.base_z + w.height,
+            thickness: w.thickness,
+        })
         .collect();
+    let last = rlv.slabs.len().saturating_sub(1);
+    let slabs: Vec<Slab3d> = rlv
+        .slabs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let kind = if i == 0 {
+                "floor_slab"
+            } else if i == last {
+                "ceiling_slab"
+            } else {
+                "slab"
+            };
+            let z = if i == 0 { s.top_z } else { s.base_z };
+            Slab3d { kind, vertices: s.polygon.iter().map(|p| [p[0], p[1], z]).collect(), elevation_m: z, thickness_m: s.thickness }
+        })
+        .collect();
+    Ok(Auto3dBuilding { floor_z: rlv.floor_z, ceiling_z: rlv.ceiling_z, walls_3d, slabs })
+}
 
-    let mut min_x = f64::INFINITY;
-    let mut max_x = f64::NEG_INFINITY;
-    let mut min_y = f64::INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-    for w in &rlv.walls {
-        for p in [w.p1, w.p2] {
-            min_x = min_x.min(p[0]);
-            max_x = max_x.max(p[0]);
-            min_y = min_y.min(p[1]);
-            max_y = max_y.max(p[1]);
-        }
+/// The area centroid of a closed ring, in world metres.
+///
+/// A degenerate ring (zero area, for instance two points repeated) falls back to the mean of its
+/// vertices, so a label always has a place to sit; an empty ring is the origin, which the caller
+/// never draws.
+fn ring_centroid(ring: &[[f64; 2]]) -> [f64; 2] {
+    let n = ring.len();
+    let mut twice_area = 0.0;
+    let mut cx = 0.0;
+    let mut cy = 0.0;
+    for i in 0..n {
+        let (Some(a), Some(b)) = (ring.get(i), ring.get((i + 1) % n)) else {
+            continue;
+        };
+        let cross = a[0] * b[1] - b[0] * a[1];
+        twice_area += cross;
+        cx += (a[0] + b[0]) * cross;
+        cy += (a[1] + b[1]) * cross;
     }
-    if !min_x.is_finite() {
-        min_x = 0.0;
-        min_y = 0.0;
-        max_x = 9.6;
-        max_y = 6.8;
+    if twice_area.abs() > f64::EPSILON {
+        return [cx / (3.0 * twice_area), cy / (3.0 * twice_area)];
     }
-
-    let mut slabs_and_roof = vec![
-        SlabOrRoof3d {
-            kind: "floor_slab",
-            vertices: vec![[min_x, min_y, floor_z], [max_x, min_y, floor_z], [max_x, max_y, floor_z], [min_x, max_y, floor_z]],
-            elevation_m: floor_z,
-            thickness_m: 0.15,
-        },
-        SlabOrRoof3d {
-            kind: "ceiling_slab",
-            vertices: vec![[min_x, min_y, ceiling_z], [max_x, min_y, ceiling_z], [max_x, max_y, ceiling_z], [min_x, max_y, ceiling_z]],
-            elevation_m: ceiling_z,
-            thickness_m: 0.15,
-        },
-    ];
-
-    let ridge_z = if include_roof { ceiling_z + ((max_y - min_y) * 0.25).clamp(1.2, 3.2) } else { ceiling_z };
-    if include_roof {
-        let mid_y = (min_y + max_y) * 0.5;
-        slabs_and_roof.push(SlabOrRoof3d {
-            kind: "roof_south_slope",
-            vertices: vec![[min_x, min_y, ceiling_z], [max_x, min_y, ceiling_z], [max_x, mid_y, ridge_z], [min_x, mid_y, ridge_z]],
-            elevation_m: ridge_z,
-            thickness_m: 0.18,
-        });
-        slabs_and_roof.push(SlabOrRoof3d {
-            kind: "roof_north_slope",
-            vertices: vec![[min_x, max_y, ceiling_z], [max_x, max_y, ceiling_z], [max_x, mid_y, ridge_z], [min_x, mid_y, ridge_z]],
-            elevation_m: ridge_z,
-            thickness_m: 0.18,
-        });
+    if n == 0 {
+        return [0.0, 0.0];
     }
-
-    Auto3dBuilding {
-        floor_z,
-        ceiling_z,
-        roof_ridge_z: round2(ridge_z),
-        furniture_removed: rlv.furniture_removed,
-        walls_3d,
-        slabs_and_roof,
-        openings: rlv.openings,
-    }
+    let count = n as f64;
+    [ring.iter().map(|p| p[0]).sum::<f64>() / count, ring.iter().map(|p| p[1]).sum::<f64>() / count]
 }
 
 fn round2(v: f64) -> f64 {
-    (v * 100.0).round() / 100.0
+    let r = (v * 100.0).round() / 100.0;
+    // `f64::sum` starts at -0.0, so an empty model formats its total as "-0.00 m²"; a total is a
+    // magnitude, and zero is zero whichever sign the addend carried.
+    if r == 0.0 { 0.0 } else { r }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn interior_furniture_is_filtered_while_walls_and_slabs_survive() {
+    fn interior_furniture_fixture() -> Vec<[f64; 3]> {
         let mut pts = Vec::new();
         // Floor slab at Z=0 and ceiling slab at Z=2.70
         for i in 0..20 {
@@ -452,12 +350,108 @@ mod tests {
                 pts.push([f64::from(i) * 0.25, f64::from(j) * 0.25, 0.65]);
             }
         }
+        pts
+    }
+
+    #[test]
+    fn a_total_with_no_addends_is_positive_zero() {
+        // `f64::sum` starts at -0.0: an empty model reported "Su total = -0.00 m²", and the
+        // reply's `totalUsableAreaM2` serialised as -0.0. A magnitude cannot be negative zero.
+        let sum: f64 = std::iter::empty::<f64>().sum();
+        assert!(sum.is_sign_negative(), "the reason the rounding has to normalise: {sum}");
+        assert!(round2(sum).is_sign_positive(), "an empty total formats as 0.00, not -0.00");
+        assert!(round2(-0.001).is_sign_positive(), "and anything that rounds to zero is still zero");
+        assert_eq!(round2(1.234), 1.23, "non-zero totals keep their value");
+    }
+
+    #[test]
+    fn interior_furniture_is_filtered_while_walls_and_slabs_survive() {
+        let pts = interior_furniture_fixture();
         let res = filter_interior_furniture(&pts, 0.20, 0.15, 0.60);
         assert!(res.furniture_points >= 20, "the sofa in the middle is removed: {res:?}");
         assert!(res.structural_points > 800, "the slabs and walls are kept: {res:?}");
-        let rlv = extract_auto_rlv(&pts, true);
-        assert!(!rlv.walls.is_empty());
-        assert!(!rlv.rooms.is_empty());
-        assert!(rlv.total_usable_area_m2 > 0.0);
+    }
+
+    /// A 6 x 4 m room split by a partition at x = 3: 0.20 m walls, floor at z = 0, ceiling at
+    /// z = 2.80, scanned from inside. See the engine test of the same shape for why the points are
+    /// where they are: the floor and ceiling planes are the histogram's tallest bins, the four
+    /// outer faces are single-sided, and the partition shows both of its faces.
+    fn room_scan() -> Vec<[f64; 3]> {
+        let mut pts = Vec::new();
+        let mut i = 0;
+        while i <= 300 {
+            let x = f64::from(i) * 0.02;
+            let mut j = 0;
+            while j <= 200 {
+                let y = f64::from(j) * 0.02;
+                pts.push([x, y, 0.0]);
+                pts.push([x, y, 2.8]);
+                j += 1;
+            }
+            i += 1;
+        }
+        let levels = [0.1, 0.9, 1.7, 2.45, 2.55, 2.65];
+        let mut k = 0;
+        while k <= 300 {
+            let t = -0.01 + 0.02 * f64::from(k);
+            for z in levels {
+                pts.push([t, 0.2, z]);
+                pts.push([t, 3.8, z]);
+            }
+            k += 1;
+        }
+        let mut k = 0;
+        while k <= 200 {
+            let t = -0.01 + 0.02 * f64::from(k);
+            for z in levels {
+                pts.push([0.2, t, z]);
+                pts.push([5.8, t, z]);
+            }
+            k += 1;
+        }
+        let mut u = 2.91;
+        while u <= 3.09 + 1e-9 {
+            let mut y = 0.2;
+            while y <= 3.8 + 1e-9 {
+                for z in levels {
+                    pts.push([u, y, z]);
+                }
+                y += 0.1;
+            }
+            u += 0.02;
+        }
+        pts
+    }
+
+    #[test]
+    fn the_model_is_the_rooms_the_scan_has_and_not_a_bounding_box() {
+        let rlv = extract_auto_rlv(&room_scan(), &BimOptions::default()).expect("the room has a model");
+        assert_eq!(rlv.slabs.len(), 2, "the floor and the ceiling");
+        assert_eq!(rlv.storeys.len(), 1, "one void between them");
+        assert_eq!(rlv.walls(), 5, "four outer faces, synthesised, and one measured partition");
+        assert_eq!(rlv.zones(), 2, "the partition splits the room");
+        assert_eq!(rlv.rooms(), 2);
+        assert!((rlv.total_usable_area_m2 - 19.44).abs() <= 0.2, "two 2.7 x 3.6 rooms, got {}", rlv.total_usable_area_m2);
+        let codes: Vec<&str> = rlv.storeys[0].rooms.iter().map(|r| r.code.as_str()).collect();
+        assert_eq!(codes, ["E01", "E02"]);
+        for room in &rlv.storeys[0].rooms {
+            assert!((room.clear_height_m - 2.6).abs() < 1e-9, "the storey's margined height, got {}", room.clear_height_m);
+            assert!(room.boundary.len() >= 3, "a room has an outline");
+        }
+    }
+
+    #[test]
+    fn auto3d_uses_the_same_model_and_says_no_roof_it_did_not_see() {
+        let bld = extract_auto_3d_building(&room_scan(), &BimOptions::default()).expect("the room has a model");
+        assert_eq!(bld.walls_3d.len(), 5);
+        assert_eq!(bld.slabs.len(), 2, "the floor and the ceiling, and nothing invented above them");
+        assert_eq!(bld.slabs.iter().map(|s| s.kind).collect::<Vec<_>>(), ["floor_slab", "ceiling_slab"]);
+        assert!(bld.slabs.iter().all(|s| !s.vertices.is_empty()), "each slab is drawn from its own plan");
+    }
+
+    #[test]
+    fn a_cloud_with_no_surfaces_is_an_error_and_not_an_empty_frame() {
+        let r = extract_auto_rlv(&[], &BimOptions::default());
+        assert!(matches!(r, Err(BimError::Empty)), "{r:?}");
     }
 }

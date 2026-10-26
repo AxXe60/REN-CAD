@@ -214,11 +214,16 @@ fn percentile(values: &[f32], count: usize, top: &[usize; 1 << HISTOGRAM_BITS]) 
     f64::from(key_point(prefix))
 }
 
+/// The grey of a point the reference has nothing for: a cloud that was never compared, and a point
+/// that found no neighbour in the one it was compared with. The legend names it, so the key holds
+/// every colour the drawing can produce.
+pub const DEVIATION_NO_DATA: [u8; 3] = [120, 120, 120];
+
 /// The colour of a deviation, on the scale survey offices read: blue for a small deviation, green
 /// in the middle, red for a large one. The point outside the reference stays grey.
 pub fn deviation_color(distance: f32, scale: f32) -> [u8; 3] {
     if !distance.is_finite() {
-        return [120, 120, 120];
+        return DEVIATION_NO_DATA;
     }
     let scale = if scale > 0.0 && scale.is_finite() { scale } else { 1.0 };
     let t = (f64::from(distance) / f64::from(scale)).clamp(0.0, 1.0) as f32;

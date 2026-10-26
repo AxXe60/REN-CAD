@@ -689,6 +689,7 @@ version = "0.12.0"
 dependencies = [
  "cadcraft-engine",
  "cadcraft-io",
+ "cadcraft-pointcloud",
  "cadcraft-render",
  "getrandom 0.4.3",
  "log",
@@ -700,6 +701,7 @@ name = "cadcraft-pointcloud"
 version = "0.12.0"
 dependencies = [
  "cadcraft-dxf",
+ "cadcraft-geom",
  "las",
  "serde_json",
  "thiserror 2.0.21",

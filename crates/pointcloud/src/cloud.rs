@@ -7,7 +7,7 @@
 //! origin, and the canvas picks the level whose spacing is about two screen pixels. Zoomed out it
 //! draws thousands; zoomed in, more — never more than the screen can show.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::{Bounds3, Result, Slice};
@@ -134,9 +134,18 @@ pub struct Cloud {
     /// The same 2%–98% window for the intensity, in the 0..255 scale the vertices use.
     pub ip02: u8,
     pub ip98: u8,
+    /// The two endpoints the user named for the elevation ramp, in metres. `None` is Auto: the
+    /// band's own 2%–98% window. A scan whose interesting wall sits in a tenth of its height reads
+    /// as one flat colour on the auto window, and this is how the user pulls it apart.
+    pub z_window: Option<(f64, f64)>,
+    /// The same for the intensity ramp, on the 0..255 scale the vertices and the histogram use.
+    pub i_window: Option<(u8, u8)>,
     pub bounds: Bounds3,
     pub visible: bool,
     pub color: CloudColor,
+    /// Display multipliers for the scanner's RGB, both bounded to 0.25..=4 by LASCOLOR and Auto.
+    pub rgb_exposure: f32,
+    pub rgb_contrast: f32,
     /// Crop box: `None` draws every point of the band.
     pub clip: Option<Clip>,
     /// Draw only the points the ground filter found.
@@ -153,6 +162,10 @@ pub struct Cloud {
     pub cluster_info: Vec<crate::cluster::Cluster>,
     /// The points the groups were read on: the nearest of them gives a point its group.
     pub cluster_sample: Vec<[f64; 3]>,
+    /// How many times the class bytes were rewritten in place. The classifiers change `level.classes`
+    /// without moving a point, and the drawing caches a plan by the cloud's state: without this
+    /// counter a re-classification keeps the colours of the one before it.
+    pub class_revision: u64,
     /// The colour scale the intensity and the elevation bands are read on.
     pub spectrum: crate::spectrum::Spectrum,
     /// Whether the cloud belongs to the drawing it was opened in: an attached cloud is written
@@ -167,6 +180,9 @@ pub struct Cloud {
     /// The band's heights in 64 bins, so the palette can draw the scan's profile and the user can
     /// see where the floor and the ceiling are.
     pub zhisto: [u32; 64],
+    /// The band's returns in 64 bins of the 0..255 scale, so the same palette can show where the
+    /// bright walls sit and how wide the window the ramp reads is.
+    pub ihisto: [u32; 64],
     /// Where the file says it is (the EPSG code and the WKT), when it says anything.
     pub crs: Option<crate::Crs>,
     /// Finest first.
@@ -198,10 +214,11 @@ impl Cloud {
         z0: f64,
         z1: f64,
         decimate: Option<f64>,
-        slice: Slice,
+        mut slice: Slice,
         max_points: usize,
         color: CloudColor,
     ) -> Self {
+        crate::normalize_rgb(&mut slice.points);
         let b = slice.bounds;
         let origin = [b.min[0], b.min[1]];
         let (zmin, zmax) = (b.min[2], b.max[2]);
@@ -216,6 +233,9 @@ impl Cloud {
         // the other 99% of the points.
         let (zp02, zp98) = bin_percentiles(&windows.zhist, zmin, zmax, slice.points.len());
         let (ip02, ip98) = intensity_percentiles(&windows.ihist, norm);
+        // The returns in the 64 bins the palette draws: folded from the counts of the same walk,
+        // so the bars are the numbers the percentiles above were read from.
+        let ihisto = fold_to_64(&windows.ihist, norm);
         // No `decimate` (or `0`) means the source points themselves: the finest level keeps every
         // point of the band, up to the memory cap. A cell is the drafting answer for huge scans.
         let asked = decimate.filter(|c| *c > 0.0);
@@ -270,9 +290,13 @@ impl Cloud {
             imax,
             ip02,
             ip98,
+            z_window: None,
+            i_window: None,
             bounds: b,
             visible: true,
             color,
+            rgb_exposure: 1.0,
+            rgb_contrast: 1.0,
             clip: None,
             ground_only: false,
             opacity: 1.0,
@@ -280,11 +304,13 @@ impl Cloud {
             dev_stats: None,
             cluster_info: Vec::new(),
             cluster_sample: Vec::new(),
+            class_revision: 0,
             spectrum: crate::spectrum::Spectrum::BlueRed,
             attached: false,
             doc: 0,
             offset: [0.0; 3],
             zhisto: windows.profile,
+            ihisto,
             crs: None,
             levels,
             full_points: slice.in_band as usize,
@@ -378,6 +404,7 @@ impl Cloud {
                 finest = result;
             }
         }
+        self.class_revision = self.class_revision.saturating_add(1);
         finest
     }
 
@@ -405,6 +432,7 @@ impl Cloud {
                 finest = result;
             }
         }
+        self.class_revision = self.class_revision.saturating_add(1);
         finest
     }
 
@@ -460,6 +488,50 @@ impl Cloud {
                 *c = classes.get(label).copied().unwrap_or(crate::classify::CLASS_UNCLASSIFIED);
             }
         }
+        self.class_revision = self.class_revision.saturating_add(1);
+    }
+
+    /// Exposure and contrast chosen from the finest level's luminance percentiles.
+    /// Empty clouds keep neutral shading, and so does a cloud whose colour has no spread: contrast
+    /// has nothing to stretch there, and stretching it would push a flat field past white.
+    pub fn auto_rgb(&self) -> (f32, f32) {
+        let Some(level) = self.levels.first().filter(|level| !level.pts.is_empty()) else { return (1.0, 1.0) };
+        let mut luminance = Vec::with_capacity(level.pts.len());
+        let mut sum = 0.0f64;
+        for v in &level.pts {
+            let [r, g, b] = v.rgb.map(f32::from);
+            let value = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+            luminance.push(value);
+            sum += f64::from(value);
+        }
+        luminance.sort_by(f32::total_cmp);
+        let last = luminance.len().saturating_sub(1);
+        let at = |fraction: f32| luminance.get(((last as f32 * fraction).round() as usize).min(last)).copied().unwrap_or(0.5);
+        let span = at(0.98) - at(0.02);
+        // Under two hundredths of the scale there is no spread to gain, and maximum contrast on a
+        // near-flat field moves every channel past the clamp: the picture goes white.
+        let contrast = if span > 0.02 { (0.8 / span).clamp(0.25, 4.0) } else { 1.0 };
+        let mean = (sum / luminance.len() as f64) as f32;
+        let adjusted = ((mean - 0.5) * contrast + 0.5).clamp(0.05, 1.0);
+        let exposure = (0.55 / adjusted).clamp(0.25, 4.0);
+        (exposure, contrast)
+    }
+
+    /// The window the elevation ramp reads on: the endpoints the user named, or the band's own
+    /// 2%–98% window when they named none.
+    pub fn elevation_window(&self) -> (f64, f64) {
+        self.z_window.unwrap_or((self.zp02, self.zp98))
+    }
+
+    /// The window the intensity ramp reads on, on the 0..255 scale the vertices and `ihisto` use.
+    pub fn intensity_window(&self) -> (u8, u8) {
+        self.i_window.unwrap_or((self.ip02, self.ip98))
+    }
+
+    /// The bin of `ihisto` a return of this 0..255 value is counted in — the bin the palette lights
+    /// up when it names a value back to the user.
+    pub fn bin_of_intensity(&self, value: u8) -> usize {
+        bin_of_u8(value)
     }
 
     /// The colour of one vertex under the cloud's colour mode.
@@ -469,24 +541,30 @@ impl Cloud {
     /// when the colour mode asks for the class colours.
     pub fn color_of(&self, v: &CloudVtx, deviation: Option<f32>, class: Option<u8>) -> [u8; 3] {
         match self.color {
-            CloudColor::Rgb => v.rgb,
+            CloudColor::Rgb => v.rgb.map(|channel| {
+                let value = f32::from(channel) / 255.0;
+                ((((value - 0.5) * self.rgb_contrast + 0.5) * self.rgb_exposure).clamp(0.0, 1.0) * 255.0).round() as u8
+            }),
             // A spectrum, not grey: the band's darkest return reads blue and its brightest red,
-            // so two walls with slightly different returns stay distinguishable. The ramp runs
-            // over the 2%–98% window, so a few hot returns cannot flatten the rest.
+            // so two walls with slightly different returns stay distinguishable. The ramp runs over
+            // the window the user left on Auto (the 2%–98% one, so a few hot returns cannot flatten
+            // the rest) or the one they named.
             CloudColor::Intensity => {
-                let span = f32::from(self.ip98) - f32::from(self.ip02);
-                let t = if span > 0.0 { (f32::from(v.intensity) - f32::from(self.ip02)) / span } else { 0.5 };
+                let (lo, hi) = self.intensity_window();
+                let span = f32::from(hi) - f32::from(lo);
+                let t = if span > 0.0 { (f32::from(v.intensity) - f32::from(lo)) / span } else { 0.5 };
                 self.spectrum.apply(t.clamp(0.0, 1.0))
             }
             CloudColor::Single(c) => c,
             CloudColor::Deviation => match deviation {
                 Some(d) => crate::compare::deviation_color(d, self.dev_scale),
-                None => [120, 120, 120],
+                None => crate::compare::DEVIATION_NO_DATA,
             },
             CloudColor::Class => crate::classify::class_color(class.unwrap_or(crate::classify::CLASS_UNCLASSIFIED)),
             CloudColor::Elevation => {
-                let span = self.zp98 - self.zp02;
-                let t = if span > 0.0 { (f64::from(v.z) - self.zp02) / span } else { 0.5 };
+                let (lo, hi) = self.elevation_window();
+                let span = hi - lo;
+                let t = if span > 0.0 { (f64::from(v.z) - lo) / span } else { 0.5 };
                 self.spectrum.apply(t.clamp(0.0, 1.0) as f32)
             }
         }
@@ -646,6 +724,26 @@ fn intensity_percentiles(raw: &[u32], norm: Norm) -> (u8, u8) {
     (lo as u8, hi as u8)
 }
 
+/// The 64-bin return histogram, folded from the same walk's 65 536 counts: a 16-bit value first
+/// takes the 0..255 stretch the vertices carry, then the bin of that scale. The counts of a value
+/// therefore land where the ramp reads it, and every point of the band lands in exactly one bin.
+fn fold_to_64(raw: &[u32], norm: Norm) -> [u32; 64] {
+    let mut out = [0u32; 64];
+    for (v, n) in raw.iter().enumerate() {
+        if *n == 0 {
+            continue;
+        }
+        let b = bin_of_u8(norm.u8(v as u16));
+        out[b] = out[b].saturating_add(*n);
+    }
+    out
+}
+
+/// The bin of the 0..255 return scale a vertex's own intensity falls in: four values per bin.
+fn bin_of_u8(v: u8) -> usize {
+    (usize::from(v) * 64 / INTENSITY_BINS).min(63)
+}
+
 /// Stretches 16-bit intensities to the band: the darkest becomes 0, the brightest 255.
 #[derive(Clone, Copy)]
 struct Norm {
@@ -661,13 +759,54 @@ impl Norm {
     }
 }
 
-/// One point per `cell`-metre cube, keeping the first in file order; `cell` 0 keeps every point.
+/// One grid cell's display accumulator. Its representative remains the first real point that
+/// entered the cell; only RGB and intensity average the cell's points.
+#[derive(Clone, Copy)]
+struct CellAcc {
+    out: usize,
+    count: u64,
+    rgb: [u64; 3],
+    intensity: u64,
+}
+
+/// Average an accumulated u8 attribute, rounded half up. Saturating arithmetic keeps hostile
+/// point counts from overflowing the sum.
+fn average_u8(sum: u64, count: u64) -> u8 {
+    if count == 0 {
+        return 0;
+    }
+    let rounded = sum.saturating_add(count / 2);
+    rounded.checked_div(count).unwrap_or(255).min(255) as u8
+}
+
+/// Add one cell point's display attributes to its accumulator.
+fn add_cell_point(acc: &mut CellAcc, rgb: [u8; 3], intensity: u8) {
+    acc.count = acc.count.saturating_add(1);
+    for (total, channel) in acc.rgb.iter_mut().zip(rgb) {
+        *total = total.saturating_add(u64::from(channel));
+    }
+    acc.intensity = acc.intensity.saturating_add(u64::from(intensity));
+}
+
+/// Write each cell's averaged display attributes onto its real representative.
+fn finish_cells(out: &mut [CloudVtx], accs: &[CellAcc]) {
+    for acc in accs {
+        if let Some(vertex) = out.get_mut(acc.out) {
+            vertex.rgb = acc.rgb.map(|sum| average_u8(sum, acc.count));
+            vertex.intensity = average_u8(acc.intensity, acc.count);
+        }
+    }
+}
+
+/// One point per `cell`-metre cube. The first point in file order supplies the real position and
+/// class; every point in the cell contributes its display RGB and intensity to that representative.
+/// `cell` 0 keeps every point.
 ///
 /// The cube is three-dimensional on purpose: an XY-only grid keeps one point per column, so a
 /// vertical wall loses every point but one and the walls disappear from the 3D view.
 ///
 /// The classification of the point that was kept travels with it, and so does the point's place
-/// in the band: the coarser levels are decimated from the levels below them and need the band
+/// in the band: the coarser levels are aggregated from the levels below them and need the band
 /// coordinates of the kept points to compute the same cells the band would give.
 fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> (Vec<CloudVtx>, Vec<u8>, Vec<usize>) {
     let held = points.len().min(4_000_000);
@@ -678,7 +817,7 @@ fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> (Vec<C
         x: (p.x - origin[0]) as f32,
         y: (p.y - origin[1]) as f32,
         z: p.z as f32,
-        rgb: p.rgb.unwrap_or([220, 220, 220]),
+        rgb: p.rgb.map(|rgb| rgb.map(|channel| channel as u8)).unwrap_or([220, 220, 220]),
         intensity: norm.u8(p.intensity),
     };
     if cell <= 0.0 || !cell.is_finite() {
@@ -688,17 +827,26 @@ fn grid(points: &[crate::Pt], cell: f64, origin: [f64; 2], norm: Norm) -> (Vec<C
         return (out, classes, indices);
     }
     let inv = 1.0 / cell;
-    // The set holds one key per cell kept, so it grows with the decimation result rather than the
+    // The map holds one key per cell kept, so it grows with the aggregation result rather than the
     // points it walks: a 4-million-point band on a 1 cm grid rarely keeps a million cells.
-    let mut seen: HashSet<(i64, i64, i64)> = HashSet::new();
+    let mut cells: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let mut accs: Vec<CellAcc> = Vec::with_capacity(held);
     for (at, p) in points.iter().enumerate() {
-        if !seen.insert(band_cell(p, origin, inv)) {
+        let key = band_cell(p, origin, inv);
+        let first = vtx(p);
+        if let Some(&acc_at) = cells.get(&key) {
+            if let Some(acc) = accs.get_mut(acc_at) {
+                add_cell_point(acc, first.rgb, first.intensity);
+            }
             continue;
         }
-        out.push(vtx(p));
+        cells.insert(key, accs.len());
+        accs.push(CellAcc { out: out.len(), count: 1, rgb: first.rgb.map(u64::from), intensity: u64::from(first.intensity) });
+        out.push(first);
         classes.push(p.class);
         indices.push(at);
     }
+    finish_cells(&mut out, &accs);
     (out, classes, indices)
 }
 
@@ -708,8 +856,9 @@ fn band_cell(p: &crate::Pt, origin: [f64; 2], inv: f64) -> (i64, i64, i64) {
     (((p.x - origin[0]) * inv).floor() as i64, ((p.y - origin[1]) * inv).floor() as i64, (p.z * inv).floor() as i64)
 }
 
-/// One coarser level, decimated from the level above it: walk the level's points in their band
-/// order and keep the first of every `cell`-metre cube.
+/// One coarser level, aggregated from the level above it: walk the level's representatives in
+/// their band order, keep the first real position of every `cell`-metre cube, and average the
+/// display attributes of the representatives that fall in it.
 ///
 /// The keys come from the band coordinates the level's points came from (the indices walk the
 /// band), so the cubes are the same the band itself would give. The cell must be a whole multiple
@@ -720,8 +869,8 @@ fn band_cell(p: &crate::Pt, origin: [f64; 2], inv: f64) -> (i64, i64, i64) {
 /// cube, which is the first of the band's points in it, exactly what decimating the band again
 /// gives.
 ///
-/// The classification the level above carries travels with the point, and the point's place in
-/// the band travels too, so the next step can do the same.
+/// The classification the level above carries travels with the representative, and the
+/// representative's place in the band travels too, so the next step can do the same.
 fn grid_below(
     band: &[crate::Pt],
     indices: &[usize],
@@ -735,17 +884,28 @@ fn grid_below(
     let mut out_classes = Vec::with_capacity(held);
     let mut kept = Vec::with_capacity(held);
     let inv = 1.0 / cell;
-    // The set holds one key per cell kept, so it grows with the decimation result rather than the
+    // The map holds one key per cell kept, so it grows with the aggregation result rather than the
     // level it walks (see `grid`).
-    let mut seen: HashSet<(i64, i64, i64)> = HashSet::new();
+    let mut cells: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let mut accs: Vec<CellAcc> = Vec::with_capacity(held);
     for (i, &at) in indices.iter().enumerate() {
-        if !seen.insert(band_cell(&band[at], origin, inv)) {
+        let (Some(point), Some(vertex)) = (band.get(at), pts.get(i)) else { continue };
+        let key = band_cell(point, origin, inv);
+        if let Some(&acc_at) = cells.get(&key) {
+            if let Some(acc) = accs.get_mut(acc_at) {
+                add_cell_point(acc, vertex.rgb, vertex.intensity);
+            }
             continue;
         }
-        out.push(pts[i]);
-        out_classes.push(classes[i]);
+        cells.insert(key, accs.len());
+        accs.push(CellAcc { out: out.len(), count: 1, rgb: vertex.rgb.map(u64::from), intensity: u64::from(vertex.intensity) });
+        out.push(*vertex);
+        if let Some(class) = classes.get(i) {
+            out_classes.push(*class);
+        }
         kept.push(at);
     }
+    finish_cells(&mut out, &accs);
     (out, out_classes, kept)
 }
 
@@ -765,6 +925,56 @@ mod tests {
         }
         let n = points.len() as u64;
         Slice { points, total: n, in_band: n, bounds: b }
+    }
+
+    #[test]
+    fn aggregates_cell_attributes_onto_first_real_point_deterministically() {
+        let points = vec![
+            crate::Pt { x: 0.1, y: 0.2, z: 0.3, rgb: Some([10, 20, 30]), intensity: 0, class: 2 },
+            crate::Pt { x: 0.4, y: 0.5, z: 0.6, rgb: Some([30, 40, 50]), intensity: 200, class: 9 },
+        ];
+        let build = || Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, Some(1.0), slice_of(points.clone()), 1000, CloudColor::Rgb);
+        let first = build();
+        let second = build();
+
+        assert_eq!(first.levels[0].pts.len(), 1, "both source points share one grid cell");
+        let p = &first.levels[0].pts[0];
+        assert_eq!((p.x, p.y, p.z), (0.0, 0.0, 0.3), "the representative keeps the first real point's coordinates");
+        assert_eq!(p.rgb, [20, 30, 40], "RGB is averaged over both points in the cell");
+        assert_eq!(p.intensity, 128, "normalized intensities 0 and 255 average to 128");
+        assert_eq!(first.levels[0].classes, [2], "the first point's class is retained");
+
+        let signature = |cloud: &Cloud| {
+            cloud
+                .levels
+                .iter()
+                .map(|l| (l.cell, l.pts.iter().map(|p| (p.x, p.y, p.z, p.rgb, p.intensity)).collect::<Vec<_>>(), l.classes.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&first), signature(&second), "repeated builds are deterministic");
+    }
+
+    #[test]
+    fn coarse_levels_aggregate_immediately_finer_cells() {
+        let points = vec![
+            crate::Pt { x: 0.1, y: 0.1, z: 0.5, rgb: Some([10, 20, 30]), intensity: 0, class: 2 },
+            crate::Pt { x: 0.2, y: 0.1, z: 0.5, rgb: Some([30, 40, 50]), intensity: 200, class: 9 },
+            crate::Pt { x: 1.1, y: 0.1, z: 0.5, rgb: Some([70, 80, 90]), intensity: 100, class: 4 },
+        ];
+        let cloud = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, Some(1.0), slice_of(points), 1000, CloudColor::Rgb);
+
+        assert_eq!(cloud.levels[0].pts.len(), 2, "the 1 m level keeps two real representatives");
+        assert_eq!(cloud.levels[0].pts[0].rgb, [20, 30, 40]);
+        assert_eq!(cloud.levels[0].pts[0].intensity, 128);
+        assert_eq!(cloud.levels[0].pts[1].rgb, [70, 80, 90]);
+        assert_eq!(cloud.levels[0].pts[1].intensity, 128);
+
+        assert_eq!(cloud.levels[1].pts.len(), 1, "both fine cells collapse into the 2 m cell");
+        let coarse = &cloud.levels[1].pts[0];
+        assert_eq!((coarse.x, coarse.y, coarse.z), (0.0, 0.0, 0.5), "the coarse representative is a real source point");
+        assert_eq!(coarse.rgb, [45, 55, 65], "coarse RGB averages the two fine representatives");
+        assert_eq!(coarse.intensity, 128, "coarse intensity averages the fine representatives");
+        assert_eq!(cloud.levels[1].classes, [2], "the coarse class is the first representative's class");
     }
 
     #[test]
@@ -859,6 +1069,115 @@ mod tests {
         assert_eq!(s.color_of(&s.levels[0].pts[0], None, None), [1, 2, 3]);
         assert_eq!(CloudColor::parse("#00ff00"), Some(CloudColor::Single([0, 255, 0])));
         assert_eq!(CloudColor::parse("rgb"), Some(CloudColor::Rgb));
+    }
+
+    /// The class colours are drawn from `level.classes`, and the classifiers rewrite those bytes
+    /// in place without moving a point. The drawing caches a plan by the cloud's state, so a
+    /// rewrite has to change that state — otherwise the user re-classifies a scan and goes on
+    /// seeing the colours of the classification before it.
+    #[test]
+    fn every_classifier_that_rewrites_the_classes_moves_the_revision() {
+        let points: Vec<_> = (0..40).map(|i| pt(f64::from(i % 8) * 0.2, f64::from(i / 8) * 0.2, f64::from(i % 3) * 0.5)).collect();
+        let mut c = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice_of(points), 100_000, CloudColor::Class);
+        let before = c.class_revision;
+        c.classify_ground(&crate::ground::GroundOptions::default());
+        assert_ne!(c.class_revision, before, "the ground filter rewrote the classes");
+        let before = c.class_revision;
+        c.classify(&crate::classify::ClassifyOptions::default());
+        assert_ne!(c.class_revision, before, "the classifier rewrote the classes");
+        let before = c.class_revision;
+        c.apply_clusters();
+        assert_ne!(c.class_revision, before, "naming the groups rewrites the classes");
+    }
+
+    #[test]
+    fn rgb_shading_is_neutral_by_default() {
+        let cloud = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice_of(vec![pt(0.0, 0.0, 0.0)]), 1000, CloudColor::Rgb);
+        assert_eq!(cloud.rgb_exposure, 1.0);
+        assert_eq!(cloud.rgb_contrast, 1.0);
+        assert_eq!(cloud.color_of(&cloud.levels[0].pts[0], None, None), [10, 20, 30]);
+    }
+
+    #[test]
+    fn rgb_exposure_doubles_channels_and_clamps_at_white() {
+        let mut cloud = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice_of(vec![pt(0.0, 0.0, 0.0)]), 1000, CloudColor::Rgb);
+        cloud.rgb_exposure = 2.0;
+        let vertex = CloudVtx { x: 0.0, y: 0.0, z: 0.0, rgb: [10, 128, 200], intensity: 0 };
+        assert_eq!(cloud.color_of(&vertex, None, None), [20, 255, 255]);
+    }
+
+    #[test]
+    fn rgb_contrast_pivots_around_middle_grey() {
+        let mut cloud = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice_of(vec![pt(0.0, 0.0, 0.0)]), 1000, CloudColor::Rgb);
+        cloud.rgb_contrast = 2.0;
+        let vertex = CloudVtx { x: 0.0, y: 0.0, z: 0.0, rgb: [32, 128, 224], intensity: 0 };
+        assert_eq!(cloud.color_of(&vertex, None, None), [0, 129, 255]);
+    }
+
+    /// A file that carries no colour gets the placeholder grey on every point, so the luminance
+    /// window has no width at all. Stretching a flat field cannot reveal anything, and maximum
+    /// contrast on it pushes every channel past white: Auto is meant to make a photo readable, not
+    /// to burn it out.
+    #[test]
+    fn auto_rgb_does_not_burn_out_a_cloud_with_no_colour_spread() {
+        let points: Vec<_> = (0..40).map(|i| crate::Pt { x: f64::from(i) * 0.01, y: 0.0, z: 0.0, rgb: None, intensity: 0, class: 1 }).collect();
+        let mut cloud = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice_of(points), 1000, CloudColor::Rgb);
+        assert!(cloud.levels[0].pts.iter().all(|v| v.rgb == [220, 220, 220]), "the placeholder a colourless file leaves");
+        let (exposure, contrast) = cloud.auto_rgb();
+        cloud.rgb_exposure = exposure;
+        cloud.rgb_contrast = contrast;
+        let colours: Vec<[u8; 3]> = cloud.levels[0].pts.iter().map(|v| cloud.color_of(v, None, None)).collect();
+        assert!(colours.iter().all(|c| *c != [255, 255, 255]), "Auto leaves a flat field off white: {:?}", colours[0]);
+        assert_eq!(contrast, 1.0, "there is no spread to stretch");
+    }
+
+    #[test]
+    fn auto_rgb_makes_a_dark_low_variance_cloud_more_readable() {
+        let points: Vec<_> = (0..101)
+            .map(|i| crate::Pt { rgb: Some([115 + (i % 11), 115 + (i % 11), 115 + (i % 11)]), ..pt(f64::from(i) * 0.01, 0.0, 0.0) })
+            .collect();
+        let mut cloud = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice_of(points), 1000, CloudColor::Rgb);
+        let before: Vec<u32> = cloud.levels[0].pts.iter().map(|v| u32::from(v.rgb[0])).collect();
+        let (exposure, contrast) = cloud.auto_rgb();
+        cloud.rgb_exposure = exposure;
+        cloud.rgb_contrast = contrast;
+        let after: Vec<u32> = cloud.levels[0].pts.iter().map(|v| u32::from(cloud.color_of(v, None, None)[0])).collect();
+        assert!((0.25..=4.0).contains(&exposure) && exposure > 1.0, "bounded exposure: {exposure}");
+        assert!((0.25..=4.0).contains(&contrast) && contrast > 1.0, "bounded contrast: {contrast}");
+        assert!(after.iter().sum::<u32>() > before.iter().sum::<u32>(), "Auto lifts the dark values: {before:?} -> {after:?}");
+        assert!(after.iter().min() < before.iter().min() && after.iter().max() > before.iter().max(), "Auto expands the narrow range");
+    }
+
+    #[test]
+    fn mixed_scale_rgb_uses_one_set_wide_decision() {
+        let mut points = vec![
+            crate::Pt { rgb: Some([65535, 128, 257]), ..pt(0.0, 0.0, 0.0) },
+            crate::Pt { rgb: Some([257, 257, 0]), ..pt(1.0, 0.0, 0.0) },
+            crate::Pt { rgb: Some([128, 128, 128]), ..pt(2.0, 0.0, 0.0) },
+        ];
+        crate::normalize_rgb(&mut points);
+        assert_eq!(points[0].rgb, Some([255, 0, 1]));
+        assert_eq!(points[1].rgb, Some([1, 1, 0]));
+        assert_eq!(points[2].rgb, Some([0, 0, 0]));
+    }
+
+    #[test]
+    fn mixed_scale_cloud_rgb_matches_set_wide_conversion() {
+        let points = vec![
+            crate::Pt { rgb: Some([65535, 128, 257]), ..pt(0.0, 0.0, 0.0) },
+            crate::Pt { rgb: Some([257, 257, 0]), ..pt(1.0, 0.0, 0.0) },
+            crate::Pt { rgb: Some([128, 128, 128]), ..pt(2.0, 0.0, 0.0) },
+        ];
+        let cloud = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice_of(points), 1000, CloudColor::Rgb);
+        let colors: Vec<[u8; 3]> = cloud.levels[0].pts.iter().map(|p| p.rgb).collect();
+        assert_eq!(colors, vec![[255, 0, 1], [1, 1, 0], [0, 0, 0]]);
+    }
+
+    #[test]
+    fn eight_bit_only_rgb_is_copied_exactly() {
+        let mut points = vec![crate::Pt { rgb: Some([255, 255, 0]), ..pt(0.0, 0.0, 0.0) }];
+        crate::normalize_rgb(&mut points);
+        assert_eq!(points[0].rgb, Some([255, 255, 0]));
     }
 
     #[test]
@@ -989,5 +1308,98 @@ mod tests {
         let c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.001), slice_of(pts), 1000, CloudColor::Elevation);
         let color = c.color_of(&c.levels[0].pts[0], None, None);
         assert!(color.iter().all(|v| *v < 255), "the mid ramp: {color:?}");
+    }
+
+    /// A scan whose interesting wall sits in one tenth of its height reads as one flat colour on
+    /// the auto window: the user names the two endpoints of the ramp instead, and the ramp is the
+    /// window they named. `None` is Auto — the band's own 2%-98% window.
+    #[test]
+    fn a_manual_elevation_window_overrides_the_auto_one() {
+        let pts: Vec<_> = (0..101).map(|i| pt(f64::from(i % 10) * 0.01, f64::from(i / 10) * 0.01, f64::from(i) * 0.01)).collect();
+        let mut c = Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, Some(0.01), slice_of(pts), 1_000_000, CloudColor::Elevation);
+        assert_eq!(c.elevation_window(), (c.zp02, c.zp98), "with no manual endpoints the ramp reads the auto window");
+        // Ten points on a wall 1 m high, in a band that spans ten times that: the wall is the one
+        // thing worth reading, so the ramp is pulled onto it.
+        c.z_window = Some((1.0, 2.0));
+        assert_eq!(c.elevation_window(), (1.0, 2.0), "the manual endpoints are the ramp");
+        let grey = |t: f32| {
+            let s = crate::spectrum::Spectrum::Grey;
+            s.apply(t)
+        };
+        c.spectrum = crate::spectrum::Spectrum::Grey;
+        let colour_at = |z: f64| c.color_of(&CloudVtx { x: 0.0, y: 0.0, z: z as f32, rgb: [0, 0, 0], intensity: 0 }, None, None);
+        assert_eq!(colour_at(1.0), grey(0.0), "the window's floor is the ramp's first colour");
+        assert_eq!(colour_at(1.5), grey(0.5), "and its middle the ramp's middle");
+        assert_eq!(colour_at(2.0), grey(1.0), "its ceiling the ramp's last");
+        // The auto window put the first colour near the bottom of the whole band, not at 1 m.
+        c.z_window = None;
+        assert_eq!(c.elevation_window(), (c.zp02, c.zp98), "clearing them returns to Auto");
+    }
+
+    /// The same lever for the returns, on the 0..255 scale the vertices and the histogram use.
+    #[test]
+    fn a_manual_intensity_window_overrides_the_auto_one() {
+        let pts: Vec<_> = (0..101)
+            .map(|i| crate::Pt { x: f64::from(i % 10) * 0.01, y: f64::from(i / 10) * 0.01, z: 0.0, rgb: None, intensity: (i as u16) * 100, class: 1 })
+            .collect();
+        let mut c = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, Some(0.01), slice_of(pts), 1_000_000, CloudColor::Intensity);
+        assert_eq!(c.intensity_window(), (c.ip02, c.ip98), "with no manual endpoints the ramp reads the auto window");
+        // The band's returns run to 10 000, which the vertices stretch over the whole 0..255 scale;
+        // the wall the user cares about sits between two of them.
+        c.i_window = Some((51, 203));
+        assert_eq!(c.intensity_window(), (51, 203), "the manual endpoints are the ramp");
+        c.spectrum = crate::spectrum::Spectrum::Grey;
+        let grey = |t: f32| crate::spectrum::Spectrum::Grey.apply(t);
+        let colour_at = |i: u8| c.color_of(&CloudVtx { x: 0.0, y: 0.0, z: 0.0, rgb: [0, 0, 0], intensity: i }, None, None);
+        assert_eq!(colour_at(51), grey(0.0), "the window's floor is the ramp's first colour");
+        assert_eq!(colour_at(127), grey(0.5), "its middle is (51 + 203) / 2");
+        assert_eq!(colour_at(203), grey(1.0), "and its ceiling the last");
+        assert_eq!(colour_at(255), grey(1.0), "a hotter return is clamped, not given a colour past the ramp");
+        assert_eq!(colour_at(0), grey(0.0), "and a darker one the first colour");
+        c.i_window = None;
+        assert_eq!(c.intensity_window(), (c.ip02, c.ip98), "clearing them returns to Auto");
+    }
+
+    /// The bins the palette draws are the band's own points, not the level the screen happens to
+    /// show: a histogram that counted only the uploaded points would change shape as the user
+    /// zooms, and read as though the scan held fewer bright returns than it does.
+    #[test]
+    fn the_intensity_histogram_counts_every_band_point() {
+        let pts: Vec<_> = (0..400)
+            .map(|i| crate::Pt { x: f64::from(i % 20) * 0.01, y: f64::from(i / 20) * 0.01, z: 0.0, rgb: None, intensity: (i as u16) * 10, class: 1 })
+            .collect();
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, Some(0.05), slice_of(pts), 1_000_000, CloudColor::Intensity);
+        let uploaded = c.points();
+        assert!(uploaded < 400, "the grid really did thin the band: {uploaded} of 400");
+        let total: u64 = c.ihisto.iter().map(|b| u64::from(*b)).sum();
+        assert_eq!(total, 400, "every band point lands in exactly one of the 64 bins");
+    }
+
+    /// A point is counted in the bin its own stretched value falls in, so the two bars of the
+    /// histogram's ends are the band's darkest and brightest returns.
+    #[test]
+    fn every_level_point_is_binned_where_the_ramp_reads_it() {
+        let pts: Vec<_> =
+            (0..20).map(|i| crate::Pt { x: f64::from(i) * 0.01, y: 0.0, z: 0.0, rgb: None, intensity: (i as u16) * 3000, class: 1 }).collect();
+        let c = Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice_of(pts), 1_000_000, CloudColor::Intensity);
+        for v in &c.levels[0].pts {
+            let bin = c.bin_of_intensity(v.intensity);
+            assert!(bin < 64, "bin {bin} of a u8 {i}", i = v.intensity);
+            assert!(c.ihisto[bin] > 0, "the point's own bin carries it");
+        }
+        assert_eq!(c.bin_of_intensity(0), 0, "the darkest return is the histogram's first bin");
+        assert_eq!(c.bin_of_intensity(255), 63, "and the brightest its last");
+    }
+
+    /// A band of one height has no Z window to bin over, but its returns still have to be drawn:
+    /// the intensity histogram is a 0..255 scale, so it never depends on the band's height.
+    #[test]
+    fn a_zero_height_band_keeps_its_intensity_counts() {
+        let pts: Vec<_> =
+            (0..50).map(|i| crate::Pt { x: f64::from(i) * 0.01, y: 0.0, z: 1.0, rgb: None, intensity: (i as u16) * 100, class: 1 }).collect();
+        let c = Cloud::from_slice("t".into(), String::new(), 1.0, 1.0001, None, slice_of(pts), 1_000_000, CloudColor::Intensity);
+        assert_eq!(c.zmin, c.zmax, "a flat band: no height to bin over");
+        assert_eq!(c.zhisto.iter().sum::<u32>(), 0, "the height profile is honestly empty");
+        assert_eq!(c.ihisto.iter().sum::<u32>(), 50, "the returns are still counted");
     }
 }
