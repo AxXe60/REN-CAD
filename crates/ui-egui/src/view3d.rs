@@ -19,9 +19,9 @@
 //! are projected with the same camera and painted over the points, so a wall can be traced in
 //! elevation without ever leaving the 3D view.
 //!
-//! The snap is smart about depth: the 3D pipeline has no depth buffer, so the candidates under the
-//! cursor are ranked by their distance to the camera and only the front layer is kept. A click
-//! therefore cannot snap through a wall seen through a gap in the near one. Two modes: `Exact` (the
+//! The snap is smart about depth: the candidates under the cursor are ranked by their distance to
+//! the camera and only the front layer is kept, so a click cannot snap through a wall seen through
+//! a gap in the near one. Two modes: `Exact` (the
 //! cloud point itself) and `Smooth` (the average of the points around it, which cancels the
 //! 2-5 mm scan noise a wall is made of).
 //!
@@ -74,14 +74,16 @@ pub struct View3d {
     /// Vertical field of view, radians (the "lens": small is telephoto, large is wide).
     pub fov_y: f64,
     pub projection: Projection,
-    /// Point square side, points.
+    /// The smallest point square the user asks for, in points: the Size slider's floor, which the
+    /// shader applies live over each level's own square.
     pub point_size: f32,
     /// The front wall cut: the points closer to the camera than this fraction of the distance to
     /// the target are dropped, so the camera can look into a room without cropping the walls out
     /// of the cloud. 0 = off.
     pub front_cut: f32,
-    /// How strong the depth cue is (0..1): the farthest points fade into the background and get
-    /// smaller. 1 fades them by 45%.
+    /// How strong the depth cue is (0..1): the farthest points fade into the background. 1 fades
+    /// them by 45%. The squares keep the size their level asked for — a far point that also shrank
+    /// fell to one pixel and left gaps in the cloud.
     pub depth_cue: f32,
     /// Fit the camera to the clouds on the next frame.
     pub fitted: bool,
@@ -96,9 +98,6 @@ pub struct View3d {
     /// The level each cloud was last drawn at, by cloud name: a zoom that hovers at the boundary
     /// between two levels keeps the one under the cursor instead of flipping the cloud's density.
     levels: std::collections::HashMap<String, f64>,
-    /// Point square side in points, as the scene was built: as wide as the spacing of the level it
-    /// holds, so the squares tile the cloud instead of leaving it a dotted haze.
-    pub drawn_size: f32,
     slot: SceneSlot,
 }
 
@@ -196,7 +195,6 @@ impl Default for View3d {
             drawn: 0,
             counted: 0,
             levels: std::collections::HashMap::new(),
-            drawn_size: 1.5,
             slot: std::sync::Arc::new(Mutex::new(None)),
         }
     }
@@ -507,8 +505,18 @@ fn scene_key(clouds: &[cadcraft_pointcloud::Cloud], px_per_m: f64, center: [f64;
         // or a new comparison must repaint instead of leaving the old colours on the screen.
         c.spectrum.name().hash(&mut hasher);
         c.dev_scale.to_bits().hash(&mut hasher);
+        c.rgb_exposure.to_bits().hash(&mut hasher);
+        c.rgb_contrast.to_bits().hash(&mut hasher);
+        // The two ramps stretch the values they read through these windows, so a window the user
+        // named is a new scene: the points keep their own numbers and only the colours move.
+        c.z_window.map(|(lo, hi)| (lo.to_bits(), hi.to_bits())).hash(&mut hasher);
+        c.i_window.hash(&mut hasher);
         c.ground_only.hash(&mut hasher);
         c.opacity.to_bits().hash(&mut hasher);
+        // A re-classification rewrites the class bytes where they stand: the points, their counts
+        // and every setting above stay as they were, so this is what makes the new colours a new
+        // scene.
+        c.class_revision.hash(&mut hasher);
         if let CloudColor::Single([r, g, b]) = c.color {
             (r, g, b).hash(&mut hasher);
         }
@@ -532,10 +540,23 @@ fn scene_key(clouds: &[cadcraft_pointcloud::Cloud], px_per_m: f64, center: [f64;
 
 /// Recolour the picked levels and pack the visible ones for upload. `visible` is the count
 /// [`pick_levels`] took for these picks, so the buffer reserves what it will actually hold.
-fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)], center: [f64; 3], radius: f64, visible: usize) -> Scene3d {
+///
+/// Every point brings the square of the level it came from and the alpha of the cloud it belongs to:
+/// one cloud at 5 cm and another at 2 mm cannot share a size, and a translucent cloud must not thin
+/// its opaque neighbour. The Size slider's floor is not baked in here — the shader applies it live,
+/// so moving it costs no rebuild and a raise can be undone by a lower.
+fn build_scene(
+    picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::CloudLevel)],
+    center: [f64; 3],
+    radius: f64,
+    visible: usize,
+    px_per_m: f64,
+) -> Scene3d {
     let r2 = radius * radius;
     let mut scene = Scene3d { points: Vec::with_capacity(visible.min(MAX_SCENE_POINTS)) };
     for (c, level) in picks {
+        let size = cloud_point_size(level.cell, px_per_m).max(1.0);
+        let alpha = (c.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
         for (i, v) in level.pts.iter().enumerate() {
             // With the ground filter on, only the points it found are drawn.
             if c.ground_only && level.classes.get(i).is_none_or(|k| *k != cadcraft_pointcloud::CLASS_GROUND) {
@@ -551,7 +572,7 @@ fn build_scene(picks: &[(&cadcraft_pointcloud::Cloud, &cadcraft_pointcloud::Clou
                 continue;
             }
             let [r, g, b] = c.color_of(v, level.dev.get(i).copied(), level.classes.get(i).copied());
-            scene.points.push(Point3d { pos: [x as f32, y as f32, z as f32], color: [r, g, b, 255] });
+            scene.points.push(Point3d { pos: [x as f32, y as f32, z as f32], color: [r, g, b, alpha], size });
         }
     }
     scene
@@ -599,8 +620,9 @@ const MAX_SNAP_HITS: usize = 20_000;
 ///
 /// The candidates are ranked by their distance to the camera and only the **front layer** is kept —
 /// the shallowest ones plus everything within [`FRONT_LAYER_M`] behind them. That is what keeps a
-/// click from snapping through a far wall seen through a gap in the near one, without a depth
-/// buffer in the pipeline.
+/// click from snapping through a far wall seen through a gap in the near one, the same rule the
+/// depth buffer enforces for the pixels: the nearest splat is what the user sees and what a click
+/// takes.
 ///
 /// In `Smooth` mode the point is the average of the cloud points around the winner (a 3 cm
 /// sphere), which cancels the 2-5 mm scan noise; in `Exact` mode it is the cloud point itself.
@@ -824,6 +846,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     }
 
     // ---------- scene ----------
+    // Screen points per metre, not device pixels: `rect.height()` is in points, so a square sized
+    // from this is in points too and the shader multiplies by `pixels_per_point` before it measures
+    // the target.
     let px_per_m = height / app.view3d.view_height().max(1e-9);
     // Only the ball around the orbit target is uploaded; zooming in shrinks it, so the finer
     // levels become affordable where their detail shows.
@@ -845,17 +870,13 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
         // The level walk is only paid here: an orbit re-uses the scene, the count and the colours
         // already built for this key.
         let (picks, counted) = pick_levels(&app.session.clouds, px_per_m, center, radius, &cells);
-        let scene = build_scene(&picks, center, radius, counted);
+        let scene = build_scene(&picks, center, radius, counted, px_per_m);
         let drawn = scene.points.len();
         // Remember the level that was really drawn, the budget coarsening included: the next frame
         // keeps it while it still reads well, so a count hovering at the budget does not flip the
         // cloud between two levels from one frame to the next.
         for (c, level) in &picks {
             app.view3d.levels.insert(c.name.clone(), level.cell);
-        }
-        // The square is as wide as the finest level drawn, so the points tile the cloud.
-        if let Some(cell) = picks.iter().map(|(_, level)| level.cell).reduce(f64::min) {
-            app.view3d.drawn_size = cloud_point_size(cell, px_per_m);
         }
         if let Ok(mut slot) = app.view3d.slot.lock() {
             *slot = Some(scene);
@@ -876,8 +897,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
                 key,
                 slot: app.view3d.scene_slot(),
                 view_proj: vp,
-                viewport: [rect.width(), rect.height()],
-                point_size: app.view3d.drawn_size.max(app.view3d.point_size).max(1.0),
+                viewport: rect,
+                min_point_size: app.view3d.point_size.max(1.0),
                 eye: [eye[0] as f32, eye[1] as f32, eye[2] as f32],
                 forward: [forward[0] as f32, forward[1] as f32, forward[2] as f32],
                 near_cut: app.view3d.near_cut() as f32,
@@ -885,7 +906,6 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
                 target_depth: app.view3d.target_depth() as f32,
                 cue: app.view3d.depth_cue,
                 bg: [f32::from(bg.r()) / 255.0, f32::from(bg.g()) / 255.0, f32::from(bg.b()) / 255.0, 1.0],
-                opacity: app.session.clouds.iter().filter(|c| c.visible).map(|c| c.opacity).fold(1.0f32, |a, b| a.min(b)),
                 xray: true,
                 stencil: target.stencil,
             },
@@ -1050,11 +1070,16 @@ fn draw_cpu_fallback(
     center: [f64; 3],
     radius: f64,
 ) {
-    let mut shapes = Vec::new();
+    // The depth of each splat with it, so they can be painted back to front. The upload order rides
+    // along: with equal depths it decides who wins, the same way the depth buffer's `Less` gives an
+    // untested pixel to the instance drawn first on the GPU.
+    let mut splats: Vec<(f64, usize, Pos2, f32, egui::Color32)> = Vec::new();
     let r2 = radius * radius;
     let screen = Screen::new(view, *vp, rect);
     for c in clouds.iter().filter(|c| c.visible) {
         let level = c.level_for(px_per_m);
+        let size = cloud_point_size(level.cell, px_per_m).max(view.point_size).max(1.0);
+        let alpha = (c.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
         let step = (level.pts.len() / 50_000).max(1);
         for (i, v) in level.pts.iter().enumerate().step_by(step) {
             // The drawing frame: every cloud is placed at its own offset.
@@ -1068,15 +1093,22 @@ fn draw_cpu_fallback(
             }
             if let Some(at) = screen.project([x, y, z]) {
                 let [r, g, b] = c.color_of(v, level.dev.get(i).copied(), level.classes.get(i).copied());
-                shapes.push(egui::Shape::rect_filled(
-                    Rect::from_center_size(at, vec2(view.drawn_size.max(view.point_size), view.drawn_size.max(view.point_size))),
-                    0.0,
-                    egui::Color32::from_rgb(r, g, b),
+                splats.push((
+                    dot(sub([x, y, z], screen.eye), screen.forward),
+                    splats.len(),
+                    at,
+                    size,
+                    egui::Color32::from_rgba_unmultiplied(r, g, b, alpha),
                 ));
             }
         }
     }
-    painter.extend(shapes);
+    // Farthest first, so the cloud nearest the eye paints over what it hides. Two places this
+    // painter's-algorithm fallback cannot match the GPU: a translucent splat blends with what it
+    // covers instead of hiding it the way the depth buffer does, and a whole square carries one
+    // depth instead of one per fragment.
+    splats.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1)));
+    painter.extend(splats.into_iter().map(|(_, _, at, size, col)| egui::Shape::rect_filled(Rect::from_center_size(at, vec2(size, size)), 0.0, col)));
 }
 
 #[cfg(test)]
@@ -1216,7 +1248,7 @@ mod tests {
     #[test]
     fn an_empty_cloud_selection_builds_an_empty_scene() {
         let (picks, counted) = pick_levels(&[], 50.0, [0.0; 3], 10.0, &[]);
-        let scene = build_scene(&picks, [0.0; 3], 10.0, counted);
+        let scene = build_scene(&picks, [0.0; 3], 10.0, counted, 50.0);
         assert_eq!(scene.points.len(), 0);
         assert_eq!(counted, 0);
         assert_eq!(scene_key(&[], 50.0, [0.0; 3], 10.0, &[]), scene_key(&[], 50.0, [0.0; 3], 10.0, &[]), "the key is stable");
@@ -1240,7 +1272,7 @@ mod tests {
         let clouds = [c];
         let (picks, counted) = pick_levels(&clouds, 4000.0, center, radius, &[]);
         assert_eq!(counted, n, "the scene is built from the count taken with it");
-        assert_eq!(build_scene(&picks, center, radius, counted).points.len(), n);
+        assert_eq!(build_scene(&picks, center, radius, counted, 4000.0).points.len(), n);
     }
 
     /// Orbiting changes no key input; zooming and panning do, in coarse steps.
@@ -1270,11 +1302,49 @@ mod tests {
         ramp.spectrum = cadcraft_pointcloud::Spectrum::Viridis;
         assert_ne!(key, scene_key(&[ramp], 4000.0, center, radius, &[]), "a new intensity scale repaints");
 
+        let mut exposed = c.clone();
+        exposed.rgb_exposure = 1.5;
+        assert_ne!(key, scene_key(&[exposed], 4000.0, center, radius, &[]), "a new RGB exposure repaints");
+        let mut contrasted = c.clone();
+        contrasted.rgb_contrast = 1.5;
+        assert_ne!(key, scene_key(&[contrasted], 4000.0, center, radius, &[]), "a new RGB contrast repaints");
+
+        let mut recolour = c.clone();
+        recolour.class_revision = c.class_revision.saturating_add(1);
+        assert_ne!(key, scene_key(&[recolour], 4000.0, center, radius, &[]), "a new classification repaints");
+
         let mut compared = c;
         compared.color = CloudColor::Deviation;
         let before = scene_key(&[compared.clone()], 4000.0, center, radius, &[]);
         compared.dev_scale = 0.05;
         assert_ne!(before, scene_key(&[compared], 4000.0, center, radius, &[]), "a new comparison scale repaints");
+    }
+
+    /// The colour window is a key input too: the points keep their own values, so a manual
+    /// elevation or intensity range only changes the colours, and a scene that does not notice
+    /// would keep the old ramp on screen until the camera moved.
+    #[test]
+    fn the_scene_key_follows_the_colour_window() {
+        let c = grid_cloud("shade", 0.0005, 1.0);
+        let (center, radius) = ([0.0; 3], 10.0);
+        let auto = scene_key(std::slice::from_ref(&c), 4000.0, center, radius, &[]);
+
+        let mut zed = c.clone();
+        zed.z_window = Some((1.0, 2.0));
+        let first = scene_key(&[zed.clone()], 4000.0, center, radius, &[]);
+        assert_ne!(auto, first, "a manual elevation window repaints");
+        zed.z_window = Some((1.0, 3.0));
+        let second = scene_key(&[zed.clone()], 4000.0, center, radius, &[]);
+        assert_ne!(auto, second, "a moved ceiling repaints");
+        assert_ne!(first, second, "and two windows that differ repaint differently");
+
+        let mut iend = c.clone();
+        iend.i_window = Some((51, 204));
+        assert_ne!(auto, scene_key(&[iend], 4000.0, center, radius, &[]), "a manual intensity window repaints");
+
+        let mut cleared = zed;
+        cleared.z_window = None;
+        assert_eq!(auto, scene_key(&[cleared], 4000.0, center, radius, &[]), "Auto is the scene the cloud had before");
     }
 
     #[test]
@@ -1388,6 +1458,66 @@ mod tests {
         assert_eq!(cloud_point_size(0.0, 1.0), 1.5, "a sparse level keeps the smallest square");
         assert_eq!(cloud_point_size(0.02, 400.0), 3.0, "an eight-pixel spacing is capped");
         assert_eq!(cloud_point_size(1.0, 0.0), 1.5, "a zoom of zero is not a panic");
+    }
+
+    /// An 8×8 grid of points 1 cm apart at `cell` resolution, so two clouds of the same scan differ
+    /// only in the level they were walked at and the opacity the user gave them.
+    fn grid_cloud(name: &str, cell: f64, opacity: f32) -> cadcraft_pointcloud::Cloud {
+        let pts: Vec<_> = (0..64)
+            .map(|i| cadcraft_pointcloud::Pt { x: f64::from(i % 8) * 0.01, y: f64::from(i / 8) * 0.01, z: 1.0, rgb: None, intensity: 0, class: 1 })
+            .collect();
+        let mut b = cadcraft_pointcloud::Bounds3::EMPTY;
+        for p in &pts {
+            b.add(p.x, p.y, p.z);
+        }
+        let slice = cadcraft_pointcloud::Slice { points: pts, total: 64, in_band: 64, bounds: b };
+        let mut c = cadcraft_pointcloud::Cloud::from_slice(name.into(), String::new(), 0.0, 2.0, Some(cell), slice, 1_000_000, CloudColor::Rgb);
+        c.opacity = opacity;
+        c
+    }
+
+    /// A cloud's level and its opacity travel with every point it contributes: one global square
+    /// would draw the coarse cloud at the fine one's spacing, and one global alpha would make an
+    /// opaque cloud as thin as its most transparent neighbour.
+    #[test]
+    fn each_cloud_brings_its_own_square_and_opacity() {
+        let (fine, coarse) = (grid_cloud("fine", 0.0005, 1.0), grid_cloud("coarse", 0.002, 0.5));
+        let px_per_m = 2000.0;
+        let scene = build_scene(
+            &[(&fine, &fine.levels[0]), (&coarse, &coarse.levels[0])],
+            [0.0; 3],
+            1e6,
+            fine.levels[0].pts.len() + coarse.levels[0].pts.len(),
+            px_per_m,
+        );
+        let size = |c: &cadcraft_pointcloud::Cloud| cloud_point_size(c.levels[0].cell, px_per_m).max(1.0);
+        let (n_fine, n_coarse) = (fine.levels[0].pts.len(), coarse.levels[0].pts.len());
+        assert_eq!(scene.points.len(), n_fine + n_coarse);
+        assert_ne!(size(&fine), size(&coarse), "the two levels really do ask for different squares");
+        for p in scene.points.iter().take(n_fine) {
+            assert_eq!(p.size, size(&fine), "the fine cloud keeps its own spacing");
+            assert_eq!(p.color[3], 255, "an opaque cloud is not thinned by the other one");
+        }
+        for p in &scene.points[n_fine..] {
+            assert_eq!(p.size, size(&coarse), "the coarse cloud keeps its own spacing");
+            assert_eq!(p.color[3], 128, "half the opacity reaches the shader as premultiplied alpha");
+        }
+    }
+
+    /// What the scene stores is the square the level asked for, and nothing the user asked for: the
+    /// floor rides in the uniform, so a slider move costs one 160-byte write. Baking it here would
+    /// make the Size slider one-way — the scene key does not change with it, so raising the floor
+    /// rebuilds nothing and lowering it could not take the fat points back.
+    #[test]
+    fn the_scene_stores_the_level_not_the_user_floor() {
+        let cloud = grid_cloud("scan", 0.0005, 1.0);
+        let px_per_m = 2000.0;
+        let level = &cloud.levels[0];
+        let scene = build_scene(&[(&cloud, level)], [0.0; 3], 1e6, level.pts.len(), px_per_m);
+        // The one value the slider could have baked in here is its own floor, and no floor reaches
+        // this line: the scene holds the level's square in points, and the shader turns it into
+        // device pixels (`a_point_covers_the_square_its_level_asked_for_in_physical_pixels`).
+        assert_eq!(scene.points[0].size, cloud_point_size(level.cell, px_per_m).max(1.0), "the level's own spacing is what is stored");
     }
 
     /// The level kept across frames is named in the key, so the scene is rebuilt the one time the

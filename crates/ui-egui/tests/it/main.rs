@@ -10,6 +10,7 @@ mod docking_workflows;
 mod drafting_polar_increment;
 mod drafting_spacing;
 mod file_tab_titles;
+mod gpu_pointcloud_depth;
 mod gpu_viewport_stencil;
 mod hidden_command_line;
 mod lisp_files;

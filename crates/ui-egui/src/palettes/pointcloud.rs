@@ -143,6 +143,35 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     });
 
+    // ---------- RGB clarity ----------
+    if color == cadcraft_pointcloud::CloudColor::Rgb {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("RGB exposure").color(t.text_dim).size(12.0));
+            let mut exposure = app.session.clouds[selected].rgb_exposure;
+            let width = (ui.available_width() - 4.0).max(60.0);
+            if ui.add_sized([width, 18.0], egui::Slider::new(&mut exposure, 0.25..=4.0).fixed_decimals(2).suffix(" ×")).changed() {
+                run(app, "lascolor", json!({"index": selected, "mode": "rgb", "exposure": exposure}));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("RGB contrast").color(t.text_dim).size(12.0));
+            let mut contrast = app.session.clouds[selected].rgb_contrast;
+            let width = (ui.available_width() - 4.0).max(60.0);
+            if ui.add_sized([width, 18.0], egui::Slider::new(&mut contrast, 0.25..=4.0).fixed_decimals(2).suffix(" ×")).changed() {
+                run(app, "lascolor", json!({"index": selected, "mode": "rgb", "contrast": contrast}));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if ui.button("Auto RGB").on_hover_text("Choose exposure and contrast from the cloud's luminance range").clicked() {
+                run(app, "lascolor", json!({"index": selected, "mode": "rgb", "auto": true}));
+            }
+        });
+    }
+
     // ---------- the scale the intensity is read on ----------
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -161,6 +190,61 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             }
         });
     });
+
+    // ---------- the window the ramp is stretched over ----------
+    // The band's own 2%–98% slice is a sensible default and a useless one at the same time: on a
+    // scan whose wall sits in a tenth of its height it paints the whole wall one colour. These two
+    // sliders name the ends; Auto hands the choice back to the band.
+    if matches!(color, cadcraft_pointcloud::CloudColor::Elevation | cadcraft_pointcloud::CloudColor::Intensity) {
+        let by_height = color == cadcraft_pointcloud::CloudColor::Elevation;
+        let (lo, hi) = if by_height {
+            app.session.clouds[selected].elevation_window()
+        } else {
+            let (lo, hi) = app.session.clouds[selected].intensity_window();
+            (f64::from(lo), f64::from(hi))
+        };
+        let auto = if by_height { app.session.clouds[selected].z_window.is_none() } else { app.session.clouds[selected].i_window.is_none() };
+        let (floor, ceiling) = if by_height { (bounds.min[2], bounds.max[2]) } else { (0.0, 255.0) };
+        let (step, decimals, suffix) = if by_height { (0.01, 2, " m") } else { (1.0, 0, "") };
+        let target = if by_height { "elevation" } else { "intensity" };
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(if by_height { "Height window" } else { "Intensity window" }).color(t.text_dim).size(12.0));
+            if auto {
+                ui.label(egui::RichText::new("auto").italics().color(t.text_dim).size(10.0));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Auto").on_hover_text("Read the band's own 2%-98% window").clicked() {
+                    run(app, "lasrange", json!({ "index": selected, "target": target, "reset": true }));
+                }
+            });
+        });
+        // A band with no height has no window to name, and a slider whose range is empty would
+        // divide by zero. The legend still reads: it says what the middle of the ramp means.
+        if ceiling - floor >= step {
+            let width = (ui.available_width() - 46.0).max(60.0);
+            let mut low = lo.clamp(floor, ceiling);
+            let mut high = hi.clamp(floor, ceiling);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let top = (high - step).clamp(floor + step, ceiling);
+                let slider = egui::Slider::new(&mut low, floor..=top).fixed_decimals(decimals).suffix(suffix);
+                if ui.add_sized([width, 18.0], slider).changed() {
+                    run(app, "lasrange", json!({ "index": selected, "target": target, "min": low, "max": high }));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let bottom = (low + step).clamp(floor, ceiling - step);
+                let slider = egui::Slider::new(&mut high, bottom..=ceiling).fixed_decimals(decimals).suffix(suffix);
+                if ui.add_sized([width, 18.0], slider).changed() {
+                    run(app, "lasrange", json!({ "index": selected, "target": target, "min": low, "max": high }));
+                }
+            });
+        }
+    }
+    crate::pointcloud_hud::draw_color_legend(ui, &app.session.clouds[selected]);
 
     // ---------- resolution ----------
     ui.add_space(6.0);
@@ -379,6 +463,21 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             }
         }
 
+        // The returns by brightness, with the window the ramp reads marked: the height histogram
+        // says where the scan is, this says how wide the window is against where the bright walls
+        // actually sit.
+        if app.session.clouds[selected].ihisto.iter().sum::<u32>() > 0 {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Intensity profile").color(t.text_dim).size(12.0));
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                crate::pointcloud_hud::draw_intensity_histogram(ui, &app.session.clouds[selected]);
+            });
+        }
+
         let shown = if all { format!("{} points (all)", num(points)) } else { format!("{} of {} band points", num(points), num(in_band)) };
         let intensity = if color == cadcraft_pointcloud::CloudColor::Intensity { format!(" · intensity {imin}–{imax}") } else { String::new() };
         ui.add_space(4.0);
@@ -429,7 +528,7 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
         let width = (ui.available_width() - 26.0).max(60.0) * 0.5;
         let quick = [
             ("Auto-RLV", "Auto-RLV 2D with the room schedule, from this cloud (Tools ▸ Point Cloud & RLV)", "autorlv"),
-            ("Auto-3D", "Auto-3D building structure: walls, slabs and roof (Tools ▸ Point Cloud & RLV)", "auto3d"),
+            ("Auto-3D", "Auto-3D building structure: extruded walls and the floor/ceiling slabs the scan has (Tools ▸ Point Cloud & RLV)", "auto3d"),
             ("DTM / TIN", "Digital terrain model: triangles on layer TOPOCAD_TIN (Tools ▸ TopoCAD)", "topodtm"),
             ("Contours", "Contour lines: major and minor segments on layers TOPOCAD_CONTUR_* (Tools ▸ TopoCAD)", "curbenivel"),
             ("Volumes", "Cut & fill volumes against the reference Z, on this cloud's terrain (Tools ▸ TopoCAD)", "volumetopo"),
@@ -482,7 +581,7 @@ pub fn section(app: &mut CadApp, ui: &mut egui::Ui) {
             }
         });
 
-        // ---------- clarity without a depth buffer ----------
+        // ---------- clarity: what depth does not settle ----------
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Cut").color(t.text_dim).size(12.0));
@@ -617,5 +716,109 @@ fn run(app: &mut CadApp, command: &str, params: serde_json::Value) {
     if let Err(error) = app.run(command, params) {
         app.session.echo(error.clone());
         app.set_status(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CadApp, Services};
+    use cadcraft_engine::Session;
+    use cadcraft_pointcloud::{Bounds3, CLASS_BUILDING, CLASS_GROUND, Cloud, CloudColor, CloudVtx, Pt, Slice, Spectrum};
+    use egui::{Color32, Rect, Shape, vec2};
+
+    /// A chip of the legend: the swatch the palette allocates, in the colour the ramp produces.
+    fn chip(shapes: &[Shape], want: Color32) -> bool {
+        shapes.iter().any(|shape| match shape {
+            Shape::Rect(r) => r.fill == want && (r.rect.width() - 14.0).abs() < 0.1 && (r.rect.height() - 11.0).abs() < 0.1,
+            Shape::Vec(inner) => chip(inner, want),
+            _ => false,
+        })
+    }
+
+    fn app_with(mut cloud: Cloud) -> CadApp {
+        let mut app = CadApp::new(Session::default(), Services::default());
+        cloud.levels.first_mut().unwrap().pts = vec![CloudVtx { x: 0.0, y: 0.0, z: 1.5, rgb: [0, 0, 0], intensity: 127 }];
+        app.session.clouds.push(cloud);
+        app
+    }
+
+    /// One frame of the palette, and the shapes it painted.
+    fn painted(app: &mut CadApp) -> Vec<Shape> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(320.0, 1400.0))), ..Default::default() };
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            app.logic(&ctx);
+            let mut output = ctx.run_ui(input.clone(), |ui| section(app, ui));
+            shapes = output.shapes.iter().map(|clipped| clipped.shape.clone()).collect();
+            output.textures_delta.clear();
+        }
+        shapes
+    }
+
+    fn ramp(color: CloudColor, height: f64) -> Cloud {
+        let pts: Vec<_> = (0..40)
+            .map(|i| Pt {
+                x: f64::from(i % 4) * 0.05,
+                y: f64::from(i / 4) * 0.05,
+                z: f64::from(i) * 0.02 * height,
+                rgb: None,
+                intensity: u16::try_from(i * 1600).unwrap_or(0),
+                class: 1,
+            })
+            .collect();
+        let mut b = Bounds3::EMPTY;
+        for p in &pts {
+            b.add(p.x, p.y, p.z);
+        }
+        Cloud::from_slice(
+            "wall".into(),
+            String::new(),
+            0.0,
+            1.0,
+            Some(0.05),
+            Slice { points: pts, total: 40, in_band: 40, bounds: b },
+            1_000_000,
+            color,
+        )
+    }
+
+    /// The legend is the palette's promise about the pixels, so it has to be on the screen: the
+    /// two ends of the grey ramp the user named, painted as swatches.
+    #[test]
+    fn the_palette_paints_the_window_legend() {
+        let mut cloud = ramp(CloudColor::Elevation, 1.0);
+        cloud.spectrum = Spectrum::Grey;
+        cloud.z_window = Some((1.0, 2.0));
+        let shapes = painted(&mut app_with(cloud));
+        assert!(chip(&shapes, Color32::from_rgb(Spectrum::Grey.apply(0.0)[0], Spectrum::Grey.apply(0.0)[1], Spectrum::Grey.apply(0.0)[2])));
+        let hi = Spectrum::Grey.apply(1.0);
+        assert!(chip(&shapes, Color32::from_rgb(hi[0], hi[1], hi[2])), "the ceiling of the window is on the panel");
+    }
+
+    /// A scan with no height has no window to name: the sliders are skipped, and the legend still
+    /// explains the flat ramp. The palette must paint, not panic.
+    #[test]
+    fn a_flat_band_paints_the_palette_without_a_window_slider() {
+        let mut cloud = ramp(CloudColor::Elevation, 0.0);
+        cloud.spectrum = Spectrum::Viridis;
+        let shapes = painted(&mut app_with(cloud));
+        let lo = Spectrum::Viridis.apply(0.0);
+        assert!(chip(&shapes, Color32::from_rgb(lo[0], lo[1], lo[2])), "the legend reads even when the band is flat");
+    }
+
+    /// A class cloud gets one swatch per class it carries, in the colour the class is drawn in.
+    #[test]
+    fn the_palette_paints_a_chip_for_each_class() {
+        let mut cloud = ramp(CloudColor::Class, 1.0);
+        if let Some(level) = cloud.levels.first_mut() {
+            for (i, code) in level.classes.iter_mut().enumerate() {
+                *code = if i % 2 == 0 { CLASS_GROUND } else { CLASS_BUILDING };
+            }
+        }
+        let shapes = painted(&mut app_with(cloud));
+        assert!(chip(&shapes, Color32::from_rgb(160, 120, 80)), "the ground's brown is on the panel");
+        assert!(chip(&shapes, Color32::from_rgb(220, 60, 50)), "and so is the wall's red");
     }
 }

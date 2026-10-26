@@ -1412,7 +1412,7 @@
 	Scan file	Файл сканування
 	AI Classify & Vectorize (Buildings, Fences, Poles, Roads, Ditches)	AI-класифікація та векторизація (будівлі, паркани, стовпи, дороги, канави)
 	AI Classify & Vectorize Topography	AI-класифікація та векторизація топографії
-	Auto-3D Building (Walls, Slabs, Roof)	Авто-3D будівля (стіни, плити, дах)
+	Auto-3D Building (Walls, Slabs)	Авто-3D будівля (стіни, плити)
 	Auto-3D Building Structure from Point Cloud	Авто-3D конструкція будівлі з хмари точок
 	Auto-RLV 2D & Room Schedule from Point Cloud	Авто-RLV 2D та відомість приміщень з хмари точок
 	Auto-RLV 2D (Apartment Releveu)	Авто-RLV 2D (обмір квартири)

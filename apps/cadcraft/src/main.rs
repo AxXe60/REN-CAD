@@ -194,6 +194,9 @@ const APP_ID: &str = "ai.storyteller.cadcraft";
 
 /// Stencil bits of the window's render pass (see `NativeOptions::stencil_buffer`).
 const STENCIL_BITS: u8 = 8;
+/// Depth bits: the 3D clouds hide what is behind them with the window's depth buffer, and the 2D
+/// canvas clips its viewports with the stencil of the same one (`Depth24PlusStencil8`).
+const DEPTH_BITS: u8 = 24;
 
 #[cfg(target_os = "macos")]
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon/cadcraft-macos-512.png");
@@ -281,7 +284,9 @@ fn main() -> eframe::Result {
             .with_title_shown(false)
             .with_app_id(APP_ID),
         persist_window: false,
-        // A stencil buffer clips the contents of clipped layout viewports on the GPU.
+        // A stencil buffer clips the contents of clipped layout viewports on the GPU, and a depth
+        // buffer is what the 3D point clouds draw their front-to-back order with.
+        depth_buffer: DEPTH_BITS,
         stencil_buffer: STENCIL_BITS,
         ..Default::default()
     };
@@ -352,7 +357,7 @@ fn main() -> eframe::Result {
                 app.frame_cap = Some(cadcraft_ui_egui::gpu::FrameCap::new(240));
             }
             if let Some(rs) = &cc.wgpu_render_state {
-                app.set_wgpu(rs, eframe::egui_wgpu::depth_format_from_bits(0, STENCIL_BITS));
+                app.set_wgpu(rs, eframe::egui_wgpu::depth_format_from_bits(DEPTH_BITS, STENCIL_BITS));
             }
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());

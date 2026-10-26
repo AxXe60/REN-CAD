@@ -97,8 +97,8 @@ impl FrameCap {
 #[derive(Clone, Copy, Debug)]
 pub struct GpuTarget {
     pub format: wgpu::TextureFormat,
-    /// The stencil buffer format of the render pass, when it has one (the native window asks
-    /// for one): clipped viewports are clipped with it.
+    /// The render pass's depth-stencil format, when it has one (the native window asks for one):
+    /// clipped viewports are clipped with its stencil, the 3D clouds are depth-sorted with its depth.
     pub stencil: Option<wgpu::TextureFormat>,
 }
 
@@ -579,7 +579,10 @@ impl Resources {
                         wgpu::StencilState { front: f, back: f, read_mask: 1, write_mask: 0 }
                     }
                 };
-                wgpu::DepthStencilState { format, depth_write_enabled: None, depth_compare: None, stencil, bias: wgpu::DepthBiasState::default() }
+                // A format with a depth aspect must state whether the pipeline writes it; the 2D
+                // canvas never does — it only uses the stencil half of the window's buffer.
+                let depth_write_enabled = format.has_depth_aspect().then_some(false);
+                wgpu::DepthStencilState { format, depth_write_enabled, depth_compare: None, stencil, bias: wgpu::DepthBiasState::default() }
             })
         };
         let pipeline = |label: &str, vs: &str, topology: wgpu::PrimitiveTopology, buffer: wgpu::VertexBufferLayout<'static>, s: Stencil| {
@@ -704,8 +707,10 @@ impl GpuFaults {
 
 /// Create the canvas pipelines in the renderer's callback resources, and report wgpu errors and
 /// device loss to `faults` instead of panicking. Call once with the app's render state (eframe
-/// `CreationContext::wgpu_render_state`) and the format of its render pass's stencil buffer,
-/// if it has one (eframe `NativeOptions::stencil_buffer`).
+/// `CreationContext::wgpu_render_state`) and the format of its render pass's depth-stencil
+/// attachment, if it has one — the window's, asked for with `NativeOptions`'s `depth_buffer` and
+/// `stencil_buffer`. The 2D canvas clips with the stencil half; [`crate::gpu3d`] sorts the clouds
+/// with the depth half.
 pub fn install(rs: &egui_wgpu::RenderState, faults: &Arc<GpuFaults>, stencil: Option<wgpu::TextureFormat>) -> GpuTarget {
     let f = Arc::clone(faults);
     rs.device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| f.error(e.to_string())));

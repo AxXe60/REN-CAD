@@ -703,6 +703,24 @@ fn adaptive(unit: f64, scale: f64, min_px: f64) -> f64 {
     u
 }
 
+/// The order the plan view paints a cloud level in: the lowest point first, the highest last.
+///
+/// The 2D pipeline blends premultiplied quads in list order and has no depth buffer, so the last
+/// point drawn in a pixel is the one the user sees. File order is scan order, not height order: a
+/// floor point and a ceiling point land in the same screen pixel and whichever came later in the
+/// file wins, which turns the plan into a salt-and-pepper of every surface in the building.
+/// Painting bottom-up leaves the highest point — the surface a top view looks at — in the pixel,
+/// without a depth attachment egui's pass does not give us.
+fn plan_order(pts: &[cadcraft_pointcloud::CloudVtx], candidates: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    let mut order: Vec<u32> = candidates.into_iter().filter(|i| (*i as usize) < pts.len()).collect();
+    order.sort_unstable_by(|a, b| {
+        let za = pts.get(*a as usize).map_or(f32::INFINITY, |v| v.z);
+        let zb = pts.get(*b as usize).map_or(f32::INFINITY, |v| v.z);
+        za.total_cmp(&zb)
+    });
+    order
+}
+
 /// Point clouds opened with LASOPEN, drawn under the drawing so they can be traced over.
 ///
 /// The display list is a level of the cloud's decimation pyramid — the one whose grid spacing is
@@ -760,22 +778,25 @@ fn draw_clouds(app: &mut CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb) {
             // key and the built points agree.
             let level = c.level_for_sticky(xf.scale, Some(*cell));
             let start = list.verts.len() as u32;
-            for (i, v) in level.pts.iter().enumerate() {
+            // Each cloud is placed at its own offset: the drawing's (0, 0, 0) is that world point.
+            let at = |v: &cadcraft_pointcloud::CloudVtx| (f64::from(v.x) + c.origin[0] - c.offset[0], f64::from(v.y) + c.origin[1] - c.offset[1]);
+            let keep = |i: usize| {
+                let Some(v) = level.pts.get(i) else { return false };
                 // With the ground filter on, only the points it found are drawn.
                 if c.ground_only && level.classes.get(i).is_none_or(|k| *k != cadcraft_pointcloud::CLASS_GROUND) {
-                    continue;
+                    return false;
                 }
-                // Each cloud is placed at its own offset: the drawing's (0, 0, 0) is that world point.
-                let x = f64::from(v.x) + c.origin[0] - c.offset[0];
-                let y = f64::from(v.y) + c.origin[1] - c.offset[1];
+                let (x, y) = at(v);
                 if c.clip.is_some_and(|clip| !clip.contains(x + c.offset[0], y + c.offset[1], f64::from(v.z))) {
-                    continue;
+                    return false;
                 }
-                if x < far.min.x || x > far.max.x || y < far.min.y || y > far.max.y {
-                    continue;
-                }
+                (far.min.x..=far.max.x).contains(&x) && (far.min.y..=far.max.y).contains(&y)
+            };
+            for i in plan_order(&level.pts, (0..level.pts.len() as u32).filter(|i| keep(*i as usize))) {
+                let Some(v) = level.pts.get(i as usize) else { continue };
+                let (x, y) = at(v);
                 list.verts.push(Vec2::new(x, y));
-                let [r, g, b] = c.color_of(v, level.dev.get(i).copied(), level.classes.get(i).copied());
+                let [r, g, b] = c.color_of(v, level.dev.get(i as usize).copied(), level.classes.get(i as usize).copied());
                 list.colors.push(Rgb(r, g, b));
                 min_x = min_x.min(x);
                 min_y = min_y.min(y);
@@ -863,8 +884,17 @@ fn cloud_state_key(c: &cadcraft_pointcloud::Cloud, cell: f64) -> u64 {
     // The colour scales: a new spectrum or deviation scale changes every colour of every point.
     c.spectrum.name().hash(&mut h);
     c.dev_scale.to_bits().hash(&mut h);
+    // The RGB multipliers and the two windows recolour every point without moving its numbers, so
+    // they are part of the identity of the list — the same four the 3D scene key carries.
+    c.rgb_exposure.to_bits().hash(&mut h);
+    c.rgb_contrast.to_bits().hash(&mut h);
+    c.z_window.map(|(lo, hi)| (lo.to_bits(), hi.to_bits())).hash(&mut h);
+    c.i_window.hash(&mut h);
     c.ground_only.hash(&mut h);
     c.opacity.to_bits().hash(&mut h);
+    // The class colours come from bytes the classifiers rewrite in place, so the rewrite itself has
+    // to be in the identity: nothing else in this list moves when a scan is re-classified.
+    c.class_revision.hash(&mut h);
     if let cadcraft_pointcloud::CloudColor::Single([r, g, b]) = c.color {
         (r, g, b).hash(&mut h);
     }
@@ -3222,9 +3252,9 @@ mod hatch_pick_tests {
 /// the colours can change, or LASPECTRUM and LASCMP leave stale colours until the view moves.
 #[cfg(test)]
 mod cloud_overlay_tests {
-    use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice, Spectrum};
+    use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, CloudVtx, Pt, Slice, Spectrum};
 
-    use super::{cloud_point_size, cloud_state_key};
+    use super::{cloud_point_size, cloud_state_key, plan_order};
 
     /// A small band: a line of points from 0 to 9 m, the way view3d's tests build theirs.
     fn cloud() -> Cloud {
@@ -3235,6 +3265,21 @@ mod cloud_overlay_tests {
         }
         let slice = Slice { points: pts, total: 10, in_band: 10, bounds: b };
         Cloud::from_slice("t".into(), String::new(), 0.0, 2.0, None, slice, 1_000_000, CloudColor::Rgb)
+    }
+
+    /// The plan view has no depth buffer: the painter's order is the only thing that decides which
+    /// surface a pixel keeps. Scan order is not height order, so without this a floor point and a
+    /// ceiling point fight over a pixel record by record and the plan is a salt-and-pepper of every
+    /// surface in the building.
+    #[test]
+    fn the_plan_view_paints_the_cloud_from_the_bottom_up() {
+        let v = |z: f32| CloudVtx { x: 0.0, y: 0.0, z, rgb: [10, 20, 30], intensity: 100 };
+        let pts = vec![v(2.5), v(0.1), v(1.2)];
+        assert_eq!(plan_order(&pts, 0..3), vec![1, 2, 0], "the floor is painted first and the ceiling last, so the top surface wins the pixel");
+        assert_eq!(plan_order(&pts, [0u32, 2]), vec![2, 0], "a filter narrows the paint without reordering it");
+        let hostile = vec![v(f32::NAN), v(0.1)];
+        assert_eq!(plan_order(&hostile, 0..2), vec![1, 0], "a non-finite height is painted last and never panics");
+        assert_eq!(plan_order(&pts, [0u32, 3]), vec![0], "an index past the level is dropped, not dereferenced");
     }
 
     #[test]
@@ -3257,6 +3302,38 @@ mod cloud_overlay_tests {
         let mut dev = c.clone();
         dev.dev_scale = 7.5;
         assert_ne!(k, cloud_state_key(&dev, 0.001), "a new comparison scale needs new colours");
+    }
+
+    /// LASRANGE names a height or intensity window and LASCOLOR moves the exposure or the
+    /// contrast: both recolour every point without touching its numbers, so the plan view has to
+    /// rebuild. The 3D scene key already carries all four (view3d's `scene_key`).
+    #[test]
+    fn the_cloud_state_key_follows_the_windows_and_the_rgb_multipliers() {
+        let c = cloud();
+        let k = cloud_state_key(&c, 0.001);
+        let mut heights = c.clone();
+        heights.z_window = Some((1.0, 2.0));
+        assert_ne!(k, cloud_state_key(&heights, 0.001), "a height window recolours every point");
+        let mut lit = c.clone();
+        lit.i_window = Some((60, 180));
+        assert_ne!(k, cloud_state_key(&lit, 0.001), "an intensity window recolours every point");
+        let mut exposed = c.clone();
+        exposed.rgb_exposure = 1.5;
+        assert_ne!(k, cloud_state_key(&exposed, 0.001), "exposure recolours every point");
+        let mut contrasted = c.clone();
+        contrasted.rgb_contrast = 1.4;
+        assert_ne!(k, cloud_state_key(&contrasted, 0.001), "contrast recolours every point");
+    }
+
+    /// The classifiers rewrite the class bytes where they stand: a re-classification moves no point,
+    /// changes no count and touches no colour setting, yet every point of the class colours is a
+    /// different colour. The revision is the only thing that says so.
+    #[test]
+    fn the_cloud_state_key_follows_a_reclassification() {
+        let c = cloud();
+        let mut recolour = c.clone();
+        recolour.class_revision = c.class_revision.saturating_add(1);
+        assert_ne!(cloud_state_key(&c, 0.001), cloud_state_key(&recolour, 0.001), "new classes are a new picture");
     }
 
     /// The square must be as wide as the spacing it decimates on, so a coarse level tiles the
