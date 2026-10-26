@@ -23,7 +23,14 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo(),
         CommandSpec::new("lasattach", "Attach Point Cloud to Drawing", lasattach).params("{attach?: bool, index?: int}").enabled(always).noundo(),
-        CommandSpec::new("lascolor", "Colour Point Cloud", lascolor).params("{mode: string, index?: int}").enabled(always).noundo(),
+        CommandSpec::new("lascolor", "Colour Point Cloud", lascolor)
+            .params("{mode: string, exposure?: number, contrast?: number, auto?: bool, index?: int} (RGB multipliers: 0.25..=4)")
+            .enabled(always)
+            .noundo(),
+        CommandSpec::new("lasrange", "Set the Colour Window", lasrange)
+            .params(r#"{target: "elevation"|"intensity", min: number, max: number} | {target: string, reset: true} (intensity on the 0..255 scale)"#)
+            .enabled(always)
+            .noundo(),
         CommandSpec::new("lasdecimate", "Decimate Point Cloud", lasdecimate)
             .params("{cell: number, index?: int} (0 = every point of the band)")
             .enabled(always)
@@ -392,12 +399,31 @@ fn lascolor(s: &mut Session, p: &Value) -> Result<Value> {
     let text = text(p, "mode")?;
     let mode = cadcraft_pointcloud::CloudColor::parse(text)
         .ok_or_else(|| EngineError::Other(format!("unknown colour mode `{text}`: rgb, elevation, intensity, single:#rrggbb")))?;
-    let i = cloud_index(s, p)?;
-    let name = {
-        let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
-        c.color = mode;
-        c.name.clone()
+    let rgb_value = |key| -> Result<Option<f32>> {
+        match p.get(key) {
+            None => Ok(None),
+            Some(value) => value
+                .as_f64()
+                .filter(|number| number.is_finite() && (0.25..=4.0).contains(number))
+                .map(|number| Some(number as f32))
+                .ok_or_else(|| EngineError::Other(format!("`{key}` must be a finite number from 0.25 through 4"))),
+        }
     };
+    let requested_exposure = rgb_value("exposure")?;
+    let requested_contrast = rgb_value("contrast")?;
+    let auto = match p.get("auto") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| EngineError::Other("`auto` must be a boolean".into()))?,
+    };
+    let i = cloud_index(s, p)?;
+    let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+    let (automatic_exposure, automatic_contrast) = if auto { c.auto_rgb() } else { (c.rgb_exposure, c.rgb_contrast) };
+    c.rgb_exposure = requested_exposure.unwrap_or(automatic_exposure);
+    c.rgb_contrast = requested_contrast.unwrap_or(automatic_contrast);
+    c.color = mode;
+    let name = c.name.clone();
+    let exposure = c.rgb_exposure;
+    let contrast = c.rgb_contrast;
     Ok(json!({
         "message": format!("{name}: colour {}{}", mode.name(), match mode {
             cadcraft_pointcloud::CloudColor::Single([r, g, b]) => format!(" #{r:02x}{g:02x}{b:02x}"),
@@ -405,6 +431,83 @@ fn lascolor(s: &mut Session, p: &Value) -> Result<Value> {
         }),
         "index": i,
         "color": mode.name(),
+        "exposure": exposure,
+        "contrast": contrast,
+        "auto": auto,
+    }))
+}
+
+/// Move the window a colour ramp reads on.
+///
+/// The 2%–98% window is the honest default, but it is the band's own answer: a wall that lives in
+/// a tenth of the scan's height still reads as one flat colour on it. Naming the two endpoints puts
+/// the ramp on what the user is looking at; `reset` hands the window back to the band.
+fn lasrange(s: &mut Session, p: &Value) -> Result<Value> {
+    let asked = text(p, "target")?;
+    let elevation = match asked.to_ascii_lowercase().as_str() {
+        "elevation" | "height" | "z" => true,
+        "intensity" | "return" | "i" => false,
+        other => return Err(EngineError::Other(format!("unknown window `{other}`: elevation or intensity"))),
+    };
+    let reset = match p.get("reset") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| EngineError::Other("`reset` must be a boolean".into()))?,
+    };
+    // Read the endpoints before anything is touched: a rejected pair must leave the ramp alone.
+    let pair = if reset {
+        None
+    } else {
+        let lo = number(p, "min").ok_or_else(|| EngineError::Other("`min` must be a finite number".into()))?;
+        let hi = number(p, "max").ok_or_else(|| EngineError::Other("`max` must be a finite number".into()))?;
+        if hi < lo {
+            return Err(EngineError::Other("`max` must not be below `min`".into()));
+        }
+        if !elevation && (!(0.0..=255.0).contains(&lo) || !(0.0..=255.0).contains(&hi)) {
+            return Err(EngineError::Other("the intensity window is on the 0..255 scale the points carry".into()));
+        }
+        // A height window is a pair of coordinates. Endpoints a hundred million kilometres apart
+        // are finite numbers and not a window: the span overflows to infinity, every point reads
+        // the ramp's first colour, and the legend prints a number three hundred characters long.
+        // The Earth is 4e7 metres round, so anything past 1e9 is not a survey.
+        const MAX_COORDINATE_M: f64 = 1e9;
+        if elevation && !(lo.abs() <= MAX_COORDINATE_M && hi.abs() <= MAX_COORDINATE_M) {
+            return Err(EngineError::Other(format!("`min` and `max` must be heights within ±{MAX_COORDINATE_M:e} m of the origin")));
+        }
+        Some((lo, hi))
+    };
+    let i = cloud_index(s, p)?;
+    let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+    let (name, target, window) = match (elevation, pair) {
+        (true, Some((lo, hi))) => {
+            c.z_window = Some((lo, hi));
+            (c.name.clone(), "elevation", Some(json!([lo, hi])))
+        }
+        (true, None) => {
+            c.z_window = None;
+            (c.name.clone(), "elevation", None)
+        }
+        (false, Some((lo, hi))) => {
+            let (lo8, hi8) = (lo.round().clamp(0.0, 255.0) as u8, hi.round().clamp(0.0, 255.0) as u8);
+            c.i_window = Some((lo8, hi8));
+            (c.name.clone(), "intensity", Some(json!([lo8, hi8])))
+        }
+        (false, None) => {
+            c.i_window = None;
+            (c.name.clone(), "intensity", None)
+        }
+    };
+    let (lo, hi) = if elevation {
+        let (lo, hi) = c.elevation_window();
+        (format!("{lo:.2} m"), format!("{hi:.2} m"))
+    } else {
+        let (lo, hi) = c.intensity_window();
+        (lo.to_string(), hi.to_string())
+    };
+    Ok(json!({
+        "message": format!("{name}: the {target} ramp reads {lo} to {hi}{}", if window.is_none() { " (the band's own window)" } else { "" }),
+        "index": i,
+        "target": target,
+        "window": window,
     }))
 }
 
@@ -444,19 +547,35 @@ fn lasdecimate(s: &mut Session, p: &Value) -> Result<Value> {
         .filter(|c| *c >= 0.0)
         .ok_or_else(|| EngineError::Other("`cell` must be 0 (every point) or a positive number of metres".into()))?;
     let i = cloud_index(s, p)?;
-    let (path, name, z0, z1, color, clip, offset, spectrum, attached, doc) = {
-        let c = s.clouds.get(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
-        (PathBuf::from(&c.path), c.name.clone(), c.z0, c.z1, c.color, c.clip, c.offset, c.spectrum, c.attached, c.doc)
-    };
+    let previous = s.clouds.get(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
     let decimate = (cell > 0.0).then_some(cell);
     let max_points = if decimate.is_some() { cadcraft_pointcloud::DEFAULT_MAX_POINTS } else { 0 };
-    let mut cloud = cadcraft_pointcloud::Cloud::open(&path, name.clone(), z0, z1, decimate, max_points, color).map_err(oops)?;
-    cloud.clip = clip;
-    // Re-reading the file keeps what the cloud is in the drawing: its place, its scale, its tie.
-    cloud.offset = offset;
-    cloud.spectrum = spectrum;
-    cloud.attached = attached;
-    cloud.doc = doc;
+    let name = previous.name.clone();
+    let mut cloud = cadcraft_pointcloud::Cloud::open(
+        Path::new(&previous.path),
+        previous.name.clone(),
+        previous.z0,
+        previous.z1,
+        decimate,
+        max_points,
+        previous.color,
+    )
+    .map_err(oops)?;
+    // The re-read brings back the points; everything else was the cloud's life in the drawing, and
+    // the file knows none of it: its place and its crop, its tie to the document, the colour the
+    // user chose and the two windows and two multipliers that picture is read through, and how the
+    // cloud is drawn at all.
+    cloud.clip = previous.clip;
+    cloud.offset = previous.offset;
+    cloud.spectrum = previous.spectrum;
+    cloud.attached = previous.attached;
+    cloud.doc = previous.doc;
+    cloud.z_window = previous.z_window;
+    cloud.i_window = previous.i_window;
+    cloud.rgb_exposure = previous.rgb_exposure;
+    cloud.rgb_contrast = previous.rgb_contrast;
+    cloud.visible = previous.visible;
+    cloud.opacity = previous.opacity;
     let points = cloud.points();
     let levels = cloud.levels.len();
     let shown = cloud.levels.first().map_or(0.0, |l| l.cell);
@@ -1055,6 +1174,178 @@ fn sketch_export(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_las::write_test_las;
+
+    fn session_with_rgb_cloud() -> Session {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let points: Vec<_> = (0..101)
+            .map(|i| Pt {
+                x: f64::from(i) * 0.01,
+                y: 0.0,
+                z: 0.0,
+                rgb: Some([115 + (i % 11), 115 + (i % 11), 115 + (i % 11)]),
+                intensity: 0,
+                class: 1,
+            })
+            .collect();
+        let mut bounds = Bounds3::EMPTY;
+        for point in &points {
+            bounds.add(point.x, point.y, point.z);
+        }
+        let count = points.len() as u64;
+        let slice = Slice { points, total: count, in_band: count, bounds };
+        let mut session = Session::new();
+        session.clouds.push(Cloud::from_slice("t".into(), String::new(), 0.0, 1.0, None, slice, 1000, CloudColor::Rgb));
+        session
+    }
+
+    /// A wall that climbs while it brightens: both ramps have a real window to be moved off.
+    fn session_with_elevation_cloud() -> Session {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let points: Vec<_> = (0..101)
+            .map(|i| Pt {
+                x: f64::from(i % 10) * 0.01,
+                y: f64::from(i / 10) * 0.01,
+                z: f64::from(i) * 0.02,
+                rgb: None,
+                intensity: (i as u16) * 100,
+                class: 1,
+            })
+            .collect();
+        let mut bounds = Bounds3::EMPTY;
+        for point in &points {
+            bounds.add(point.x, point.y, point.z);
+        }
+        let count = points.len() as u64;
+        let slice = Slice { points, total: count, in_band: count, bounds };
+        let mut session = Session::new();
+        session.clouds.push(Cloud::from_slice("wall".into(), String::new(), 0.0, 2.1, Some(0.01), slice, 1_000_000, CloudColor::Elevation));
+        session
+    }
+
+    #[test]
+    fn lascolor_json_sets_rgb_exposure_and_contrast() {
+        let mut session = session_with_rgb_cloud();
+        let result = session.execute("lascolor", &json!({"mode": "rgb", "exposure": 1.75, "contrast": 2.25}));
+        assert!(result.is_ok(), "JSON execution needs no dialog: {result:?}");
+        assert_eq!(session.clouds[0].rgb_exposure, 1.75);
+        assert_eq!(session.clouds[0].rgb_contrast, 2.25);
+        let value = result.ok().unwrap_or_default();
+        assert_eq!(value["exposure"].as_f64(), Some(1.75f32 as f64));
+        assert_eq!(value["contrast"].as_f64(), Some(2.25f32 as f64));
+    }
+
+    #[test]
+    fn lascolor_json_auto_uses_the_cloud_statistics() {
+        let mut session = session_with_rgb_cloud();
+        let expected = session.clouds[0].auto_rgb();
+        let result = session.execute("lascolor", &json!({"mode": "rgb", "auto": true}));
+        assert!(result.is_ok(), "JSON Auto needs no dialog: {result:?}");
+        assert_eq!((session.clouds[0].rgb_exposure, session.clouds[0].rgb_contrast), expected);
+        assert_eq!(result.ok().and_then(|v| v["auto"].as_bool()), Some(true));
+    }
+
+    #[test]
+    fn lascolor_json_rejects_invalid_and_out_of_range_rgb_numbers() {
+        let mut session = session_with_rgb_cloud();
+        let before = (session.clouds[0].rgb_exposure, session.clouds[0].rgb_contrast);
+        for params in [
+            json!({"mode": "rgb", "exposure": 0.249}),
+            json!({"mode": "rgb", "exposure": 4.001}),
+            json!({"mode": "rgb", "exposure": f64::NAN}),
+            json!({"mode": "rgb", "exposure": f64::INFINITY}),
+            json!({"mode": "rgb", "exposure": "bright"}),
+            json!({"mode": "rgb", "contrast": 0.249}),
+            json!({"mode": "rgb", "contrast": 4.001}),
+            json!({"mode": "rgb", "contrast": f64::NEG_INFINITY}),
+            json!({"mode": "rgb", "contrast": null}),
+        ] {
+            assert!(session.execute("lascolor", &params).is_err(), "rejected: {params}");
+            assert_eq!((session.clouds[0].rgb_exposure, session.clouds[0].rgb_contrast), before, "rejected input changes nothing: {params}");
+        }
+    }
+
+    #[test]
+    fn lasrange_json_sets_the_elevation_window_the_ramp_reads() {
+        let mut session = session_with_elevation_cloud();
+        let auto = session.clouds[0].elevation_window();
+        let r = session.execute("lasrange", &json!({"target": "elevation", "min": 1.2, "max": 1.8}));
+        assert!(r.is_ok(), "JSON execution needs no dialog: {r:?}");
+        let value = r.ok().unwrap_or_default();
+        assert_eq!(value["window"].as_array().map(|a| (a[0].as_f64(), a[1].as_f64())), Some((Some(1.2), Some(1.8))));
+        assert_eq!(value["target"].as_str(), Some("elevation"));
+        assert_eq!(session.clouds[0].z_window, Some((1.2, 1.8)));
+        assert_eq!(session.clouds[0].elevation_window(), (1.2, 1.8), "the ramp reads what was set");
+        assert_ne!(auto, (1.2, 1.8), "and the auto window was something else");
+    }
+
+    #[test]
+    fn lasrange_json_sets_the_intensity_window_on_the_display_scale() {
+        let mut session = session_with_elevation_cloud();
+        let r = session.execute("lasrange", &json!({"target": "intensity", "min": 51, "max": 204}));
+        assert!(r.is_ok(), "JSON execution needs no dialog: {r:?}");
+        let value = r.ok().unwrap_or_default();
+        assert_eq!(value["window"].as_array().map(|a| (a[0].as_u64(), a[1].as_u64())), Some((Some(51), Some(204))));
+        assert_eq!(value["target"].as_str(), Some("intensity"));
+        assert_eq!(session.clouds[0].i_window, Some((51, 204)));
+        assert_eq!(session.clouds[0].intensity_window(), (51, 204));
+    }
+
+    #[test]
+    fn lasrange_reset_restores_auto() {
+        let mut session = session_with_elevation_cloud();
+        let auto_z = session.clouds[0].elevation_window();
+        let auto_i = session.clouds[0].intensity_window();
+        session.execute("lasrange", &json!({"target": "elevation", "min": 1.2, "max": 1.8})).ok();
+        session.execute("lasrange", &json!({"target": "intensity", "min": 51, "max": 204})).ok();
+        let r = session.execute("lasrange", &json!({"target": "elevation", "reset": true}));
+        assert!(r.is_ok(), "reset needs no endpoints: {r:?}");
+        let value = r.ok().unwrap_or_default();
+        assert!(value["window"].is_null(), "a reset reports no window: {value}");
+        assert_eq!(session.clouds[0].z_window, None, "the height window is off again");
+        assert_eq!(session.clouds[0].i_window, Some((51, 204)), "one target's reset leaves the other alone");
+        assert_eq!(session.clouds[0].elevation_window(), auto_z, "the ramp goes back to the band's own window");
+        session.execute("lasrange", &json!({"target": "intensity", "reset": true})).ok();
+        assert_eq!(session.clouds[0].intensity_window(), auto_i);
+    }
+
+    #[test]
+    fn lasrange_json_rejects_reversed_non_finite_and_out_of_range_endpoints() {
+        let mut session = session_with_elevation_cloud();
+        for params in [
+            json!({"target": "elevation", "min": 2.0, "max": 1.0}),
+            json!({"target": "elevation", "min": 1.0}),
+            json!({"target": "elevation", "max": 1.0}),
+            json!({"target": "elevation", "min": f64::NAN, "max": 1.0}),
+            json!({"target": "elevation", "min": 1.0, "max": f64::INFINITY}),
+            json!({"target": "elevation", "min": "low", "max": 1.0}),
+            json!({"target": "intensity", "min": 204, "max": 51}),
+            json!({"target": "intensity", "min": -1.0, "max": 200.0}),
+            json!({"target": "intensity", "min": 0.0, "max": 256.0}),
+            json!({"target": "colour", "min": 0.0, "max": 1.0}),
+            json!({"target": "elevation", "min": -f64::INFINITY, "max": 1.0}),
+            // Finite, and still not a window: a span of 2e308 overflows to infinity, so every point
+            // lands on the ramp's first colour and the legend prints a number 310 characters long.
+            json!({"target": "elevation", "min": -1e308f64, "max": 1e308f64}),
+            json!({"target": "elevation", "min": 1.0, "max": 1e12f64}),
+        ] {
+            assert!(session.execute("lasrange", &params).is_err(), "rejected: {params}");
+            assert_eq!(session.clouds[0].z_window, None, "rejected input changes the height window: {params}");
+            assert_eq!(session.clouds[0].i_window, None, "rejected input changes the return window: {params}");
+        }
+    }
+
+    /// An equal pair is not reversed: the ramp has no span, so every point takes its middle colour
+    /// instead of the command refusing a choice the user then undoes by moving one endpoint.
+    #[test]
+    fn lasrange_accepts_a_window_of_zero_span() {
+        let mut session = session_with_elevation_cloud();
+        let mid = session.clouds[0].spectrum.apply(0.5);
+        assert!(session.execute("lasrange", &json!({"target": "elevation", "min": 1.5, "max": 1.5})).is_ok());
+        assert_eq!(session.clouds[0].z_window, Some((1.5, 1.5)));
+        let vertex = cadcraft_pointcloud::CloudVtx { x: 0.0, y: 0.0, z: 0.0, rgb: [0, 0, 0], intensity: 0 };
+        assert_eq!(session.clouds[0].color_of(&vertex, None, None), mid, "a zero span reads the middle of the scale");
+    }
 
     #[test]
     fn closing_with_nothing_open_reports_zero() {
@@ -1416,67 +1707,6 @@ mod tests {
         }
     }
 
-    /// A LAS 1.2 file on the disk, written by hand: the crate reads LAS, it does not write it,
-    /// and LASOPEN needs a real file to open. The points are (x, y, z, class).
-    fn write_test_las(path: &Path, points: &[(f64, f64, f64, u8)]) {
-        /// A fixed-size header text field: the text, zero padded.
-        fn padded(text: &[u8]) -> [u8; 32] {
-            let mut out = [0u8; 32];
-            let n = text.len().min(out.len());
-            out[..n].copy_from_slice(&text[..n]);
-            out
-        }
-        let mut bytes: Vec<u8> = Vec::new();
-        bytes.extend_from_slice(b"LASF");
-        bytes.extend_from_slice(&0u16.to_le_bytes()); // file source id
-        bytes.extend_from_slice(&0u16.to_le_bytes()); // global encoding
-        bytes.extend_from_slice(&[0u8; 16]); // project id
-        bytes.push(1); // version 1.2
-        bytes.push(2);
-        bytes.extend_from_slice(&padded(b"CADCraft")); // system identifier
-        bytes.extend_from_slice(&padded(b"CADCraft test")); // generating software
-        bytes.extend_from_slice(&1u16.to_le_bytes()); // creation day
-        bytes.extend_from_slice(&2024u16.to_le_bytes()); // creation year
-        bytes.extend_from_slice(&227u16.to_le_bytes()); // header size
-        bytes.extend_from_slice(&227u32.to_le_bytes()); // the points start right after the header
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // VLRs
-        bytes.push(0); // point format 0
-        bytes.extend_from_slice(&20u16.to_le_bytes()); // record length
-        bytes.extend_from_slice(&(points.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&(points.len() as u32).to_le_bytes()); // points of the first return
-        bytes.extend_from_slice(&[0u8; 16]); // the other four returns are empty
-        let scale = 0.01f64;
-        for _ in 0..3 {
-            bytes.extend_from_slice(&scale.to_le_bytes()); // scale
-        }
-        for _ in 0..3 {
-            bytes.extend_from_slice(&0f64.to_le_bytes()); // offset
-        }
-        let (mut min, mut max) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-        for &(x, y, z, _) in points {
-            let p = [x, y, z];
-            for k in 0..3 {
-                min[k] = min[k].min(p[k]);
-                max[k] = max[k].max(p[k]);
-            }
-        }
-        for v in [max[0], min[0], max[1], min[1], max[2], min[2]] {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        for &(x, y, z, class) in points {
-            bytes.extend_from_slice(&((x / scale).round() as i32).to_le_bytes());
-            bytes.extend_from_slice(&((y / scale).round() as i32).to_le_bytes());
-            bytes.extend_from_slice(&((z / scale).round() as i32).to_le_bytes());
-            bytes.extend_from_slice(&100u16.to_le_bytes()); // intensity
-            bytes.push(0x11); // one return, the first
-            bytes.push(class); // the classification the file carries
-            bytes.push(0); // scan angle
-            bytes.push(0); // user data
-            bytes.extend_from_slice(&0u16.to_le_bytes()); // point source id
-        }
-        std::fs::write(path, bytes).ok();
-    }
-
     /// LASOPEN answers with the report it always gave: the same keys, and for a whole file the
     /// same numbers.
     #[test]
@@ -1508,6 +1738,70 @@ mod tests {
         // The cloud keeps a band a drawing can be written with: the heights of its own points,
         // not the endless numbers the whole file was read at.
         assert!(s.clouds.first().is_some_and(|c| c.z0.is_finite() && c.z1.is_finite() && c.z0 < c.z1), "{:?}", s.clouds.first());
+    }
+
+    /// A 64-point wall on a 0.25 m grid, written where the tests are allowed to write.
+    fn las_decimate_fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("colour.las");
+        let mut points: Vec<(f64, f64, f64, u8)> = Vec::new();
+        for i in 0..8 {
+            for j in 0..8 {
+                points.push((f64::from(i) * 0.25, f64::from(j) * 0.25, 1.0 + f64::from(j) * 0.1, 2));
+            }
+        }
+        write_test_las(&path, &points);
+        path
+    }
+
+    /// The path to a session holding that wall, so a test can set a display knob and re-read.
+    fn session_with_decimatable_las(name: &str) -> (Session, PathBuf) {
+        let path = las_decimate_fixture(name);
+        let mut s = Session::new();
+        lasopen(&mut s, &json!({ "path": path.to_string_lossy() })).ok();
+        (s, path)
+    }
+
+    /// LASDECIMATE re-reads the file, and the picture the user set up is not part of the file: the
+    /// height and intensity windows and the two RGB multipliers have to be carried over, the way
+    /// the crop, the offset and the spectrum already are. Without them, thinning a scan to a coarser
+    /// grid silently throws the user's colouring away.
+    #[test]
+    fn lasdecimate_carries_the_windows_and_the_rgb_multipliers() {
+        let (mut s, _path) = session_with_decimatable_las("cadcraft-lasdecimate-colour");
+        {
+            let c = s.clouds.first_mut().expect("the scan opened");
+            c.z_window = Some((1.0, 1.4));
+            c.i_window = Some((40, 200));
+            c.rgb_exposure = 1.3;
+            c.rgb_contrast = 0.8;
+        }
+        let r = lasdecimate(&mut s, &json!({ "cell": 0.1 }));
+        assert!(r.is_ok(), "the re-read runs: {r:?}");
+        let c = s.clouds.first().expect("the cloud is still there");
+        assert_eq!(c.z_window, Some((1.0, 1.4)), "a coarser grid keeps the height window");
+        assert_eq!(c.i_window, Some((40, 200)), "a coarser grid keeps the intensity window");
+        assert_eq!(c.rgb_exposure, 1.3, "a coarser grid keeps the exposure");
+        assert_eq!(c.rgb_contrast, 0.8, "a coarser grid keeps the contrast");
+    }
+
+    /// Opacity and whether the cloud is drawn are settings of the drawing, and the palette reaches
+    /// both without leaving the panel: thinning a scan that the user had faded to a x-ray, or one
+    /// they had hidden, must not bring it back at full strength.
+    #[test]
+    fn lasdecimate_carries_the_opacity_and_the_visibility() {
+        let (mut s, _path) = session_with_decimatable_las("cadcraft-lasdecimate-display");
+        {
+            let c = s.clouds.first_mut().expect("the scan opened");
+            c.opacity = 0.4;
+            c.visible = false;
+        }
+        let r = lasdecimate(&mut s, &json!({ "cell": 0.1 }));
+        assert!(r.is_ok(), "the re-read runs: {r:?}");
+        let c = s.clouds.first().expect("the cloud is still there");
+        assert_eq!(c.opacity, 0.4, "a coarser grid keeps the x-ray");
+        assert!(!c.visible, "a coarser grid does not redraw a hidden cloud");
     }
 
     /// A file whose points carry the class 0 ("created") knows no ground: the ground filter still

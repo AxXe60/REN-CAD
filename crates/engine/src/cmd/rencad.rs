@@ -6,8 +6,12 @@
 //! - TopoCAD Suite (`topodtm`, `curbenivel`, `profiltopo`, `volumetopo`)
 //! - CADGen Suite (`parcelare`, `padcadastru`)
 
+use std::path::Path;
+
 use cadcraft_doc::{Common, EntityKind, HAlign, Space, Text, VAlign};
 use cadcraft_geom::{PolyVertex, Vec2, Vec3};
+use cadcraft_pointcloud::bim::{deviate, ifc, openings};
+use cadcraft_pointcloud::{AutoRlvResult, BimOptions, StoreyModel, slice_bands_capped};
 use serde_json::{Value, json};
 
 use super::helpers::{circle, line, lwpoly};
@@ -22,11 +26,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .noundo(),
         CommandSpec::new("autorlv", "Auto-RLV 2D & Room Schedule from Point Cloud", autorlv)
             .menu(&["Tools", "Point Cloud & RLV", "Auto-RLV 2D (Apartment Releveu)"])
-            .params("{index?: int, removeFurniture?: bool}")
+            .params("{index?: int, ifc?: string, params?: {cell?, z_step?, slab_ratio?, slice_from?, slice_to?, threshold?, close_radius?, epsilon?, safety_margin?, single_sided_slab_thickness?, min_wall_length?, min_wall_thickness?, max_wall_thickness?, angle_tolerance_deg?, exterior_wall_thickness?, exterior_scan?, zone_gap?, min_zone_area?, opening_cell?, opening_threshold?, opening_rank?, min_opening_width?, max_opening_width?, door_min_height?, door_max_sill?, window_min_sill?, opening_band?, opening_decimate?, max_wall_band_points?, deviation_threshold?, deviation_cell?, min_furniture_points?, max_furniture_clusters?}}")
             .enabled(always),
         CommandSpec::new("auto3d", "Auto-3D Building Structure from Point Cloud", auto3d)
-            .menu(&["Tools", "Point Cloud & RLV", "Auto-3D Building (Walls, Slabs, Roof)"])
-            .params("{index?: int, roof?: bool}")
+            .menu(&["Tools", "Point Cloud & RLV", "Auto-3D Building (Walls, Slabs)"])
+            .params("{index?: int, ifc?: string, params?: {cell?, z_step?, slab_ratio?, slice_from?, slice_to?, threshold?, close_radius?, epsilon?, safety_margin?, single_sided_slab_thickness?, min_wall_length?, min_wall_thickness?, max_wall_thickness?, angle_tolerance_deg?, exterior_wall_thickness?, exterior_scan?, zone_gap?, min_zone_area?, opening_cell?, opening_threshold?, opening_rank?, min_opening_width?, max_opening_width?, door_min_height?, door_max_sill?, window_min_sill?, opening_band?, opening_decimate?, max_wall_band_points?}}")
             .enabled(always),
         CommandSpec::new("autovectorize", "AI Classify & Vectorize Topography", autovectorize)
             .menu(&["Tools", "Point Cloud & RLV", "AI Classify & Vectorize (Buildings, Fences, Poles, Roads, Ditches)"])
@@ -104,6 +108,29 @@ fn active_cloud_points(s: &Session, p: &Value) -> Vec<[f64; 3]> {
     pts
 }
 
+/// The points the modelling commands may use: the named cloud, or the last one opened.
+///
+/// The other point-cloud commands keep [`active_cloud_points`]' synthetic scan so their standalone
+/// demonstrations still run. The modelling commands do not: `AUTORLV` on a made-up apartment would
+/// draw a building nobody scanned, which is the failure this command is replacing.
+fn cloud_points_for_model(s: &Session, p: &Value) -> Result<Vec<[f64; 3]>> {
+    let idx = p.get("index").and_then(Value::as_u64).map(|i| i as usize).unwrap_or_else(|| s.clouds.len().saturating_sub(1));
+    let Some(cloud) = s.clouds.get(idx) else {
+        return Err(EngineError::Other("no point cloud is open: open the scan with LASOPEN first".to_string()));
+    };
+    let pts = cloud.world_points();
+    if pts.is_empty() {
+        return Err(EngineError::Other(format!("the cloud `{}` holds no points in its band", cloud.name)));
+    }
+    Ok(pts)
+}
+
+/// The pipeline options a modelling command carries, from its `params` object.
+fn model_options(p: &Value) -> Result<cadcraft_pointcloud::BimOptions> {
+    cadcraft_pointcloud::BimOptions::from_params(p.get("params").unwrap_or(&Value::Null))
+        .map_err(|e| EngineError::Other(format!("the modelling options cannot be used: {e}")))
+}
+
 fn add_on_layer(s: &mut Session, layer_name: &str, kind: EntityKind) -> Result<String> {
     let d = s.doc_mut()?;
     let common = Common { layer: layer_name.to_string(), ..Common::default() };
@@ -130,6 +157,190 @@ fn add_label(s: &mut Session, layer_name: &str, at: [f64; 2], height: f64, value
     )
 }
 
+/// The path of the cloud a modelling command reads, chosen by the same index rule as
+/// [`cloud_points_for_model`]. The openings stage streams a finer pass than the working level
+/// carries, so it needs the file the cloud came from; a cloud opened from memory has no path and
+/// the stage reports no openings rather than inventing them.
+fn cloud_path_for_model(s: &Session, p: &Value) -> Result<String> {
+    let idx = p.get("index").and_then(Value::as_u64).map(|i| i as usize).unwrap_or_else(|| s.clouds.len().saturating_sub(1));
+    let Some(cloud) = s.clouds.get(idx) else {
+        return Err(EngineError::Other("no point cloud is open: open the scan with LASOPEN first".to_string()));
+    };
+    Ok(cloud.path.clone())
+}
+
+/// The openings of every storey, from one fine read of the scan.
+///
+/// `band` decides which walls can be read, and the original index is carried alongside each band
+/// so an opening still names the wall it pierces after the unusable walls have been filtered out.
+/// A failed read or a refused wall is "no openings here", never a failed model: the rest of the
+/// scan was good, and the reply says the fine bands were unavailable.
+fn storey_openings(path: &str, storeys: &[StoreyModel], opts: &BimOptions) -> Vec<Vec<openings::Opening>> {
+    let mut out = Vec::with_capacity(storeys.len());
+    for model in storeys {
+        if path.is_empty() {
+            out.push(Vec::new());
+            continue;
+        }
+        let mut bands = Vec::new();
+        let mut origins = Vec::new();
+        for (i, wall) in model.walls.iter().enumerate() {
+            if let Some(band) = openings::band(wall, opts) {
+                bands.push(band);
+                origins.push(i);
+            }
+        }
+        if bands.is_empty() {
+            out.push(Vec::new());
+            continue;
+        }
+        let Ok(per_band) = slice_bands_capped(Path::new(path), &bands, opts.opening_decimate, opts.max_wall_band_points) else {
+            out.push(Vec::new());
+            continue;
+        };
+        let mut holes = Vec::new();
+        for (k, &i) in origins.iter().enumerate() {
+            let (Some(points), Some(wall)) = (per_band.get(k), model.walls.get(i)) else {
+                continue;
+            };
+            let fine: Vec<[f64; 3]> = points.iter().map(|pt| [pt.x, pt.y, pt.z]).collect();
+            if let Ok(mut found) = openings::detect(&fine, wall, i, opts) {
+                holes.append(&mut found);
+            }
+        }
+        holes.sort_by(|a, b| {
+            a.wall.cmp(&b.wall).then(a.from[0].total_cmp(&b.from[0])).then(a.from[1].total_cmp(&b.from[1])).then(a.kind.as_str().cmp(b.kind.as_str()))
+        });
+        out.push(holes);
+    }
+    out
+}
+
+/// Draw each opening as the two jamb lines that cross its wall body.
+fn draw_openings(s: &mut Session, per_storey: &[Vec<openings::Opening>]) -> Result<usize> {
+    let mut lines = 0usize;
+    for holes in per_storey {
+        for o in holes {
+            let (dx, dy) = (o.to[0] - o.from[0], o.to[1] - o.from[1]);
+            let len = (dx * dx + dy * dy).sqrt();
+            if !len.is_finite() || len <= 0.0 {
+                continue;
+            }
+            let (nx, ny) = (-dy / len * o.thickness * 0.5, dx / len * o.thickness * 0.5);
+            for at in [o.from, o.to] {
+                add_on_layer(s, "RLV_OPENINGS", line(Vec2::new(at[0] - nx, at[1] - ny), Vec2::new(at[0] + nx, at[1] + ny)))?;
+                lines += 1;
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// The number of openings, doors and windows across every storey.
+fn opening_counts(per_storey: &[Vec<openings::Opening>]) -> (usize, usize, usize) {
+    let mut count = 0usize;
+    let mut doors = 0usize;
+    let mut windows = 0usize;
+    for o in per_storey.iter().flatten() {
+        count += 1;
+        match o.kind {
+            openings::OpeningKind::Door => doors += 1,
+            openings::OpeningKind::Window => windows += 1,
+        }
+    }
+    (count, doors, windows)
+}
+
+/// Draw one plan rectangle per furniture cluster, as the deviation stage isolated it.
+fn draw_furniture(s: &mut Session, clusters: &[deviate::FurnitureCluster]) -> Result<usize> {
+    let mut rects = 0usize;
+    for c in clusters {
+        if !(c.max[0] > c.min[0] && c.max[1] > c.min[1]) {
+            continue;
+        }
+        let vs = vec![
+            PolyVertex::new(Vec2::new(c.min[0], c.min[1])),
+            PolyVertex::new(Vec2::new(c.max[0], c.min[1])),
+            PolyVertex::new(Vec2::new(c.max[0], c.max[1])),
+            PolyVertex::new(Vec2::new(c.min[0], c.max[1])),
+        ];
+        add_on_layer(s, "RLV_FURNITURE", lwpoly(vs, true))?;
+        rects += 1;
+    }
+    Ok(rects)
+}
+
+/// The IFC building the model describes.
+///
+/// A slab belongs to one storey, not both: the floor slab of storey `i` is `slabs[i]`, and the last
+/// storey also carries the top slab over it. That keeps a shared middle slab from being written
+/// twice while every storey still has its floor and its ceiling in the file.
+fn building_from_rlv(rlv: &AutoRlvResult, per_storey: &[Vec<openings::Opening>]) -> ifc::Building {
+    let storeys = rlv
+        .storeys
+        .iter()
+        .enumerate()
+        .map(|(i, model)| {
+            let mut slabs = Vec::new();
+            if let Some(slab) = rlv.slabs.get(i) {
+                slabs.push(slab.clone());
+            }
+            if i + 1 == rlv.storeys.len()
+                && let Some(slab) = rlv.slabs.get(i + 1)
+            {
+                slabs.push(slab.clone());
+            }
+            ifc::BuildingStorey {
+                name: format!("Storey {}", i + 1),
+                elevation: model.storey.base_z,
+                height: model.storey.top_z - model.storey.base_z,
+                walls: model.walls.clone(),
+                slabs,
+                zones: model.zones.clone(),
+                openings: per_storey.get(i).cloned().unwrap_or_default(),
+            }
+        })
+        .collect();
+    ifc::Building { name: "RENCAD RLV".to_string(), timestamp: unix_seconds(), storeys }
+}
+
+/// Seconds since the Unix epoch. The IFC's `IfcTimeStamp` is exactly this, and the engine needs no
+/// calendar conversion to write it.
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// The `ifc` parameter: a path to write, or nothing. A value that is there but is not a usable path
+/// is refused rather than quietly ignored.
+fn ifc_param(p: &Value) -> Result<Option<String>> {
+    match p.get("ifc") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(path)) if !path.trim().is_empty() => Ok(Some(path.clone())),
+        Some(_) => Err(EngineError::Other("ifc must be a file path string".to_string())),
+    }
+}
+
+/// Write the STEP file and read it back with our own checker before reporting it.
+///
+/// A file the writer produces is not advertised until [`ifc::check`] has closed its entity graph;
+/// a write that fails is an error and no file is claimed.
+fn write_ifc_file(path: &str, building: &ifc::Building) -> Result<Value> {
+    let step = ifc::write(building).map_err(|e| EngineError::Other(format!("IFC: {e}")))?;
+    let checked = ifc::check(&step).map_err(|e| EngineError::Other(format!("IFC self-check: {e}")))?;
+    std::fs::write(path, step.as_bytes()).map_err(|e| EngineError::Other(format!("IFC write {path}: {e}")))?;
+    Ok(json!({
+        "path": path,
+        "entities": checked.entities,
+        "references": checked.references,
+        "walls": checked.walls,
+        "slabs": checked.slabs,
+        "spaces": checked.spaces,
+        "openings": checked.openings,
+        "doors": checked.doors,
+        "windows": checked.windows,
+    }))
+}
+
 fn lasfurniture(s: &mut Session, p: &Value) -> Result<Value> {
     let pts = active_cloud_points(s, p);
     let cell = p.get("cell").and_then(Value::as_f64).unwrap_or(0.15);
@@ -150,108 +361,215 @@ fn lasfurniture(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn autorlv(s: &mut Session, p: &Value) -> Result<Value> {
-    let remove_furniture = p.get("removeFurniture").and_then(Value::as_bool).unwrap_or(true);
-    let pts = active_cloud_points(s, p);
-    let rlv = cadcraft_pointcloud::extract_auto_rlv(&pts, remove_furniture);
+    let opts = model_options(p)?;
+    let pts = cloud_points_for_model(s, p)?;
+    let path = cloud_path_for_model(s, p)?;
+    let rlv = cadcraft_pointcloud::extract_auto_rlv(&pts, &opts).map_err(|e| EngineError::Other(format!("Auto-RLV: {e}")))?;
+    let per_storey = storey_openings(&path, &rlv.storeys, &opts);
 
     let mut wall_handles = Vec::new();
-    for w in &rlv.walls {
-        let a = Vec2::new(w.p1[0], w.p1[1]);
-        let b = Vec2::new(w.p2[0], w.p2[1]);
-        if !a.near(b, 1e-6) {
-            wall_handles.push(add_on_layer(s, "RLV_WALLS", line(a, b))?);
-        }
-    }
-
-    let mut opening_handles = Vec::new();
-    for op in &rlv.openings {
-        let c = Vec2::new(op.center[0], op.center[1]);
-        opening_handles.push(add_on_layer(s, "RLV_OPENINGS", circle(c, (op.width * 0.5).max(0.2)))?);
-    }
-
-    let mut dim_handles = Vec::new();
-    for d in &rlv.dimensions {
-        let a = Vec2::new(d.p1[0], d.p1[1]);
-        let b = Vec2::new(d.p2[0], d.p2[1]);
-        if !a.near(b, 1e-6) {
-            dim_handles.push(add_on_layer(s, "RLV_DIMS", line(a, b))?);
-        }
-        let mid = [(d.p1[0] + d.p2[0]) * 0.5, (d.p1[1] + d.p2[1]) * 0.5];
-        dim_handles.push(add_label(s, "RLV_DIMS", mid, 0.18, d.label.clone())?);
-    }
-
+    let mut zone_handles = Vec::new();
     let mut rooms_json = Vec::new();
-    for r in &rlv.rooms {
-        let label = format!("{} {} | Su={:.2} mp | P={:.2} m | H={:.2} m", r.code, r.name, r.area_m2, r.perimeter_m, r.clear_height_m);
-        let _ = add_label(s, "RLV_SCHEDULE", r.center, 0.22, label)?;
-        rooms_json.push(json!({
-            "code": r.code,
-            "name": r.name,
-            "areaM2": r.area_m2,
-            "perimeterM": r.perimeter_m,
-            "clearHeightM": r.clear_height_m,
-            "center": r.center,
+    let mut storeys_json = Vec::new();
+    for model in &rlv.storeys {
+        for w in &model.walls {
+            let a = Vec2::new(w.from[0], w.from[1]);
+            let b = Vec2::new(w.to[0], w.to[1]);
+            if !a.near(b, 1e-6) {
+                wall_handles.push(add_on_layer(s, "RLV_WALLS", line(a, b))?);
+            }
+        }
+        for zone in &model.zones {
+            if zone.ring.len() >= 3 {
+                let vs: Vec<PolyVertex> = zone.ring.iter().map(|pt| PolyVertex::new(Vec2::new(pt[0], pt[1]))).collect();
+                zone_handles.push(add_on_layer(s, "RLV_ZONES", lwpoly(vs, true))?);
+            }
+        }
+        storeys_json.push(json!({
+            "index": model.storey.index,
+            "baseZ": model.storey.base_z,
+            "topZ": model.storey.top_z,
+            "clearHeightM": model.storey.top_z - model.storey.base_z,
+            "walls": model.walls.len(),
+            "zones": model.zones.len(),
+            "openings": per_storey.get(model.storey.index).map_or(0, Vec::len),
         }));
     }
 
-    Ok(json!({
+    let mut slab_handles = Vec::new();
+    let mut slabs_json = Vec::new();
+    for slab in &rlv.slabs {
+        if slab.polygon.len() >= 3 {
+            let vs: Vec<PolyVertex> = slab.polygon.iter().map(|pt| PolyVertex::new(Vec2::new(pt[0], pt[1]))).collect();
+            slab_handles.push(add_on_layer(s, "RLV_SLABS", lwpoly(vs, true))?);
+        }
+        slabs_json.push(json!({
+            "baseZ": slab.base_z,
+            "topZ": slab.top_z,
+            "thicknessM": slab.thickness,
+            "singleSided": slab.single_sided,
+            "vertices": slab.polygon.len(),
+        }));
+    }
+
+    let opening_lines = draw_openings(s, &per_storey)?;
+    let all_walls: Vec<cadcraft_pointcloud::bim::Wall> = rlv.storeys.iter().flat_map(|m| m.walls.iter().cloned()).collect();
+    let dev = deviate::measure(&pts, &all_walls, &rlv.slabs, &opts).map_err(|e| EngineError::Other(format!("Deviation: {e}")))?;
+    let furniture_rects = draw_furniture(s, &dev.furniture)?;
+
+    let mut label_handles = Vec::new();
+    for model in &rlv.storeys {
+        for r in &model.rooms {
+            let label = format!("{} {} | Su={:.2} mp | P={:.2} m | H={:.2} m", r.code, r.name, r.area_m2, r.perimeter_m, r.clear_height_m);
+            label_handles.push(add_label(s, "RLV_SCHEDULE", r.center, 0.22, label)?);
+            rooms_json.push(json!({
+                "code": r.code,
+                "name": r.name,
+                "areaM2": r.area_m2,
+                "perimeterM": r.perimeter_m,
+                "clearHeightM": r.clear_height_m,
+                "center": r.center,
+                "storey": model.storey.index,
+            }));
+        }
+    }
+
+    let (opening_count, doors, windows) = opening_counts(&per_storey);
+    let ifc_json = match ifc_param(p)? {
+        Some(path) => Some(write_ifc_file(&path, &building_from_rlv(&rlv, &per_storey))?),
+        None => None,
+    };
+
+    let mut reply = json!({
         "message": format!(
-            "Auto-RLV complete: {} walls, {} openings, {} rooms, Su total = {:.2} m² (furniture removed: {} pts)",
-            rlv.walls.len(),
-            rlv.openings.len(),
-            rlv.rooms.len(),
-            rlv.total_usable_area_m2,
-            rlv.furniture_removed
+            "Auto-RLV complete: {} slabs, {} storeys, {} walls, {} rooms, {} openings ({} doors, {} windows), Su total = {:.2} m²",
+            rlv.slabs.len(),
+            rlv.storeys.len(),
+            rlv.walls(),
+            rlv.rooms(),
+            opening_count,
+            doors,
+            windows,
+            rlv.total_usable_area_m2
         ),
         "floorZ": rlv.floor_z,
         "ceilingZ": rlv.ceiling_z,
-        "clearHeightM": rlv.clear_height_m,
-        "furnitureRemoved": rlv.furniture_removed,
+        "walls": rlv.walls(),
+        "zones": rlv.zones(),
+        "slabs": rlv.slabs.len(),
+        "roomCount": rlv.rooms(),
         "totalUsableAreaM2": rlv.total_usable_area_m2,
         "totalPerimeterM": rlv.total_perimeter_m,
-        "walls": wall_handles.len(),
-        "openings": opening_handles.len(),
-        "dimensions": dim_handles.len(),
+        "storeyDetails": storeys_json,
+        "slabDetails": slabs_json,
         "rooms": rooms_json,
-    }))
+        "openings": {
+            "count": opening_count,
+            "doors": doors,
+            "windows": windows,
+            "perStorey": per_storey.iter().map(Vec::len).collect::<Vec<_>>(),
+            "fineBands": if path.is_empty() { "unavailable" } else { "streamed" },
+        },
+        "deviation": {
+            "points": dev.points,
+            "rmseMm": dev.rmse_mm,
+            "meanMm": dev.mean_mm,
+            "maxMm": dev.max_mm,
+            "aboveThreshold": dev.above_threshold,
+            "furniture": dev.furniture.len(),
+        },
+        "notAvailable": ["dimensions"],
+        "drawn": {
+            "walls": wall_handles.len(),
+            "zones": zone_handles.len(),
+            "slabs": slab_handles.len(),
+            "openings": opening_lines,
+            "furniture": furniture_rects,
+            "labels": label_handles.len(),
+        },
+    });
+    if let Some(ifc) = ifc_json {
+        reply["ifc"] = ifc;
+    }
+    Ok(reply)
 }
 
 fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
-    let include_roof = p.get("roof").and_then(Value::as_bool).unwrap_or(true);
-    let pts = active_cloud_points(s, p);
-    let bld = cadcraft_pointcloud::extract_auto_3d_building(&pts, include_roof);
+    let opts = model_options(p)?;
+    let pts = cloud_points_for_model(s, p)?;
+    let path = cloud_path_for_model(s, p)?;
+    let rlv = cadcraft_pointcloud::extract_auto_rlv(&pts, &opts).map_err(|e| EngineError::Other(format!("Auto-3D: {e}")))?;
+    let per_storey = storey_openings(&path, &rlv.storeys, &opts);
 
-    let mut wall_strokes = 0usize;
-    for w in &bld.walls_3d {
-        let poly = [w.base_p1, w.base_p2, [w.base_p2[0], w.base_p2[1], w.top_z], [w.base_p1[0], w.base_p1[1], w.top_z]];
-        s.sketch.add(&poly, "BIM_3D_WALLS", true);
-        let a = Vec2::new(w.base_p1[0], w.base_p1[1]);
-        let b = Vec2::new(w.base_p2[0], w.base_p2[1]);
-        if !a.near(b, 1e-6) {
-            let _ = add_on_layer(s, "BIM_3D_WALLS", line(a, b))?;
+    let mut wall_planes = 0usize;
+    for model in &rlv.storeys {
+        for w in &model.walls {
+            let a = Vec2::new(w.from[0], w.from[1]);
+            let b = Vec2::new(w.to[0], w.to[1]);
+            if a.near(b, 1e-6) {
+                continue;
+            }
+            let _ = add_on_layer(s, "RLV_3D_WALLS", line(a, b))?;
+            let (dx, dy) = (w.to[0] - w.from[0], w.to[1] - w.from[1]);
+            let length = (dx * dx + dy * dy).sqrt();
+            if !length.is_finite() || length <= 0.0 {
+                continue;
+            }
+            let (nx, ny) = (-dy / length * w.thickness * 0.5, dx / length * w.thickness * 0.5);
+            for side in [1.0, -1.0] {
+                let x1 = w.from[0] + nx * side;
+                let y1 = w.from[1] + ny * side;
+                let x2 = w.to[0] + nx * side;
+                let y2 = w.to[1] + ny * side;
+                let face = [[x1, y1, w.base_z], [x2, y2, w.base_z], [x2, y2, w.base_z + w.height], [x1, y1, w.base_z + w.height]];
+                s.sketch.add(&face, "RLV_3D_WALLS", true);
+            }
+            wall_planes += 1;
         }
-        wall_strokes += 1;
     }
 
-    for slab in &bld.slabs_and_roof {
-        s.sketch.add(&slab.vertices, "BIM_3D_SLABS_ROOF", true);
+    let mut slab_faces = 0usize;
+    for (i, slab) in rlv.slabs.iter().enumerate() {
+        if slab.polygon.len() < 3 {
+            continue;
+        }
+        // The face a person sees from the room: the walking surface for the lowest slab, the
+        // underside for every slab above it.
+        let z = if i == 0 { slab.top_z } else { slab.base_z };
+        let face: Vec<[f64; 3]> = slab.polygon.iter().map(|pt| [pt[0], pt[1], z]).collect();
+        s.sketch.add(&face, "RLV_3D_SLABS", true);
+        slab_faces += 1;
     }
 
-    Ok(json!({
+    let (opening_count, doors, windows) = opening_counts(&per_storey);
+    let ifc_json = match ifc_param(p)? {
+        Some(path) => Some(write_ifc_file(&path, &building_from_rlv(&rlv, &per_storey))?),
+        None => None,
+    };
+
+    let mut reply = json!({
         "message": format!(
-            "Auto-3D Building generated (no furniture): {} 3D walls, {} slabs/roof planes, ridge Z={:.2} m",
-            wall_strokes,
-            bld.slabs_and_roof.len(),
-            bld.roof_ridge_z
+            "Auto-3D Building: {} wall planes (two faces each), {} slab faces, {} openings ({} doors, {} windows)",
+            wall_planes, slab_faces, opening_count, doors, windows
         ),
-        "floorZ": bld.floor_z,
-        "ceilingZ": bld.ceiling_z,
-        "roofRidgeZ": bld.roof_ridge_z,
-        "furnitureRemoved": bld.furniture_removed,
-        "walls3d": wall_strokes,
-        "slabsAndRoof": bld.slabs_and_roof.len(),
-        "openings": bld.openings.len(),
-    }))
+        "floorZ": rlv.floor_z,
+        "ceilingZ": rlv.ceiling_z,
+        "walls3d": wall_planes,
+        "slabs": slab_faces,
+        "openings": {
+            "count": opening_count,
+            "doors": doors,
+            "windows": windows,
+            "perStorey": per_storey.iter().map(Vec::len).collect::<Vec<_>>(),
+            "fineBands": if path.is_empty() { "unavailable" } else { "streamed" },
+        },
+        "notAvailable": ["dimensions"],
+        "drawn": {"walls": wall_planes, "slabs": slab_faces},
+    });
+    if let Some(ifc) = ifc_json {
+        reply["ifc"] = ifc;
+    }
+    Ok(reply)
 }
 
 fn autovectorize(s: &mut Session, p: &Value) -> Result<Value> {
@@ -694,4 +1012,158 @@ fn padcadastru(s: &mut Session, p: &Value) -> Result<Value> {
         "perimeterM": pad.perimeter_m,
         "inventory": rows_json,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::test_las::write_test_las;
+    use cadcraft_doc::Space as DocSpace;
+    use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, DEFAULT_MAX_POINTS, Pt, Slice};
+
+    /// A 6 x 4 m room split in two by a partition at x = 3, with 0.20 m walls, a floor at z = 0
+    /// and a ceiling at z = 2.80. The points are the surfaces a scanner sees from inside: the
+    /// floor and ceiling planes, the four room-side faces of the outer walls, and both faces of
+    /// the partition. A bounding-box fake calls that six walls; the scan has five, and two rooms.
+    ///
+    /// The partition carries one 0.90 m door (y 1.90..2.80, up to z = 2.10): its rectangle has no
+    /// points. Walls are sampled every 2 cm along their length and every 5 cm up them, so the
+    /// 2 cm opening raster closes the seams between sample rows and the door stands alone as one
+    /// hole instead of dissolving into them.
+    fn room_points() -> Vec<[f64; 3]> {
+        let mut pts = Vec::new();
+        // The floor and the ceiling, at 2 cm so the histogram's tallest bin is the plane and not
+        // a wall level: a point cloud samples surfaces, and a wall contributes its area, not its
+        // height, to any 5 cm Z bin.
+        let mut i = 0;
+        while i <= 300 {
+            let x = f64::from(i) * 0.02;
+            let mut j = 0;
+            while j <= 200 {
+                let y = f64::from(j) * 0.02;
+                pts.push([x, y, 0.0]);
+                pts.push([x, y, 2.8]);
+                j += 1;
+            }
+            i += 1;
+        }
+        // The four room-side faces, one cell thick, running past the corners so they meet the
+        // way walls do.
+        let mut k = 0;
+        while k <= 300 {
+            let t = -0.01 + 0.02 * f64::from(k);
+            let mut l = 0;
+            while l <= 52 {
+                let z = 0.1 + 0.05 * f64::from(l);
+                pts.push([t, 0.2, z]);
+                pts.push([t, 3.8, z]);
+                l += 1;
+            }
+            k += 1;
+        }
+        let mut k = 0;
+        while k <= 200 {
+            let t = -0.01 + 0.02 * f64::from(k);
+            let mut l = 0;
+            while l <= 52 {
+                let z = 0.1 + 0.05 * f64::from(l);
+                pts.push([0.2, t, z]);
+                pts.push([5.8, t, z]);
+                l += 1;
+            }
+            k += 1;
+        }
+        // The partition, both faces seen: the pair that becomes one axis at x = 3, with the door
+        // cut out of it.
+        let mut u = 2.91;
+        while u <= 3.09 + 1e-9 {
+            let mut y = 0.2;
+            while y <= 3.8 + 1e-9 {
+                let in_door = (1.9 - 1e-9..=2.8 + 1e-9).contains(&y);
+                let mut l = 0;
+                while l <= 52 {
+                    let z = 0.1 + 0.05 * f64::from(l);
+                    if !(in_door && z <= 2.1 + 1e-9) {
+                        pts.push([u, y, z]);
+                    }
+                    l += 1;
+                }
+                y += 0.02;
+            }
+            u += 0.02;
+        }
+        pts
+    }
+
+    fn session_with_room() -> Session {
+        let pts = room_points();
+        let mut bounds = Bounds3::EMPTY;
+        let mut sliced = Vec::with_capacity(pts.len());
+        let mut on_disk = Vec::with_capacity(pts.len());
+        for p in &pts {
+            bounds.add(p[0], p[1], p[2]);
+            sliced.push(Pt { x: p[0], y: p[1], z: p[2], rgb: None, intensity: 100, class: 1 });
+            on_disk.push((p[0], p[1], p[2], 1u8));
+        }
+        // The fine opening bands are read from the file, not from the display cloud: the fixture
+        // has to exist on the disk and the cloud has to know where.
+        let dir = std::env::temp_dir().join("cadcraft-autorlv-test");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("room.las");
+        write_test_las(&path, &on_disk);
+        let total = sliced.len() as u64;
+        let slice = Slice { points: sliced, total, in_band: total, bounds };
+        let cloud =
+            Cloud::from_slice("room".to_string(), path.display().to_string(), 0.0, 2.8, None, slice, DEFAULT_MAX_POINTS, CloudColor::Elevation);
+        let mut s = Session::new();
+        s.clouds.push(cloud);
+        s
+    }
+
+    fn count_on_layer(s: &Session, layer: &str) -> usize {
+        s.doc().ok().and_then(|d| d.space(&DocSpace::Model)).map(|store| store.iter().filter(|e| e.common.layer == layer).count()).unwrap_or(0)
+    }
+
+    #[test]
+    fn autorlv_draws_the_walls_the_scan_has_and_not_a_bounding_box() {
+        let mut s = session_with_room();
+        let r = s.execute("autorlv", &json!({"index": 0}));
+        assert!(r.is_ok(), "the pipeline runs: {r:?}");
+        let reply = r.expect("the reply");
+        assert_eq!(reply["walls"].as_u64(), Some(5), "the partition and four sides, not a fabricated six: {reply}");
+        assert_eq!(reply["zones"].as_u64(), Some(2), "the partition splits the room in two: {reply}");
+        assert_eq!(reply["drawn"]["walls"].as_u64(), reply["walls"].as_u64(), "every found wall is drawn: {reply}");
+        assert_eq!(reply["drawn"]["zones"].as_u64(), reply["zones"].as_u64(), "and every zone: {reply}");
+        assert_eq!(count_on_layer(&s, "RLV_WALLS"), 5);
+        assert_eq!(count_on_layer(&s, "RLV_ZONES"), 2);
+        assert_eq!(count_on_layer(&s, "RLV_SLABS"), 2, "the floor and the ceiling");
+        assert_eq!(count_on_layer(&s, "BIM_WALLS"), 0, "the fabricated layer is not written");
+        assert_eq!(count_on_layer(&s, "RLV_OPENINGS"), 2, "two jamb lines for the one door: {reply}");
+        assert_eq!(reply["openings"]["count"].as_u64(), Some(1), "the partition's door: {reply}");
+        assert_eq!(reply["openings"]["doors"].as_u64(), Some(1), "and it is a door, not a window: {reply}");
+        assert_eq!(reply["openings"]["windows"].as_u64(), Some(0), "{reply}");
+        assert!(reply["deviation"]["rmseMm"].as_f64().is_some_and(|v| v.is_finite()), "the scan is measured against the model: {reply}");
+        assert_eq!(reply["notAvailable"].as_array().map(Vec::len), Some(1), "dimensions alone are still to come: {reply}");
+    }
+
+    #[test]
+    fn autorlv_writes_a_self_checked_ifc_file_when_it_is_asked_for() {
+        let mut s = session_with_room();
+        let path = std::env::temp_dir().join("cadcraft-autorlv.ifc");
+        let r = s.execute("autorlv", &json!({"index": 0, "ifc": path.display().to_string()}));
+        let reply = r.expect("the file writes");
+        assert!(path.is_file(), "the IFC file is on the disk: {reply}");
+        let text = std::fs::read_to_string(&path).expect("the file reads");
+        assert!(text.contains("IFCWALL"), "the walls reach the file: {reply}");
+        assert_eq!(reply["ifc"]["doors"].as_u64(), Some(1), "the door reaches the file: {reply}");
+        assert!(reply["ifc"]["entities"].as_u64().is_some_and(|n| n > 0), "{reply}");
+    }
+
+    #[test]
+    fn autorlv_without_a_cloud_refuses_instead_of_modelling_a_fake_apartment() {
+        let mut s = Session::new();
+        let r = s.execute("autorlv", &json!({}));
+        assert!(r.is_err(), "no cloud, no model: {r:?}");
+        assert_eq!(count_on_layer(&s, "RLV_WALLS"), 0, "and nothing is drawn from a fallback scan");
+    }
 }

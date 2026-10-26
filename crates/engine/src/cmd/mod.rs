@@ -41,6 +41,8 @@ mod selecttools;
 mod settings;
 mod spline_opts;
 mod table;
+#[cfg(test)]
+pub(crate) mod test_las;
 mod tolerance;
 mod trimextend;
 mod txt2mtxt;
