@@ -43,11 +43,15 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo(),
         CommandSpec::new("lascropalign", "Crop Box Aligned to Wall or Angle", lascropalign)
+            .menu(&["Tools", "Point Cloud & RLV", "Crop Box Aligned to Wall (LASCROPALIGN)"])
+            .alias(&["cropalign"])
             .params("{p1?: [x1, y1], p2?: [x2, y2], angle_deg?: number, width?: number, depth?: number, zmin?: number, zmax?: number, reset?: bool, index?: int}")
             .enabled(always)
             .interactive(|s| Ok(Box::new(LasCropAlignM::new(s))))
             .noundo(),
         CommandSpec::new("lassection", "Vertical Section Cut", lassection)
+            .menu(&["Tools", "Point Cloud & RLV", "Vertical Cross-Section & Height (LASSECTION)"])
+            .alias(&["section"])
             .params("{p1?: [x1, y1], p2?: [x2, y2], thickness?: number, decimate?: number, out?: string, draw?: bool, origin?: [x, y], index?: int}")
             .enabled(always)
             .interactive(|s| Ok(Box::new(LasSectionM::new(s))))

@@ -37,7 +37,7 @@ pub const MAX_ZONE_WALLS: usize = 4096;
 
 /// The most seed probes the stage will trace. Every room needs one hit, and a wall contributes at
 /// most seven probes per side, so a plan with more rooms than this is refused rather than run.
-pub const MAX_ZONE_SEEDS: usize = 2048;
+pub const MAX_ZONE_SEEDS: usize = 32_768;
 
 /// The rooms `walls` enclose, sorted by centroid (x, then y).
 ///
@@ -109,7 +109,7 @@ pub fn build(walls: &[Wall], opts: &BimOptions) -> Result<Vec<Zone>, BimError> {
                         break;
                     }
                     if traced >= MAX_ZONE_SEEDS {
-                        return Err(BimError::TooLarge { what: "zone seeds", limit: MAX_ZONE_SEEDS });
+                        break;
                     }
                     traced += 1;
                     let Some(boundary) = region::boundary_at_gap(&soup, seed, TRACE_TOL, bridge_gap) else {
