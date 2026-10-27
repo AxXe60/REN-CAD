@@ -773,7 +773,7 @@ mod tests {
     use crate::bim::walls::Wall;
 
     fn wall(from: [f64; 2], to: [f64; 2], thickness: f64) -> Wall {
-        Wall { from, to, thickness, base_z: 0.1, height: 2.8, exterior: false, is_parapet: false }
+        Wall { from, to, thickness, base_z: 0.1, height: 2.8, exterior: false, is_parapet: false, arc: None }
     }
 
     /// A 6 × 6 m floor with one cross wall in each direction, so four rooms of 2.8 × 2.8 m once
@@ -948,7 +948,16 @@ mod tests {
         walls.push(wall([0.0, 0.0], [0.0, 0.0], 0.2));
         walls.push(wall([0.0, 0.0], [1.0, 0.0], -0.2));
         walls.push(wall([0.0, 0.0], [1.0, 0.0], f64::INFINITY));
-        walls.push(Wall { from: [0.0, 0.0], to: [1.0, 0.0], thickness: 0.2, base_z: f64::NAN, height: f64::NAN, exterior: false, is_parapet: false });
+        walls.push(Wall {
+            from: [0.0, 0.0],
+            to: [1.0, 0.0],
+            thickness: 0.2,
+            base_z: f64::NAN,
+            height: f64::NAN,
+            exterior: false,
+            is_parapet: false,
+            arc: None,
+        });
         let zones = build(&walls, &BimOptions::default()).expect("the room still stands");
         assert_eq!(zones.len(), 1, "the unusable walls neither add a zone nor remove the room");
         assert!(zones[0].ring.len() >= 4, "the room is a quadrilateral, not a sliver");
@@ -1069,9 +1078,9 @@ mod tests {
             wall([4.0, 4.0], [0.0, 4.0], t),
             wall([0.0, 4.0], [0.0, 0.0], t),
             // Parapet wall (is_parapet: true, height: 1.0 m)
-            Wall { from: [1.0, 1.0], to: [3.0, 1.0], thickness: 0.20, base_z: 0.0, height: 1.0, exterior: false, is_parapet: true },
+            Wall { from: [1.0, 1.0], to: [3.0, 1.0], thickness: 0.20, base_z: 0.0, height: 1.0, exterior: false, is_parapet: true, arc: None },
             // Partial-height furniture / low wall (is_parapet: false, height: 1.2 m < 2.8 * 0.75 = 2.1 m)
-            Wall { from: [2.0, 1.0], to: [2.0, 3.0], thickness: 0.20, base_z: 0.0, height: 1.20, exterior: false, is_parapet: false },
+            Wall { from: [2.0, 1.0], to: [2.0, 3.0], thickness: 0.20, base_z: 0.0, height: 1.20, exterior: false, is_parapet: false, arc: None },
         ];
 
         let zones = build(&walls, &BimOptions::default()).expect("zones should build");

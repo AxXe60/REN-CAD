@@ -19,17 +19,25 @@ use crate::bim::{BimError, BimOptions};
 // Public types — the contract the engine draws from; kept exactly as the stub.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpeningShape {
+    Rectangular,
+    Arched { arch_radius: f64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpeningKind {
     Door,
     Window,
+    ClosedDoor { recess_depth: f64 },
 }
 
 impl OpeningKind {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             OpeningKind::Door => "door",
             OpeningKind::Window => "window",
+            OpeningKind::ClosedDoor { .. } => "closed_door",
         }
     }
 }
@@ -38,6 +46,7 @@ impl OpeningKind {
 pub struct Opening {
     pub wall: usize,
     pub kind: OpeningKind,
+    pub shape: OpeningShape,
     pub from: [f64; 2],
     pub to: [f64; 2],
     pub thickness: f64,
@@ -296,6 +305,7 @@ pub fn detect(points: &[[f64; 3]], wall: &Wall, wall_index: usize, opts: &BimOpt
         let mut region_max_z = 0usize;
         let mut touches_left = false;
         let mut touches_right = false;
+        let mut col_max_cy: Vec<Option<usize>> = vec![None; w];
 
         stack.push(seed as u32);
         if let Some(v) = visited.get_mut(seed) {
@@ -319,6 +329,10 @@ pub fn detect(points: &[[f64; 3]], wall: &Wall, wall_index: usize, opts: &BimOpt
             region_max_u = region_max_u.max(cx);
             region_min_z = region_min_z.min(cy);
             region_max_z = region_max_z.max(cy);
+
+            if let Some(entry) = col_max_cy.get_mut(cx) {
+                *entry = Some(entry.map_or(cy, |m| m.max(cy)));
+            }
 
             // Check edge touches.
             if cx == 0 {
@@ -380,6 +394,39 @@ pub fn detect(points: &[[f64; 3]], wall: &Wall, wall_index: usize, opts: &BimOpt
         let sill_z = wall.base_z + sill_above_base;
         let head_z = wall.base_z + head_above_base;
 
+        // Arched top fitting on candidate openings: check upper region [0.75, 1.0] of height.
+        // If the profile fits a semicircle with RMSE <= 0.03 m, set shape: Arched { arch_radius: width / 2.0 }.
+        let r_arch = width_m / 2.0;
+        let is_arched = if r_arch > 0.0 && r_arch <= 0.60 * height_m {
+            let mut sum_sq = 0.0;
+            let mut count = 0usize;
+            let mut has_corner_drop = false;
+            for cx in region_min_u..=region_max_u {
+                if let Some(Some(cy)) = col_max_cy.get(cx) {
+                    let u_rel = (cx - region_min_u) as f64 * t.cell + 0.5 * t.cell;
+                    let dx = (u_rel - r_arch).clamp(-r_arch, r_arch);
+                    let z_expected = (head_above_base - r_arch) + (r_arch * r_arch - dx * dx).max(0.0).sqrt();
+                    let z_actual = (cy + 1) as f64 * t.cell;
+                    let diff = z_actual - z_expected;
+                    sum_sq += diff * diff;
+                    count += 1;
+                    if (head_above_base - z_actual) >= 0.25 * r_arch {
+                        has_corner_drop = true;
+                    }
+                }
+            }
+            if count >= 4 && has_corner_drop {
+                let rmse = (sum_sq / (count as f64)).sqrt();
+                rmse <= 0.03
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let shape = if is_arched { OpeningShape::Arched { arch_radius: r_arch } } else { OpeningShape::Rectangular };
+
         // Step 10: jambs in world metres, clamped to the wall ends.
         // from = wall.from + d·(min_u_cell·cell), to = wall.from + d·((max_u_cell+1)·cell).
         let u0 = (region_min_u as f64 * t.cell).clamp(0.0, len);
@@ -387,8 +434,12 @@ pub fn detect(points: &[[f64; 3]], wall: &Wall, wall_index: usize, opts: &BimOpt
         let from = [wall.from[0] + dux * u0, wall.from[1] + duy * u0];
         let to = [wall.from[0] + dux * u1, wall.from[1] + duy * u1];
 
-        openings_out.push(Opening { wall: wall_index, kind, from, to, thickness: wall.thickness, sill_z, head_z });
+        openings_out.push(Opening { wall: wall_index, kind, shape, from, to, thickness: wall.thickness, sill_z, head_z });
     }
+
+    // Step 10b: detect closed doors in candidate wall regions without density drops
+    let closed_doors = detect_closed_doors(points, wall, wall_index, &openings_out);
+    openings_out.extend(closed_doors);
 
     // Step 11: sort by (from.x, from.y, kind) for determinism across repeated runs. *(ours)*
     openings_out.sort_by(|a, b| a.from[0].total_cmp(&b.from[0]).then(a.from[1].total_cmp(&b.from[1])).then(a.kind.as_str().cmp(b.kind.as_str())));
@@ -419,6 +470,262 @@ pub fn detect_all(walls: &[Wall], fine: &[Vec<[f64; 3]>], opts: &BimOptions) -> 
     Ok(out)
 }
 
+fn median_f64(mut v: Vec<f64>) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[v.len() / 2])
+}
+
+/// Inspect candidate wall regions without density drops for micro-relief (recess) characteristic of closed doors.
+///
+/// A closed door region:
+/// - Width in [0.65, 1.20] m
+/// - Height in [1.90, 2.25] m
+/// - Starts near the floor (sill <= 0.10 m)
+/// - Average recess in [0.01, 0.08] m (1 to 8 cm) relative to the surrounding wall face
+/// - Does not overlap with existing open openings
+pub fn detect_closed_doors(points: &[[f64; 3]], wall: &Wall, wall_index: usize, existing: &[Opening]) -> Vec<Opening> {
+    let dx = wall.to[0] - wall.from[0];
+    let dy = wall.to[1] - wall.from[1];
+    let len = dx.hypot(dy);
+    if !len.is_finite() || len < 0.65 || !wall.height.is_finite() || wall.height < 1.90 {
+        return Vec::new();
+    }
+    let (dux, duy) = (dx / len, dy / len);
+    let (nx, ny) = (-duy, dux);
+
+    let half_thick = wall.thickness / 2.0;
+    let band = 0.10;
+    let v_limit = half_thick + band;
+
+    #[derive(Clone, Copy)]
+    struct Pt {
+        u: f64,
+        v: f64,
+        z: f64,
+    }
+    let mut wall_pts: Vec<Pt> = Vec::new();
+    for &[px, py, pz] in points {
+        if !px.is_finite() || !py.is_finite() || !pz.is_finite() {
+            continue;
+        }
+        let z_rel = pz - wall.base_z;
+        if z_rel < 0.0 || z_rel > wall.height {
+            continue;
+        }
+        let rx = px - wall.from[0];
+        let ry = py - wall.from[1];
+        let u = rx * dux + ry * duy;
+        let v = rx * nx + ry * ny;
+        if u >= 0.0 && u <= len && v.abs() <= v_limit {
+            wall_pts.push(Pt { u, v, z: z_rel });
+        }
+    }
+    if wall_pts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut excluded_u: Vec<(f64, f64)> = Vec::new();
+    for op in existing {
+        let u_a = (op.from[0] - wall.from[0]) * dux + (op.from[1] - wall.from[1]) * duy;
+        let u_b = (op.to[0] - wall.from[0]) * dux + (op.to[1] - wall.from[1]) * duy;
+        let u_min = (u_a.min(u_b) - 0.05).max(0.0);
+        let u_max = (u_a.max(u_b) + 0.05).min(len);
+        excluded_u.push((u_min, u_max));
+    }
+
+    let is_excluded = |u: f64| -> bool { excluded_u.iter().any(|&(lo, hi)| u >= lo && u <= hi) };
+
+    let mut detected: Vec<Opening> = Vec::new();
+
+    for side in [1.0_f64, -1.0_f64] {
+        let face_pts: Vec<Pt> =
+            wall_pts.iter().copied().filter(|p| side * p.v > 0.0 && (side * p.v) >= half_thick - 0.12 && !is_excluded(p.u)).collect();
+        if face_pts.len() < 30 {
+            continue;
+        }
+
+        let bin_w = 0.02;
+        let num_bins = (len / bin_w).ceil() as usize;
+        if num_bins == 0 {
+            continue;
+        }
+
+        let mut bin_mid: Vec<Vec<f64>> = vec![Vec::new(); num_bins];
+        let mut bin_top: Vec<Vec<f64>> = vec![Vec::new(); num_bins];
+        let mut all_mid_v: Vec<f64> = Vec::new();
+        let mut all_top_v: Vec<f64> = Vec::new();
+
+        for p in &face_pts {
+            let bi = ((p.u / bin_w).floor() as usize).min(num_bins - 1);
+            let val = side * p.v;
+            if p.z >= 0.50 && p.z <= 1.80 {
+                bin_mid[bi].push(val);
+                all_mid_v.push(val);
+            } else if p.z >= 2.15 && p.z <= 2.70_f64.min(wall.height) {
+                bin_top[bi].push(val);
+                all_top_v.push(val);
+            }
+        }
+
+        if all_mid_v.len() < 20 {
+            continue;
+        }
+
+        let v_wall_mid_median = match median_f64(all_mid_v) {
+            Some(m) => m,
+            None => continue,
+        };
+        let v_wall_top_median = median_f64(all_top_v);
+
+        let mut med_mid: Vec<Option<f64>> = Vec::with_capacity(num_bins);
+        let mut med_top: Vec<Option<f64>> = Vec::with_capacity(num_bins);
+        for bi in 0..num_bins {
+            med_mid.push(median_f64(bin_mid[bi].clone()));
+            med_top.push(median_f64(bin_top[bi].clone()));
+        }
+
+        let mut bin_is_recessed: Vec<bool> = vec![false; num_bins];
+
+        for bi in 0..num_bins {
+            if let Some(m_mid) = med_mid[bi] {
+                let v_ref = if let Some(m_top) = med_top[bi] {
+                    m_top
+                } else if let Some(top_med) = v_wall_top_median {
+                    top_med
+                } else {
+                    v_wall_mid_median
+                };
+                let diff = v_ref - m_mid;
+                if (0.008..=0.085).contains(&diff) {
+                    bin_is_recessed[bi] = true;
+                }
+            }
+        }
+
+        let mut start_bin: Option<usize> = None;
+        #[allow(clippy::needless_range_loop)]
+        for bi in 0..=num_bins {
+            let is_rec = if bi < num_bins { bin_is_recessed[bi] } else { false };
+            if is_rec {
+                if start_bin.is_none() {
+                    start_bin = Some(bi);
+                }
+            } else if let Some(s) = start_bin {
+                let e = bi;
+                start_bin = None;
+                let u_start = s as f64 * bin_w;
+                let u_end = e as f64 * bin_w;
+                let width = u_end - u_start;
+
+                if !(0.65..=1.20).contains(&width) {
+                    continue;
+                }
+
+                let door_pts: Vec<Pt> = face_pts.iter().copied().filter(|p| p.u >= u_start && p.u <= u_end).collect();
+                if door_pts.is_empty() {
+                    continue;
+                }
+
+                let min_z = door_pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+                if min_z > 0.20 {
+                    continue;
+                }
+
+                let body_pts: Vec<f64> = door_pts.iter().filter(|p| p.z >= 0.30 && p.z <= 1.80).map(|p| side * p.v).collect();
+                let Some(v_door) = median_f64(body_pts) else {
+                    continue;
+                };
+
+                let mut best_h: Option<f64> = None;
+                let mut best_step = 0.0f64;
+                for z_step in (190..=225).step_by(2) {
+                    let z_cand = z_step as f64 / 100.0;
+                    let below_pts: Vec<f64> = door_pts.iter().filter(|p| p.z >= z_cand - 0.10 && p.z < z_cand).map(|p| side * p.v).collect();
+                    let above_pts: Vec<f64> =
+                        door_pts.iter().filter(|p| p.z >= z_cand && p.z <= (z_cand + 0.10).min(wall.height)).map(|p| side * p.v).collect();
+                    if !below_pts.is_empty() && !above_pts.is_empty() {
+                        let mean_b = below_pts.iter().sum::<f64>() / (below_pts.len() as f64);
+                        let mean_a = above_pts.iter().sum::<f64>() / (above_pts.len() as f64);
+                        let step = mean_a - mean_b;
+                        if step > best_step {
+                            best_step = step;
+                            best_h = Some(z_cand);
+                        }
+                    }
+                }
+                let found_h = if best_step >= 0.008 { best_h } else { None };
+
+                let left_pts: Vec<f64> = face_pts
+                    .iter()
+                    .filter(|p| p.u >= (u_start - 0.25).max(0.0) && p.u < u_start && p.z >= 0.50 && p.z <= 1.80)
+                    .map(|p| side * p.v)
+                    .collect();
+                let right_pts: Vec<f64> = face_pts
+                    .iter()
+                    .filter(|p| p.u > u_end && p.u <= (u_end + 0.25).min(len) && p.z >= 0.50 && p.z <= 1.80)
+                    .map(|p| side * p.v)
+                    .collect();
+
+                let step_left = median_f64(left_pts).map(|vl| vl - v_door);
+                let step_right = median_f64(right_pts).map(|vr| vr - v_door);
+
+                let has_jamb_step = step_left.is_some_and(|s| s >= 0.008) || step_right.is_some_and(|s| s >= 0.008);
+                let has_lintel_step = found_h.is_some();
+
+                if !has_lintel_step && !has_jamb_step {
+                    continue;
+                }
+                if wall.height >= 2.25 && !has_lintel_step {
+                    continue;
+                }
+
+                let detected_h = found_h.unwrap_or(2.10_f64.min(wall.height));
+                if !(1.90..=2.25).contains(&detected_h) {
+                    continue;
+                }
+
+                let mut surrounding_face: Vec<f64> = Vec::new();
+                for p in &door_pts {
+                    if p.z >= detected_h && p.z <= (detected_h + 0.35).min(wall.height) {
+                        surrounding_face.push(side * p.v);
+                    }
+                }
+                for p in &face_pts {
+                    if p.z >= 0.50
+                        && p.z <= 1.80
+                        && ((p.u >= (u_start - 0.25).max(0.0) && p.u < u_start) || (p.u > u_end && p.u <= (u_end + 0.25).min(len)))
+                    {
+                        surrounding_face.push(side * p.v);
+                    }
+                }
+
+                let v_surround = median_f64(surrounding_face).unwrap_or(v_wall_mid_median);
+                let avg_recess = v_surround - v_door;
+
+                if (0.01..=0.08).contains(&avg_recess) {
+                    let from = [wall.from[0] + dux * u_start, wall.from[1] + duy * u_start];
+                    let to = [wall.from[0] + dux * u_end, wall.from[1] + duy * u_end];
+                    detected.push(Opening {
+                        wall: wall_index,
+                        kind: OpeningKind::ClosedDoor { recess_depth: avg_recess },
+                        shape: OpeningShape::Rectangular,
+                        from,
+                        to,
+                        thickness: wall.thickness,
+                        sill_z: wall.base_z,
+                        head_z: wall.base_z + detected_h,
+                    });
+                }
+            }
+        }
+    }
+
+    detected
+}
+
 // ---------------------------------------------------------------------------
 // Tests (TDD: written before implementation, run RED, then GREEN)
 // ---------------------------------------------------------------------------
@@ -429,7 +736,7 @@ mod tests {
     use crate::bim::BimOptions;
 
     fn wall() -> Wall {
-        Wall { from: [0.0, 0.0], to: [4.0, 0.0], thickness: 0.20, base_z: 0.0, height: 3.0, exterior: false, is_parapet: false }
+        Wall { from: [0.0, 0.0], to: [4.0, 0.0], thickness: 0.20, base_z: 0.0, height: 3.0, exterior: false, is_parapet: false, arc: None }
     }
 
     /// Points on both faces of the wall, on a 2 cm grid, skipping the two holes.
@@ -461,6 +768,8 @@ mod tests {
         assert_eq!(got.len(), 2, "one door and one window, not the scan cracks: {got:?}");
         let door = got.iter().find(|o| o.kind == OpeningKind::Door).expect("a door");
         let window = got.iter().find(|o| o.kind == OpeningKind::Window).expect("a window");
+        assert_eq!(door.shape, OpeningShape::Rectangular);
+        assert_eq!(window.shape, OpeningShape::Rectangular);
         assert!((door.width() - 0.9).abs() <= 0.025, "door width {}, acceptance 25 mm", door.width());
         assert!((door.height() - 2.1).abs() <= 0.025, "door height {}", door.height());
         assert!(door.sill_z.abs() <= 0.025, "a door starts at the floor, sill {}", door.sill_z);
@@ -493,6 +802,8 @@ mod tests {
         assert_eq!(got.len(), 2, "density spikes must not hide the openings: {got:?}");
         let door = got.iter().find(|o| o.kind == OpeningKind::Door).expect("a door");
         let window = got.iter().find(|o| o.kind == OpeningKind::Window).expect("a window");
+        assert_eq!(door.shape, OpeningShape::Rectangular);
+        assert_eq!(window.shape, OpeningShape::Rectangular);
         assert!((door.width() - 0.9).abs() <= 0.025, "door width still correct under spikes: {}", door.width());
         assert!((window.width() - 0.8).abs() <= 0.025, "window width still correct: {}", window.width());
     }
@@ -562,5 +873,86 @@ mod tests {
         let o = BimOptions::default();
         let result = detect_all(&walls, &fine, &o).expect("missing band is not an error");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn arched_opening_fitting_detects_semicircle_profile() {
+        let o = BimOptions::default();
+        let mut pts = Vec::new();
+        // Wall 4.0m long, 3.0m high, 0.20m thick (faces at y = -0.10, +0.10)
+        // Arched doorway: x in [1.50, 2.50] (width = 1.0 m, radius = 0.50 m)
+        // Rectangular part: z in [0.0, 1.70]
+        // Semicircle arch top: center at (2.0, 1.70), radius 0.50 m, peak at z = 2.20
+        for face in [-0.10_f64, 0.10] {
+            let mut x = 0.01_f64;
+            while x < 4.0 {
+                let mut z = 0.01_f64;
+                while z < 3.0 {
+                    let in_rect = (1.50..=2.50).contains(&x) && z <= 1.70;
+                    let in_arch = (1.50..=2.50).contains(&x) && z > 1.70 && {
+                        let dx = x - 2.0;
+                        let dz = z - 1.70;
+                        dx * dx + dz * dz <= 0.50 * 0.50
+                    };
+                    if !in_rect && !in_arch {
+                        pts.push([x, face, z]);
+                    }
+                    z += 0.02;
+                }
+                x += 0.02;
+            }
+        }
+
+        let got = detect(&pts, &wall(), 0, &o).expect("arched door detected");
+        assert_eq!(got.len(), 1, "exactly one arched doorway: {got:?}");
+        let door = &got[0];
+        assert_eq!(door.kind, OpeningKind::Door);
+        match door.shape {
+            OpeningShape::Arched { arch_radius } => {
+                assert!((arch_radius - 0.50).abs() <= 0.03, "arch radius ~0.50 m, got {arch_radius}");
+            }
+            OpeningShape::Rectangular => panic!("expected Arched shape, got Rectangular"),
+        }
+        assert!((door.width() - 1.0).abs() <= 0.03, "width ~1.0 m: {}", door.width());
+        assert!((door.head_z - 2.20).abs() <= 0.04, "head ~2.20 m: {}", door.head_z);
+    }
+
+    #[test]
+    fn closed_door_detection_from_micro_relief() {
+        let o = BimOptions::default();
+        let mut pts = Vec::new();
+        // Solid wall with NO empty hole (no density drop).
+        // Wall faces normally at y = -0.10 and y = +0.10.
+        // Closed door on face y = +0.10:
+        // x in [1.50, 2.40] (width 0.90 m), z in [0.0, 2.10] (height 2.10 m)
+        // Door leaf is recessed by 0.03 m (3 cm) -> y = 0.07 m!
+        // Above z = 2.10 m in [1.50, 2.40], y = 0.10 m (solid wall face).
+        // Face y = -0.10 is completely flat at y = -0.10.
+        for i in 0..200 {
+            let x = 0.01 + (i as f64) * 0.02;
+            for k in 0..150 {
+                let z = 0.01 + (k as f64) * 0.02;
+                // Back face
+                pts.push([x, -0.10, z]);
+
+                // Front face
+                let is_door = (1.50..=2.40).contains(&x) && z <= 2.10;
+                let y = if is_door { 0.07 } else { 0.10 };
+                pts.push([x, y, z]);
+            }
+        }
+
+        let got = detect(&pts, &wall(), 0, &o).expect("closed door detection");
+        assert_eq!(got.len(), 1, "exactly one closed door detected: {got:?}");
+        let door = &got[0];
+        match door.kind {
+            OpeningKind::ClosedDoor { recess_depth } => {
+                assert!((recess_depth - 0.03).abs() <= 0.01, "recess ~0.03 m: {recess_depth}");
+            }
+            _ => panic!("expected ClosedDoor, got {:?}", door.kind),
+        }
+        assert_eq!(door.shape, OpeningShape::Rectangular);
+        assert!((door.width() - 0.90).abs() <= 0.03, "width ~0.90 m: {}", door.width());
+        assert!((door.height() - 2.10).abs() <= 0.03, "height ~2.10 m: {}", door.height());
     }
 }

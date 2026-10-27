@@ -28,6 +28,14 @@ const MAX_SEGMENT_SAMPLES: usize = 4096;
 /// The most pairing samples the whole storey may hold, counted across all faces.
 const MAX_PAIR_SAMPLES: usize = 1_000_000;
 
+/// An arc definition for a curved wall.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WallArc {
+    pub center: [f64; 2],
+    pub radius: f64,
+    pub ccw: bool,
+}
+
 /// One wall, as an axis in plan and a vertical extent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Wall {
@@ -47,6 +55,8 @@ pub struct Wall {
     pub exterior: bool,
     /// True when the wall is a partial-height wall or parapet whose height is lower than clear storey height.
     pub is_parapet: bool,
+    /// Optional arc specification if the wall is curved.
+    pub arc: Option<WallArc>,
 }
 
 /// The walls standing in `storey`.
@@ -219,7 +229,8 @@ pub fn extract(points: &[[f64; 3]], storey: &Storey, opts: &BimOptions) -> Resul
     let walls = merge_collinear_walls(walls, 3.0, 0.15, 1.20);
     let walls = collapse_parallel_walls(walls);
     let walls = non_maximal_suppression(walls);
-    let mut walls = merge_collinear_walls(walls, 3.0, 0.15, 1.20);
+    let walls = merge_collinear_walls(walls, 3.0, 0.15, 1.20);
+    let mut walls = detect_curved_walls(walls);
 
     walls.sort_by(|a, b| {
         a.from[0]
@@ -291,6 +302,7 @@ fn extract_walls_from_band(band: &[[f64; 3]], storey_base_z: f64, height: f64, t
                 height,
                 exterior: true,
                 is_parapet: false,
+                arc: None,
             });
         }
     }
@@ -380,7 +392,7 @@ pub fn merge_collinear_walls(walls: Vec<Wall>, angle_tol_deg: f64, max_perp_dist
             let Some(w) = walls.get(j) else {
                 continue;
             };
-            if w.is_parapet != r.is_parapet {
+            if w.is_parapet != r.is_parapet || w.arc.is_some() || r.arc.is_some() {
                 continue;
             }
             let len_j = lengths.get(j).copied().unwrap_or(0.0);
@@ -445,7 +457,7 @@ pub fn merge_collinear_walls(walls: Vec<Wall>, angle_tol_deg: f64, max_perp_dist
                 let from = [origin_shifted[0] + t_min * u[0], origin_shifted[1] + t_min * u[1]];
                 let to = [origin_shifted[0] + t_max * u[0], origin_shifted[1] + t_max * u[1]];
 
-                result.push(Wall { from, to, thickness, base_z, height, exterior, is_parapet });
+                result.push(Wall { from, to, thickness, base_z, height, exterior, is_parapet, arc: None });
             }
         }
     }
@@ -628,7 +640,7 @@ pub fn collapse_parallel_walls(walls: Vec<Wall>) -> Vec<Wall> {
             let Some(w2) = walls.get(j) else {
                 continue;
             };
-            if w1.is_parapet != w2.is_parapet {
+            if w1.is_parapet != w2.is_parapet || w1.arc.is_some() || w2.arc.is_some() {
                 continue;
             }
             let l2 = lengths.get(j).copied().unwrap_or(0.0);
@@ -689,7 +701,7 @@ pub fn collapse_parallel_walls(walls: Vec<Wall>) -> Vec<Wall> {
             let base_z = w1.base_z.min(w2.base_z);
             let height = w1.height.max(w2.height);
 
-            result.push(Wall { from, to, thickness, base_z, height, exterior, is_parapet });
+            result.push(Wall { from, to, thickness, base_z, height, exterior, is_parapet, arc: None });
         } else {
             if let Some(slot) = used.get_mut(i) {
                 *slot = true;
@@ -725,6 +737,9 @@ pub fn non_maximal_suppression(mut walls: Vec<Wall>) -> Vec<Wall> {
         let Some(wi) = walls.get(i) else {
             continue;
         };
+        if wi.arc.is_some() {
+            continue;
+        }
         let ui = [(wi.to[0] - wi.from[0]) / len_i, (wi.to[1] - wi.from[1]) / len_i];
 
         for j in 0..walls.len() {
@@ -738,6 +753,9 @@ pub fn non_maximal_suppression(mut walls: Vec<Wall>) -> Vec<Wall> {
             let Some(wj) = walls.get(j) else {
                 continue;
             };
+            if wj.arc.is_some() {
+                continue;
+            }
             let uj = [(wj.to[0] - wj.from[0]) / len_j, (wj.to[1] - wj.from[1]) / len_j];
 
             let dot = (ui[0] * uj[0] + ui[1] * uj[1]).abs();
@@ -777,6 +795,246 @@ pub fn non_maximal_suppression(mut walls: Vec<Wall>) -> Vec<Wall> {
         k
     });
     walls
+}
+
+/// Fit a circle to a slice of 2D points using the algebraic Kåsa method.
+///
+/// Returns `Some((center, radius, rmse))` if the fit succeeds with a positive, finite radius
+/// and non-degenerate determinant. Returns `None` if `pts.len() < 3`, points are collinear or
+/// nearly collinear, non-finite coordinates are present, or the fitted radius is non-positive.
+pub fn fit_circle_kasa(pts: &[[f64; 2]]) -> Option<([f64; 2], f64, f64)> {
+    let n = pts.len();
+    if n < 3 {
+        return None;
+    }
+
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    for p in pts {
+        if !p[0].is_finite() || !p[1].is_finite() {
+            return None;
+        }
+        sum_x += p[0];
+        sum_y += p[1];
+    }
+    let nf = n as f64;
+    let mean_x = sum_x / nf;
+    let mean_y = sum_y / nf;
+
+    let mut s_uu = 0.0;
+    let mut s_vv = 0.0;
+    let mut s_uv = 0.0;
+    let mut s_uw = 0.0;
+    let mut s_vw = 0.0;
+    let mut sum_w = 0.0;
+
+    for p in pts {
+        let u = p[0] - mean_x;
+        let v = p[1] - mean_y;
+        let w = u * u + v * v;
+        s_uu += u * u;
+        s_vv += v * v;
+        s_uv += u * v;
+        s_uw += u * w;
+        s_vw += v * w;
+        sum_w += w;
+    }
+
+    let det = s_uu * s_vv - s_uv * s_uv;
+    if !det.is_finite() || det.abs() <= 1e-12 {
+        return None;
+    }
+
+    let a_prime = (s_uw * s_vv - s_vw * s_uv) / det;
+    let b_prime = (s_vw * s_uu - s_uw * s_uv) / det;
+    let c_prime = sum_w / nf;
+
+    let uc = a_prime / 2.0;
+    let vc = b_prime / 2.0;
+
+    let r_sq = c_prime + uc * uc + vc * vc;
+    if !r_sq.is_finite() || r_sq <= 0.0 {
+        return None;
+    }
+    let radius = r_sq.sqrt();
+    let center = [uc + mean_x, vc + mean_y];
+
+    if !radius.is_finite() || !center[0].is_finite() || !center[1].is_finite() {
+        return None;
+    }
+
+    let mut sum_err_sq = 0.0;
+    for p in pts {
+        let d = (p[0] - center[0]).hypot(p[1] - center[1]) - radius;
+        sum_err_sq += d * d;
+    }
+    let rmse = (sum_err_sq / nf).sqrt();
+    if !rmse.is_finite() {
+        return None;
+    }
+
+    Some((center, radius, rmse))
+}
+
+/// Detect and merge sequences of consecutive segments that form a curve.
+///
+/// Where a sequence of consecutive segments forms a curve with consistent angular deflection
+/// and Kåsa circle fit has RMSE <= 0.015 m (15 mm) and radius in [0.5, 20.0] m,
+/// create a Wall with `arc: Some(WallArc { center, radius, ccw })`.
+pub fn detect_curved_walls(walls: Vec<Wall>) -> Vec<Wall> {
+    if walls.len() < 2 {
+        return walls;
+    }
+
+    let mut used = vec![false; walls.len()];
+    let mut out = Vec::with_capacity(walls.len());
+
+    let turn_angle = |u1: [f64; 2], u2: [f64; 2]| -> f64 {
+        let cross = u1[0] * u2[1] - u1[1] * u2[0];
+        let dot = u1[0] * u2[0] + u1[1] * u2[1];
+        cross.atan2(dot)
+    };
+
+    for i in 0..walls.len() {
+        if used.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        let Some(w0) = walls.get(i) else {
+            continue;
+        };
+        if w0.arc.is_some() {
+            if let Some(slot) = used.get_mut(i) {
+                *slot = true;
+            }
+            out.push(w0.clone());
+            continue;
+        }
+
+        let mut chain: Vec<(usize, [f64; 2], [f64; 2])> = vec![(i, w0.from, w0.to)];
+        let mut curvature_sign: Option<f64> = None;
+
+        let mut extended = true;
+        while extended {
+            extended = false;
+            let Some(&(_, _, last_to)) = chain.last() else {
+                break;
+            };
+            let Some(&(_, prev_from, _)) = chain.last() else {
+                break;
+            };
+            let len_prev = (last_to[0] - prev_from[0]).hypot(last_to[1] - prev_from[1]);
+            if len_prev < 1e-4 {
+                break;
+            }
+            let dir_prev = [(last_to[0] - prev_from[0]) / len_prev, (last_to[1] - prev_from[1]) / len_prev];
+
+            let mut best_next: Option<(usize, [f64; 2], [f64; 2], f64)> = None;
+            for j in 0..walls.len() {
+                if used.get(j).copied().unwrap_or(true) || chain.iter().any(|&(idx, _, _)| idx == j) {
+                    continue;
+                }
+                let Some(wj) = walls.get(j) else {
+                    continue;
+                };
+                if wj.arc.is_some() || wj.is_parapet != w0.is_parapet {
+                    continue;
+                }
+
+                let d_fwd = (wj.from[0] - last_to[0]).hypot(wj.from[1] - last_to[1]);
+                let d_rev = (wj.to[0] - last_to[0]).hypot(wj.to[1] - last_to[1]);
+
+                let (cand_from, cand_to, dist) = if d_fwd <= 0.35 && d_fwd <= d_rev {
+                    (wj.from, wj.to, d_fwd)
+                } else if d_rev <= 0.35 {
+                    (wj.to, wj.from, d_rev)
+                } else {
+                    continue;
+                };
+
+                let len_cand = (cand_to[0] - cand_from[0]).hypot(cand_to[1] - cand_from[1]);
+                if len_cand < 1e-4 {
+                    continue;
+                }
+                let dir_cand = [(cand_to[0] - cand_from[0]) / len_cand, (cand_to[1] - cand_from[1]) / len_cand];
+
+                let angle = turn_angle(dir_prev, dir_cand);
+                let angle_deg = angle.to_degrees();
+                if angle_deg.abs() < 1.5 || angle_deg.abs() > 50.0 {
+                    continue;
+                }
+
+                if curvature_sign.is_some_and(|cs| cs * angle <= 0.0) {
+                    continue;
+                }
+
+                if best_next.as_ref().is_none_or(|(_, _, _, best_d)| dist < *best_d) {
+                    best_next = Some((j, cand_from, cand_to, dist));
+                }
+            }
+
+            if let Some((next_idx, next_from, next_to, _)) = best_next {
+                let len_next = (next_to[0] - next_from[0]).hypot(next_to[1] - next_from[1]);
+                let dir_next = [(next_to[0] - next_from[0]) / len_next, (next_to[1] - next_from[1]) / len_next];
+                let angle = turn_angle(dir_prev, dir_next);
+                if curvature_sign.is_none() {
+                    curvature_sign = Some(angle.signum());
+                }
+                chain.push((next_idx, next_from, next_to));
+                extended = true;
+            }
+        }
+
+        let mut merged_arc = false;
+        if chain.len() >= 2 {
+            let mut pts: Vec<[f64; 2]> = Vec::with_capacity(chain.len() + 1);
+            if let Some(&(_, first_from, _)) = chain.first() {
+                pts.push(first_from);
+            }
+            for &(_, _, to) in &chain {
+                pts.push(to);
+            }
+
+            if let Some((center, radius, _rmse)) = fit_circle_kasa(&pts).filter(|&(_, r, err)| err <= 0.015 && (0.5..=20.0).contains(&r)) {
+                let k = chain.len();
+                let ccw = curvature_sign.is_some_and(|s| s > 0.0);
+                let avg_thickness = chain.iter().filter_map(|&(idx, _, _)| walls.get(idx)).map(|w| w.thickness).sum::<f64>() / (k as f64);
+                let min_base_z = chain.iter().filter_map(|&(idx, _, _)| walls.get(idx)).map(|w| w.base_z).fold(f64::INFINITY, f64::min);
+                let max_height = chain.iter().filter_map(|&(idx, _, _)| walls.get(idx)).map(|w| w.height).fold(f64::NEG_INFINITY, f64::max);
+                let any_exterior = chain.iter().filter_map(|&(idx, _, _)| walls.get(idx)).any(|w| w.exterior);
+                let all_parapet = chain.iter().filter_map(|&(idx, _, _)| walls.get(idx)).all(|w| w.is_parapet);
+
+                let from = chain.first().map(|c| c.1).unwrap_or([0.0, 0.0]);
+                let to = chain.last().map(|c| c.2).unwrap_or([0.0, 0.0]);
+
+                for &(idx, _, _) in &chain {
+                    if let Some(slot) = used.get_mut(idx) {
+                        *slot = true;
+                    }
+                }
+
+                out.push(Wall {
+                    from,
+                    to,
+                    thickness: avg_thickness,
+                    base_z: min_base_z,
+                    height: max_height,
+                    exterior: any_exterior,
+                    is_parapet: all_parapet,
+                    arc: Some(WallArc { center, radius, ccw }),
+                });
+                merged_arc = true;
+            }
+        }
+
+        if !merged_arc {
+            if let Some(slot) = used.get_mut(i) {
+                *slot = true;
+            }
+            out.push(w0.clone());
+        }
+    }
+
+    out
 }
 
 /// The options this stage can use, validated once.
@@ -991,7 +1249,7 @@ fn axis_of(a: &Segment, b: &Segment, t: &Tuning, base_z: f64, height: f64) -> Op
     let shift = 0.5 * offset;
     let from = [base.a[0] + dx * u0 + nx * shift, base.a[1] + dy * u0 + ny * shift];
     let to = [base.a[0] + dx * u1 + nx * shift, base.a[1] + dy * u1 + ny * shift];
-    Some((Wall { from, to, thickness, base_z, height, exterior: false, is_parapet: false }, overlap))
+    Some((Wall { from, to, thickness, base_z, height, exterior: false, is_parapet: false, arc: None }, overlap))
 }
 
 /// Join the runs of a ring that turn by no more than `tolerance_deg`.
@@ -1078,7 +1336,10 @@ fn turn_deg(prev: [f64; 2], here: [f64; 2], next: [f64; 2]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tuning, Wall, collapse_parallel_walls, extract, extract_walls_from_band, merge_collinear_walls, non_maximal_suppression};
+    use super::{
+        Tuning, Wall, collapse_parallel_walls, detect_curved_walls, extract, extract_walls_from_band, fit_circle_kasa, merge_collinear_walls,
+        non_maximal_suppression,
+    };
     use crate::bim::storeys::Storey;
     use crate::bim::{BimError, BimOptions};
 
@@ -1363,13 +1624,13 @@ mod tests {
     #[test]
     fn fragmented_collinear_walls_merge_into_one_continuous_wall() {
         let walls = vec![
-            Wall { from: [0.0, 0.0], to: [2.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [0.0, 0.0], to: [2.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
             // Doorway gap of 0.80 m (<= 1.0 m)
-            Wall { from: [2.8, 0.02], to: [5.0, 0.02], thickness: 0.22, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [2.8, 0.02], to: [5.0, 0.02], thickness: 0.22, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
             // Another gap of 0.60 m (<= 1.0 m)
-            Wall { from: [5.6, -0.01], to: [8.0, -0.01], thickness: 0.18, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [5.6, -0.01], to: [8.0, -0.01], thickness: 0.18, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
             // Non-collinear wall (perpendicular)
-            Wall { from: [8.0, 0.0], to: [8.0, 4.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [8.0, 0.0], to: [8.0, 4.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
         ];
 
         let merged = merge_collinear_walls(walls, 3.0, 0.15, 1.0);
@@ -1385,15 +1646,15 @@ mod tests {
     fn corner_extension_and_orphan_filter() {
         let walls = vec![
             // Wall 1: horizontal wall from (0, 0) to (3.8, 0)
-            Wall { from: [0.0, 0.0], to: [3.8, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [0.0, 0.0], to: [3.8, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
             // Wall 2: perpendicular wall from (4.0, 0.2) to (4.0, 4.0).
             // Its end (4.0, 0.2) is within 0.2 m (<= 0.35 m) of Wall 1's line (y = 0).
             // Wall 1's end (3.8, 0) is within 0.2 m (<= 0.35 m) of Wall 2's line (x = 4.0).
-            Wall { from: [4.0, 0.2], to: [4.0, 4.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [4.0, 0.2], to: [4.0, 4.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
             // Wall 3: short corner return (length 0.30 m < 0.40 m) connected to Wall 2 at (4.0, 4.0)
-            Wall { from: [4.0, 4.0], to: [3.7, 4.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [4.0, 4.0], to: [3.7, 4.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
             // Wall 4: isolated orphan wall (length 0.25 m < 0.40 m) not connected to anything
-            Wall { from: [10.0, 10.0], to: [10.25, 10.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [10.0, 10.0], to: [10.25, 10.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
         ];
 
         let merged = merge_collinear_walls(walls, 3.0, 0.15, 1.20);
@@ -1413,10 +1674,10 @@ mod tests {
     fn parallel_wall_collapse_pairs_and_merges_opposite_faces() {
         let walls = vec![
             // Two parallel walls along x, separated by d_perp = 0.20 m (y = 0.0 and y = 0.20)
-            Wall { from: [0.0, 0.0], to: [4.0, 0.0], thickness: 0.10, base_z: 0.0, height: 2.80, exterior: true, is_parapet: false },
-            Wall { from: [0.5, 0.20], to: [3.5, 0.20], thickness: 0.10, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [0.0, 0.0], to: [4.0, 0.0], thickness: 0.10, base_z: 0.0, height: 2.80, exterior: true, is_parapet: false, arc: None },
+            Wall { from: [0.5, 0.20], to: [3.5, 0.20], thickness: 0.10, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
             // A perpendicular wall that should NOT be collapsed
-            Wall { from: [4.0, 0.0], to: [4.0, 3.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [4.0, 0.0], to: [4.0, 3.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
         ];
 
         let collapsed = collapse_parallel_walls(walls);
@@ -1441,15 +1702,76 @@ mod tests {
     fn non_maximal_suppression_drops_short_parallel_ghost_wall() {
         let walls = vec![
             // Long wall (length 3.0 m >= 1.20 m)
-            Wall { from: [0.0, 0.0], to: [3.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [0.0, 0.0], to: [3.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
             // Short parallel ghost wall (length 0.50 m < 0.65 m, d_perp = 0.15 m <= 0.45 m)
-            Wall { from: [1.0, 0.15], to: [1.5, 0.15], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [1.0, 0.15], to: [1.5, 0.15], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
             // Short perpendicular wall (length 0.50 m, angle = 90 deg) which should NOT be dropped
-            Wall { from: [3.0, 0.0], to: [3.0, 0.50], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false },
+            Wall { from: [3.0, 0.0], to: [3.0, 0.50], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None },
         ];
 
         let nms = non_maximal_suppression(walls);
         assert_eq!(nms.len(), 2, "short parallel ghost wall dropped, perpendicular kept");
         assert!(!nms.iter().any(|w| (w.from[1] - 0.15).abs() < 1e-3), "ghost wall was suppressed");
+    }
+
+    #[test]
+    fn fit_circle_kasa_accuracy_and_degeneracy() {
+        // 1. Exact circle of radius 4.0 centered at (2.0, 3.0)
+        let mut pts = Vec::new();
+        for i in 0..12 {
+            let theta = (i as f64) * std::f64::consts::PI / 6.0;
+            pts.push([2.0 + 4.0 * theta.cos(), 3.0 + 4.0 * theta.sin()]);
+        }
+        let (center, radius, rmse) = fit_circle_kasa(&pts).expect("exact circle must fit");
+        assert!((center[0] - 2.0).abs() < 1e-6, "center x: {}", center[0]);
+        assert!((center[1] - 3.0).abs() < 1e-6, "center y: {}", center[1]);
+        assert!((radius - 4.0).abs() < 1e-6, "radius: {radius}");
+        assert!(rmse < 1e-6, "rmse: {rmse}");
+
+        // 2. Collinear points must return None without panicking
+        let collinear = vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]];
+        assert!(fit_circle_kasa(&collinear).is_none(), "collinear points have no circle");
+
+        // 3. Degenerate inputs (fewer than 3 points, identical points, NaNs)
+        assert!(fit_circle_kasa(&[[0.0, 0.0], [1.0, 1.0]]).is_none(), "2 points must return None");
+        assert!(fit_circle_kasa(&[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]).is_none(), "identical points must return None");
+        assert!(fit_circle_kasa(&[[f64::NAN, 0.0], [1.0, 1.0], [2.0, 0.0]]).is_none(), "NaN must return None");
+    }
+
+    #[test]
+    fn curved_wall_detection_and_regression() {
+        // Construct a chain of 4 segments approximating an arc of R = 3.0 m, center = (0.0, 0.0)
+        // From theta = 0 to theta = 60 degrees (pi/3)
+        // 4 segments = 5 points: theta_0 = 0, theta_1 = 15 deg, theta_2 = 30 deg, theta_3 = 45 deg, theta_4 = 60 deg
+        let mut arc_pts = Vec::new();
+        for i in 0..=4 {
+            let theta = (i as f64) * (std::f64::consts::PI / 12.0); // 15 degrees per step
+            arc_pts.push([3.0 * theta.cos(), 3.0 * theta.sin()]);
+        }
+
+        let mut segs = Vec::new();
+        for i in 0..4 {
+            segs.push(Wall {
+                from: arc_pts[i],
+                to: arc_pts[i + 1],
+                thickness: 0.20,
+                base_z: 0.0,
+                height: 2.80,
+                exterior: false,
+                is_parapet: false,
+                arc: None,
+            });
+        }
+
+        let detected = detect_curved_walls(segs);
+        assert_eq!(detected.len(), 1, "4 segments along circular arc must merge into 1 curved wall");
+        let cw = &detected[0];
+        let arc = cw.arc.expect("must have WallArc");
+        assert!((arc.center[0] - 0.0).abs() < 0.05, "center x near 0: {}", arc.center[0]);
+        assert!((arc.center[1] - 0.0).abs() < 0.05, "center y near 0: {}", arc.center[1]);
+        assert!((arc.radius - 3.0).abs() < 0.05, "radius near 3.0 m: {}", arc.radius);
+        assert!(arc.ccw, "arc is counter-clockwise");
+        assert!((cw.thickness - 0.20).abs() < 1e-4);
+        assert_eq!(cw.height, 2.80);
     }
 }

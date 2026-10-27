@@ -249,7 +249,7 @@ fn opening_counts(per_storey: &[Vec<openings::Opening>]) -> (usize, usize, usize
     for o in per_storey.iter().flatten() {
         count += 1;
         match o.kind {
-            openings::OpeningKind::Door => doors += 1,
+            openings::OpeningKind::Door | openings::OpeningKind::ClosedDoor { .. } => doors += 1,
             openings::OpeningKind::Window => windows += 1,
         }
     }

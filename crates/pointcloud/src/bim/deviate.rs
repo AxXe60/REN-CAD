@@ -430,7 +430,7 @@ mod tests {
     use super::*;
 
     fn box_model() -> (Vec<Wall>, Vec<Slab>) {
-        let w = |from, to, exterior| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior, is_parapet: false };
+        let w = |from, to, exterior| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior, is_parapet: false, arc: None };
         let walls =
             vec![w([0.0, 0.0], [6.0, 0.0], true), w([6.0, 0.0], [6.0, 4.0], true), w([6.0, 4.0], [0.0, 4.0], true), w([0.0, 4.0], [0.0, 0.0], true)];
         let slabs = vec![
@@ -572,7 +572,16 @@ mod tests {
             [f64::NAN, 2.0, 0.0],
             [3.0, 2.0, 0.0], // on floor slab, d = 0
         ];
-        walls.push(Wall { from: [f64::NAN, 0.0], to: [1.0, 0.0], thickness: 0.2, base_z: 0.0, height: 2.8, exterior: false, is_parapet: false });
+        walls.push(Wall {
+            from: [f64::NAN, 0.0],
+            to: [1.0, 0.0],
+            thickness: 0.2,
+            base_z: 0.0,
+            height: 2.8,
+            exterior: false,
+            is_parapet: false,
+            arc: None,
+        });
         slabs.push(Slab {
             base_z: 0.0,
             top_z: 0.2,

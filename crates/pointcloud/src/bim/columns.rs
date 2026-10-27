@@ -578,7 +578,8 @@ mod tests {
         let storey = Storey { index: 0, base_z: 0.0, top_z: 2.80 };
         let opts = BimOptions::default();
 
-        let wall = Wall { from: [0.0, 0.0], to: [5.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false };
+        let wall =
+            Wall { from: [0.0, 0.0], to: [5.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None };
 
         // Points inside the wall corridor at y = 0.05 (distance = 0.05 <= 0.20*0.5 + 0.10 = 0.20)
         let mut wall_pts = Vec::new();
@@ -611,7 +612,8 @@ mod tests {
         let storey = Storey { index: 0, base_z: 0.0, top_z: 2.80 };
         let opts = BimOptions::default();
 
-        let wall = Wall { from: [0.0, 0.0], to: [5.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false };
+        let wall =
+            Wall { from: [0.0, 0.0], to: [5.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.80, exterior: false, is_parapet: false, arc: None };
 
         // Column-like candidate positioned at y = 0.28 (outside 0.20 corridor, but within 0.35 clearance)
         let mut col_pts = Vec::new();

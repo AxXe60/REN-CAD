@@ -22,7 +22,7 @@ use crate::bim::BimError;
 use crate::bim::columns::{Column, ColumnShape};
 use crate::bim::openings::{Opening, OpeningKind};
 use crate::bim::slabs::Slab;
-use crate::bim::walls::Wall;
+use crate::bim::walls::{Wall, WallArc};
 use crate::bim::zones::Zone;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -351,14 +351,22 @@ pub fn write(building: &Building) -> Result<String, BimError> {
             // Wall placement: origin at from, base_z; RefDirection = (udx, udy, 0)
             let wall_place = write_element_placement(&mut w, storey_place, wall.from[0], wall.from[1], wall.base_z, udx, udy, 0.0, z_dir);
 
-            // Wall body: profile in local coords (0, -t/2) to (L, t/2)
+            // Wall body: profile in local coords
             let t = wall.thickness;
-            let profile_pts = [[0.0, -t / 2.0], [len, -t / 2.0], [len, t / 2.0], [0.0, t / 2.0]];
+            let (profile_pts, wall_desc) = if let Some(arc) = wall.arc {
+                let prof = approximate_wall_arc_profile(wall.from, wall.to, t, arc, udx, udy);
+                let desc = step_string(&format!("Curved wall R={:.3}m", arc.radius));
+                (prof, desc)
+            } else {
+                let prof = vec![[0.0, -t / 2.0], [len, -t / 2.0], [len, t / 2.0], [0.0, t / 2.0]];
+                (prof, "$".to_string())
+            };
             let (shape, pds) = write_element_body(&mut w, &profile_pts, wall.height, z_dir, body_ctx);
 
             let wall_guid = w.next_guid();
             let wall_name = step_string(&format!("Wall {}", wi + 1));
-            let wall_ent = w.entity("IFCWALL", &format!("'{}',#{},{},$,$,#{},#{},$,.SOLIDWALL.", wall_guid, owner, wall_name, wall_place, pds));
+            let wall_ent =
+                w.entity("IFCWALL", &format!("'{}',#{},{},{},$,#{},#{},$,.SOLIDWALL.", wall_guid, owner, wall_name, wall_desc, wall_place, pds));
 
             sd.element_ids.push(wall_ent);
             wall_entities.push(Some((wall_ent, wall_place)));
@@ -499,8 +507,12 @@ pub fn write(building: &Building) -> Result<String, BimError> {
 
             let fill_guid = w.next_guid();
             match opening.kind {
-                OpeningKind::Door => {
+                OpeningKind::Door | OpeningKind::ClosedDoor { .. } => {
                     let door_name = step_string(&format!("Door {}", oi + 1));
+                    let door_desc = match opening.kind {
+                        OpeningKind::ClosedDoor { recess_depth } => step_string(&format!("Closed door recess={:.3}m", recess_depth)),
+                        _ => "$".to_string(),
+                    };
                     let door_ent = w.entity(
                         "IFCDOOR",
                         &format!(
@@ -508,7 +520,7 @@ pub fn write(building: &Building) -> Result<String, BimError> {
                             fill_guid,
                             owner,
                             door_name,
-                            "$",
+                            door_desc,
                             open_place,
                             fill_pds,
                             fmt_real(oh),
@@ -669,6 +681,59 @@ fn write_element_placement(
     let ref_dir = w.entity("IFCDIRECTION", &format!("({},{},{})", fmt_real(rdx), fmt_real(rdy), fmt_real(rdz)));
     let axis = w.entity("IFCAXIS2PLACEMENT3D", &format!("#{},#{},#{}", pt, z, ref_dir));
     w.entity("IFCLOCALPLACEMENT", &format!("#{},#{}", parent_place, axis))
+}
+
+/// Discretize a curved wall's body into local profile coordinates for IFC extrusion.
+fn approximate_wall_arc_profile(from: [f64; 2], to: [f64; 2], thickness: f64, arc: WallArc, udx: f64, udy: f64) -> Vec<[f64; 2]> {
+    let t_half = thickness / 2.0;
+    let r = arc.radius;
+    let [cx, cy] = arc.center;
+    let theta0 = (from[1] - cy).atan2(from[0] - cx);
+    let theta1 = (to[1] - cy).atan2(to[0] - cx);
+
+    let mut d_theta = theta1 - theta0;
+    if arc.ccw {
+        while d_theta <= 0.0 {
+            d_theta += 2.0 * std::f64::consts::PI;
+        }
+    } else {
+        while d_theta >= 0.0 {
+            d_theta -= 2.0 * std::f64::consts::PI;
+        }
+    }
+
+    let n_steps = 16usize;
+    let mut outer = Vec::with_capacity(n_steps + 1);
+    let mut inner = Vec::with_capacity(n_steps + 1);
+
+    let r_out = (r + t_half).max(0.01);
+    let r_in = (r - t_half).max(0.01);
+
+    for i in 0..=n_steps {
+        let frac = (i as f64) / (n_steps as f64);
+        let th = theta0 + frac * d_theta;
+        let cos_th = th.cos();
+        let sin_th = th.sin();
+
+        let p_out = [cx + r_out * cos_th, cy + r_out * sin_th];
+        let p_in = [cx + r_in * cos_th, cy + r_in * sin_th];
+
+        let to_local = |p: [f64; 2]| -> [f64; 2] {
+            let rx = p[0] - from[0];
+            let ry = p[1] - from[1];
+            let lx = rx * udx + ry * udy;
+            let ly = -rx * udy + ry * udx;
+            [lx, ly]
+        };
+
+        outer.push(to_local(p_out));
+        inner.push(to_local(p_in));
+    }
+
+    let mut profile = outer;
+    inner.reverse();
+    profile.extend(inner);
+    profile
 }
 
 /// Write the body of an element: cartesian points → polyline → profile → extruded solid →
@@ -885,13 +950,14 @@ pub fn check(step: &str) -> Result<IfcCheck, BimError> {
 mod tests {
     use super::*;
     use crate::bim::columns::{Column, ColumnShape};
-    use crate::bim::openings::{Opening, OpeningKind};
+    use crate::bim::openings::{Opening, OpeningKind, OpeningShape};
     use crate::bim::slabs::Slab;
     use crate::bim::walls::Wall;
     use crate::bim::zones::Zone;
 
     fn fixture() -> Building {
-        let wall = |from: [f64; 2], to: [f64; 2]| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true, is_parapet: false };
+        let wall =
+            |from: [f64; 2], to: [f64; 2]| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true, is_parapet: false, arc: None };
         Building {
             name: "Fixture".to_string(),
             timestamp: 1_761_350_400,
@@ -912,6 +978,7 @@ mod tests {
                 openings: vec![Opening {
                     wall: 0,
                     kind: OpeningKind::Door,
+                    shape: OpeningShape::Rectangular,
                     from: [1.0, 0.0],
                     to: [1.9, 0.0],
                     thickness: 0.2,
@@ -964,7 +1031,8 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn hostile_geometry_is_skipped_not_fatal() {
-        let wall = |from: [f64; 2], to: [f64; 2]| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true, is_parapet: false };
+        let wall =
+            |from: [f64; 2], to: [f64; 2]| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true, is_parapet: false, arc: None };
         let building = Building {
             name: "Hostile".to_string(),
             timestamp: 100,
@@ -994,7 +1062,16 @@ mod tests {
                 ],
                 openings: vec![
                     // Opening with wall index 99 — out of range, should be skipped
-                    Opening { wall: 99, kind: OpeningKind::Door, from: [1.0, 0.0], to: [1.9, 0.0], thickness: 0.2, sill_z: 0.0, head_z: 2.1 },
+                    Opening {
+                        wall: 99,
+                        kind: OpeningKind::Door,
+                        shape: OpeningShape::Rectangular,
+                        from: [1.0, 0.0],
+                        to: [1.9, 0.0],
+                        thickness: 0.2,
+                        sill_z: 0.0,
+                        head_z: 2.1,
+                    },
                 ],
                 columns: Vec::new(),
             }],
@@ -1022,7 +1099,16 @@ mod tests {
                 name: "Parter — Spa\u{021B}iu d'Or".to_string(),
                 elevation: 0.0,
                 height: 2.8,
-                walls: vec![Wall { from: [0.0, 0.0], to: [4.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true, is_parapet: false }],
+                walls: vec![Wall {
+                    from: [0.0, 0.0],
+                    to: [4.0, 0.0],
+                    thickness: 0.20,
+                    base_z: 0.0,
+                    height: 2.8,
+                    exterior: true,
+                    is_parapet: false,
+                    arc: None,
+                }],
                 slabs: Vec::new(),
                 zones: Vec::new(),
                 openings: Vec::new(),
@@ -1121,5 +1207,52 @@ mod tests {
 
         let chk = check(&step).expect("check passes without dangling refs");
         assert_eq!(chk.columns, 2);
+    }
+
+    #[test]
+    fn ifc_writes_curved_wall_and_closed_door() {
+        let building = Building {
+            name: "CurvedAndClosed".to_string(),
+            timestamp: 1_761_350_400,
+            storeys: vec![BuildingStorey {
+                name: "Ground".to_string(),
+                elevation: 0.0,
+                height: 2.80,
+                walls: vec![Wall {
+                    from: [3.0, 0.0],
+                    to: [0.0, 3.0],
+                    thickness: 0.20,
+                    base_z: 0.0,
+                    height: 2.80,
+                    exterior: false,
+                    is_parapet: false,
+                    arc: Some(WallArc { center: [0.0, 0.0], radius: 3.0, ccw: true }),
+                }],
+                slabs: Vec::new(),
+                zones: Vec::new(),
+                openings: vec![Opening {
+                    wall: 0,
+                    kind: OpeningKind::ClosedDoor { recess_depth: 0.035 },
+                    shape: OpeningShape::Rectangular,
+                    from: [2.5, 0.5],
+                    to: [1.8, 1.2],
+                    thickness: 0.20,
+                    sill_z: 0.0,
+                    head_z: 2.10,
+                }],
+                columns: Vec::new(),
+            }],
+        };
+
+        let step = write(&building).expect("write IFC with curved wall and closed door");
+        assert!(step.contains("Curved wall R=3."));
+        assert!(step.contains("Closed door recess=0.035m"));
+        assert!(step.contains("IFCDOOR"));
+        assert!(step.contains("IFCWALL"));
+
+        let chk = check(&step).expect("check passes without dangling refs");
+        assert_eq!(chk.walls, 1);
+        assert_eq!(chk.doors, 1);
+        assert_eq!(chk.openings, 1);
     }
 }
