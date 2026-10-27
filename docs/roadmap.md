@@ -43,7 +43,7 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M11a | Georeferencing: the CRS the file names (GeoTIFF keys or WKT), shown in the palette and `LASINFO`, written as a `.prj` sidecar next to an exported drawing | done |
 | M11b | The site frame: `LASORIGIN` ties the drawing's (0, 0, 0) to a world point; `LASCRS` declares the system's code for the files that name none | done |
 | M11c | Big surveys: the read keeps the memory flat — the cell grows while the file streams — so a 53-million-point scan opens without holding the file in memory | done |
-| M10b | A vertical section through the cloud: a plane cut, a profile polyline, exported as a drawing (≈ 6–10 h) | planned |
+| M10b | A vertical section through the cloud: a plane cut, a profile polyline, exported as a drawing (`LASSECTION`) | done |
 | M10c | COPC on the octree (read only the levels and bounds in view) and LAZ writing (≈ 10–16 h) | planned |
 | M11d | Reprojection between CRSs, so a scan and a georeferenced drawing can share a frame (≈ 12–20 h) | planned |
 | M12 | A streaming LOD: the levels built while the file is read, so a huge survey keeps its walls sharp (≈ 12–20 h) | planned |
@@ -52,7 +52,7 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M15 | **The palette**: a floating camera bar over the 3D view, collapsible sections, a mini Z-histogram behind the crop slider (≈ 8–14 h) | planned |
 | M16 | **Pick to pivot**: the orbit turns around the point under the cursor (the eye and the target both rotate around it, so the picture never jumps) and `Ctrl+Scroll` drives the front wall cut on its own (≈ 6–10 h) | planned |
 | M17 | **The focus lens**: near the cursor the cloud is whole again (the opacity and the thinning ramp back), so the vertex lands on a detail even with the cloud at 25% (≈ 4–8 h) | planned |
-| M18 | **A rotated crop**: the crop box turns with a wall (`Align Crop to Line`), so a facade at 37° can be cut (≈ 6–10 h) | planned |
+| M18 | **A rotated crop**: the crop box turns with a wall (`Align Crop to Line` / `LASCROPALIGN`), so a facade at 37° can be cut | done |
 | M19 | **Romanian** in the interface catalog (`ro`), the fifteenth language (≈ 4–6 h) | planned |
 | M20 | **Compare two clouds (C2C)**: the distance from every point to the nearest point of a reference, the survey statistics (mean, σ, RMS, p95) and the deviation scale (done) | done |
 | M21 | **Classify the cloud**: the height above the ground in the three vegetation bands, the shape of the surface (the walls), the noise — `LASCLASS` with the class colours (done) | done |
@@ -65,7 +65,7 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M13 | A height/DSM grid over the band, with contours (≈ 12–18 h) | planned |
 | M14 | A local cache of the decimated pyramid next to the scan, so a 1.8 GB survey opens in a second the second time (≈ 6–10 h) | planned |
 
-M10b is the next one that can land without the upstream's 3D kernel.
+M10b and M18 landed; M10c (COPC/LAZ) and M19 (Romanian) are the next ones that can land without the upstream's 3D kernel.
 
 ## Alpha gate
 

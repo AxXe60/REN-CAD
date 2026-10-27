@@ -24,6 +24,7 @@ mod measure;
 pub mod osm;
 mod read;
 pub mod rlv;
+pub mod section;
 mod sketch;
 mod slice;
 mod snap;
@@ -49,6 +50,7 @@ pub use rlv::{
     Auto3dBuilding, AutoRlvResult, CLASS_FURNITURE, FurnitureFilterResult, RoomScheduleRow, Slab3d, StoreyModel, Wall3d, extract_auto_3d_building,
     extract_auto_rlv, filter_interior_furniture,
 };
+pub use section::{SectionCut, SectionPoint, cut_section_from_las, cut_section_from_points, export_section_dxf, simplify_polyline};
 pub use sketch::{DEFAULT_LAYER, Sketch3d, Stroke3};
 pub use slice::{Band, Pt, Slice, normalize_rgb, rgb_channel, slice, slice_bands_capped, slice_capped};
 pub use snap::{FRONT_LAYER_M, SMOOTH_RADIUS_M, SnapHit, SnapMode, axis_locked, front_layer, nearest, smooth_centroid, z_locked};
@@ -101,6 +103,12 @@ pub enum Error {
     BadDecimation,
     #[error("more than {limit} wall bands were asked of one read")]
     TooManyBands { limit: usize },
+    #[error("the section cut line has zero length")]
+    ZeroLengthSection,
+    #[error("the section thickness must be a positive number of metres")]
+    BadSectionThickness,
+    #[error("no points found along the section cut")]
+    NoSectionPoints,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

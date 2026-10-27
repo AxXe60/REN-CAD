@@ -82,16 +82,53 @@ pub struct CloudVtx {
 }
 
 /// A crop box in world metres: points outside it are not drawn, so a ceiling or the four walls
-/// can be cut away without re-reading the file.
+/// can be cut away without re-reading the file. Supports axis-aligned and rotated boxes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Clip {
     pub min: [f64; 3],
     pub max: [f64; 3],
+    pub yaw_rad: f64,
+    pub center: [f64; 2],
 }
 
 impl Clip {
+    pub fn new_axis_aligned(min: [f64; 3], max: [f64; 3]) -> Self {
+        let center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
+        Self { min, max, yaw_rad: 0.0, center }
+    }
+
+    pub fn new_rotated(center: [f64; 2], half_extents: [f64; 3], yaw_rad: f64) -> Self {
+        let hx = half_extents[0].abs();
+        let hy = half_extents[1].abs();
+        let hz = half_extents[2].abs();
+        let min = [center[0] - hx, center[1] - hy, -hz];
+        let max = [center[0] + hx, center[1] + hy, hz];
+        Self { min, max, yaw_rad, center }
+    }
+
+    pub fn with_z_range(mut self, zmin: f64, zmax: f64) -> Self {
+        self.min[2] = zmin.min(zmax);
+        self.max[2] = zmin.max(zmax);
+        self
+    }
+
     pub fn contains(&self, x: f64, y: f64, z: f64) -> bool {
-        x >= self.min[0] && x <= self.max[0] && y >= self.min[1] && y <= self.max[1] && z >= self.min[2] && z <= self.max[2]
+        if z < self.min[2] || z > self.max[2] {
+            return false;
+        }
+        if self.yaw_rad.abs() < 1e-6 {
+            x >= self.min[0] && x <= self.max[0] && y >= self.min[1] && y <= self.max[1]
+        } else {
+            let (sin_neg, cos_neg) = (-self.yaw_rad).sin_cos();
+            let dx = x - self.center[0];
+            let dy = y - self.center[1];
+            let u = dx * cos_neg - dy * sin_neg;
+            let v = dx * sin_neg + dy * cos_neg;
+            u >= self.min[0] - self.center[0]
+                && u <= self.max[0] - self.center[0]
+                && v >= self.min[1] - self.center[1]
+                && v <= self.max[1] - self.center[1]
+        }
     }
 }
 
@@ -1401,5 +1438,55 @@ mod tests {
         assert_eq!(c.zmin, c.zmax, "a flat band: no height to bin over");
         assert_eq!(c.zhisto.iter().sum::<u32>(), 0, "the height profile is honestly empty");
         assert_eq!(c.ihisto.iter().sum::<u32>(), 50, "the returns are still counted");
+    }
+
+    #[test]
+    fn clip_axis_aligned_and_rotated() {
+        // Axis-aligned box
+        let clip_aa = Clip::new_axis_aligned([-10.0, -10.0, 0.0], [10.0, 10.0, 5.0]);
+        assert_eq!(clip_aa.yaw_rad, 0.0);
+        assert_eq!(clip_aa.center, [0.0, 0.0]);
+        assert!(clip_aa.contains(0.0, 0.0, 2.5));
+        assert!(clip_aa.contains(10.0, 10.0, 5.0));
+        assert!(clip_aa.contains(-10.0, -10.0, 0.0));
+        assert!(!clip_aa.contains(10.1, 0.0, 2.5));
+        assert!(!clip_aa.contains(0.0, -10.1, 2.5));
+        assert!(!clip_aa.contains(0.0, 0.0, -0.1));
+        assert!(!clip_aa.contains(0.0, 0.0, 5.1));
+
+        // Rotated box: centered at [5.0, 5.0], half_extents [4.0, 2.0, 3.0], rotated by 45 degrees
+        let deg45 = std::f64::consts::FRAC_PI_4;
+        let mut clip_rot = Clip::new_rotated([5.0, 5.0], [4.0, 2.0, 3.0], deg45);
+        clip_rot = clip_rot.with_z_range(0.0, 6.0);
+        assert!((clip_rot.yaw_rad - deg45).abs() < 1e-9);
+
+        // Center point is inside
+        assert!(clip_rot.contains(5.0, 5.0, 3.0));
+
+        // Along the rotated X axis (direction [1, 1] / sqrt(2)):
+        // Distance 3.0 (< half_width 4.0) should be inside
+        let diag3_x = 5.0 + 3.0 * deg45.cos();
+        let diag3_y = 5.0 + 3.0 * deg45.sin();
+        assert!(clip_rot.contains(diag3_x, diag3_y, 3.0));
+
+        // Distance 5.0 (> half_width 4.0) should be outside
+        let diag5_x = 5.0 + 5.0 * deg45.cos();
+        let diag5_y = 5.0 + 5.0 * deg45.sin();
+        assert!(!clip_rot.contains(diag5_x, diag5_y, 3.0));
+
+        // Along the rotated Y axis (direction [-1, 1] / sqrt(2)):
+        // Distance 1.5 (< half_depth 2.0) should be inside
+        let perp1_x = 5.0 - 1.5 * deg45.sin();
+        let perp1_y = 5.0 + 1.5 * deg45.cos();
+        assert!(clip_rot.contains(perp1_x, perp1_y, 3.0));
+
+        // Distance 2.5 (> half_depth 2.0) should be outside
+        let perp2_x = 5.0 - 2.5 * deg45.sin();
+        let perp2_y = 5.0 + 2.5 * deg45.cos();
+        assert!(!clip_rot.contains(perp2_x, perp2_y, 3.0));
+
+        // Z-axis clipping
+        assert!(!clip_rot.contains(5.0, 5.0, -0.5));
+        assert!(!clip_rot.contains(5.0, 5.0, 6.5));
     }
 }

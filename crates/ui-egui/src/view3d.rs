@@ -526,6 +526,8 @@ fn scene_key(clouds: &[cadcraft_pointcloud::Cloud], px_per_m: f64, center: [f64;
         if let Some(clip) = &c.clip {
             clip.min.map(f64::to_bits).hash(&mut hasher);
             clip.max.map(f64::to_bits).hash(&mut hasher);
+            clip.yaw_rad.to_bits().hash(&mut hasher);
+            clip.center.map(f64::to_bits).hash(&mut hasher);
         }
         c.offset.map(f64::to_bits).hash(&mut hasher);
     }

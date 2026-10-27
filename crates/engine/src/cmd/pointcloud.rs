@@ -6,10 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
+use cadcraft_doc::{DimKind, EntityKind, HAlign, Text, VAlign};
+use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use serde_json::{Value, json};
 
+use super::helpers::{line, lwpoly};
 use super::*;
-use crate::View;
+use crate::{Accept, Input, Interactive, Prompt, Step, View};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -38,6 +41,16 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("lasclip", "Crop Point Cloud", lasclip)
             .params("{min: [x,y,z], max: [x,y,z], index?: int} | {reset: true}")
             .enabled(always)
+            .noundo(),
+        CommandSpec::new("lascropalign", "Crop Box Aligned to Wall or Angle", lascropalign)
+            .params("{p1?: [x1, y1], p2?: [x2, y2], angle_deg?: number, width?: number, depth?: number, zmin?: number, zmax?: number, reset?: bool, index?: int}")
+            .enabled(always)
+            .interactive(|s| Ok(Box::new(LasCropAlignM::new(s))))
+            .noundo(),
+        CommandSpec::new("lassection", "Vertical Section Cut", lassection)
+            .params("{p1?: [x1, y1], p2?: [x2, y2], thickness?: number, decimate?: number, out?: string, draw?: bool, origin?: [x, y], index?: int}")
+            .enabled(always)
+            .interactive(|s| Ok(Box::new(LasSectionM::new(s))))
             .noundo(),
         CommandSpec::new("lasvisible", "Show Point Cloud", lasvisible).params("{visible?: bool, index?: int}").enabled(always).noundo(),
         CommandSpec::new("lasground", "Find the Ground", lasground)
@@ -602,6 +615,24 @@ fn xyz(p: &Value, key: &str) -> Result<[f64; 3]> {
     Ok(v)
 }
 
+fn xy(p: &Value, key: &str) -> Result<[f64; 2]> {
+    let a = p.get(key).and_then(Value::as_array).filter(|a| a.len() == 2).ok_or_else(|| EngineError::Other(format!("`{key}` must be [x, y]")))?;
+    let mut v = [0.0; 2];
+    for (i, s) in a.iter().enumerate() {
+        v[i] = s.as_f64().filter(|f| f.is_finite()).ok_or_else(|| EngineError::Other(format!("`{key}` must be [x, y]")))?;
+    }
+    Ok(v)
+}
+
+fn add_on_layer(s: &mut Session, layer: &str, kind: EntityKind) -> Result<Handle> {
+    let mut common = s.current_common();
+    common.layer = layer.to_string();
+    let space = s.space();
+    s.doc_mut()?.ensure_layer(layer);
+    let h = s.doc_mut()?.add(&space, common, kind)?;
+    Ok(h)
+}
+
 /// Crop the cloud to a box without re-reading the file, so the ceiling (`max` Z) or the walls
 /// (`min`/`max` X and Y) can be cut away and put back while the scan stays loaded.
 fn lasclip(s: &mut Session, p: &Value) -> Result<Value> {
@@ -615,7 +646,7 @@ fn lasclip(s: &mut Session, p: &Value) -> Result<Value> {
         if (0..3).any(|k| max[k] < min[k]) {
             return Err(EngineError::Other("`max` must not be below `min` on any axis".into()));
         }
-        Some(cadcraft_pointcloud::Clip { min, max })
+        Some(cadcraft_pointcloud::Clip::new_axis_aligned(min, max))
     };
     let name = {
         let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
@@ -625,8 +656,342 @@ fn lasclip(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "message": if clip.is_some() { format!("{name}: cropped to the box") } else { format!("{name}: crop off") },
         "index": i,
-        "clip": clip.map(|c| json!({ "min": c.min, "max": c.max })),
+        "clip": clip.map(|c| json!({ "min": c.min, "max": c.max, "yaw_rad": c.yaw_rad, "center": c.center })),
     }))
+}
+
+/// Crop the cloud to a rotated box aligned to an edge or angle.
+fn lascropalign(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let reset = p.get("reset").and_then(Value::as_bool).unwrap_or(false);
+    if reset {
+        let name = {
+            let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+            c.clip = None;
+            c.name.clone()
+        };
+        return Ok(json!({
+            "message": format!("{name}: crop off"),
+            "index": i,
+            "clip": null,
+        }));
+    }
+
+    let (name, bounds) = {
+        let c = s.clouds.get(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+        (c.name.clone(), c.bounds)
+    };
+
+    let (yaw_rad, center, span_len) = if p.get("p1").is_some() && p.get("p2").is_some() {
+        let p1 = xy(p, "p1")?;
+        let p2 = xy(p, "p2")?;
+        let dx = p2[0] - p1[0];
+        let dy = p2[1] - p1[1];
+        let len = dx.hypot(dy);
+        if len < 1e-6 {
+            return Err(EngineError::Other("`p1` and `p2` must not be identical".into()));
+        }
+        let yaw = dy.atan2(dx);
+        let center = [(p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0];
+        (yaw, center, len)
+    } else if let Some(deg) = number(p, "angle_deg") {
+        let yaw = deg.to_radians();
+        let center =
+            if p.get("center").is_some() { xy(p, "center")? } else { [(bounds.min[0] + bounds.max[0]) / 2.0, (bounds.min[1] + bounds.max[1]) / 2.0] };
+        let cloud_w = (bounds.max[0] - bounds.min[0]).abs().max(1.0);
+        (yaw, center, cloud_w)
+    } else {
+        return Err(EngineError::Other("either `p1`/`p2` or `angle_deg` must be provided".into()));
+    };
+
+    let width = number(p, "width").unwrap_or(span_len);
+    let depth = number(p, "depth").unwrap_or_else(|| (bounds.max[1] - bounds.min[1]).abs().max(10.0));
+    let half_w = (width / 2.0).abs();
+    let half_d = (depth / 2.0).abs();
+
+    let zmin = number(p, "zmin").unwrap_or(bounds.min[2]);
+    let zmax = number(p, "zmax").unwrap_or(bounds.max[2]);
+    if zmax < zmin {
+        return Err(EngineError::Other("`zmax` must not be below `zmin`".into()));
+    }
+    let half_z = (zmax - zmin).abs() / 2.0;
+
+    let mut clip = cadcraft_pointcloud::Clip::new_rotated(center, [half_w, half_d, half_z], yaw_rad);
+    clip.min[2] = zmin;
+    clip.max[2] = zmax;
+
+    {
+        let c = s.clouds.get_mut(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+        c.clip = Some(clip);
+    }
+
+    Ok(json!({
+        "message": format!("{name}: crop aligned (angle: {:.2}°, width: {:.2}m, depth: {:.2}m)", yaw_rad.to_degrees(), width, depth),
+        "index": i,
+        "yaw_rad": yaw_rad,
+        "yaw_deg": yaw_rad.to_degrees(),
+        "center": center,
+        "width": width,
+        "depth": depth,
+        "zmin": zmin,
+        "zmax": zmax,
+        "clip": {
+            "min": clip.min,
+            "max": clip.max,
+            "yaw_rad": clip.yaw_rad,
+            "center": clip.center,
+        }
+    }))
+}
+
+#[derive(Default)]
+struct LasCropAlignM {
+    p1: Option<Vec2>,
+    index: Option<usize>,
+}
+
+impl LasCropAlignM {
+    fn new(s: &Session) -> Self {
+        Self { p1: None, index: if s.clouds.is_empty() { None } else { Some(s.clouds.len().saturating_sub(1)) } }
+    }
+}
+
+impl Interactive for LasCropAlignM {
+    fn name(&self) -> &'static str {
+        "LASCROPALIGN"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        if let Some(p1) = self.p1 {
+            Prompt::new("Specify second point along wall or alignment edge", Accept::POINT).base(p1)
+        } else {
+            Prompt::new("Specify first point along wall or alignment edge", Accept::POINT)
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        match i {
+            Input::Point(p) => {
+                if let Some(p1) = self.p1 {
+                    let mut params = json!({
+                        "p1": [p1.x, p1.y],
+                        "p2": [p.x, p.y],
+                    });
+                    if let Some(idx) = self.index {
+                        params["index"] = json!(idx);
+                    }
+                    let _ = lascropalign(s, &params)?;
+                    Ok(Step::Done)
+                } else {
+                    self.p1 = Some(p);
+                    Ok(Step::Continue)
+                }
+            }
+            Input::Cancel => Ok(Step::Cancel),
+            _ => Ok(Step::Continue),
+        }
+    }
+}
+
+/// Cut a vertical section through the cloud: generates profile polylines, level annotations,
+/// dimensions, DXF export, and optionally adds the 2D section drawing to the document.
+fn lassection(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = cloud_index(s, p)?;
+    let (path, bounds, in_mem_pts) = {
+        let c = s.clouds.get(i).ok_or_else(|| EngineError::Other(format!("no point cloud {i}")))?;
+        let pts: Vec<[f64; 3]> = if let Some(lvl) = c.levels.first() {
+            lvl.pts.iter().map(|v| [f64::from(v.x) + c.origin[0], f64::from(v.y) + c.origin[1], f64::from(v.z)]).collect()
+        } else {
+            Vec::new()
+        };
+        (c.path.clone(), c.bounds, pts)
+    };
+
+    let (p1, p2) = if p.get("p1").is_some() && p.get("p2").is_some() {
+        (xy(p, "p1")?, xy(p, "p2")?)
+    } else {
+        let mid_y = (bounds.min[1] + bounds.max[1]) / 2.0;
+        ([bounds.min[0], mid_y], [bounds.max[0], mid_y])
+    };
+
+    let thickness = number(p, "thickness").unwrap_or(0.2).max(0.001);
+    let decimate = number(p, "decimate").filter(|v| *v > 0.0);
+
+    let cut = if Path::new(&path).is_file() {
+        cadcraft_pointcloud::cut_section_from_las(Path::new(&path), p1, p2, thickness, decimate, cadcraft_pointcloud::DEFAULT_MAX_POINTS)
+            .map_err(oops)?
+    } else if !in_mem_pts.is_empty() {
+        cadcraft_pointcloud::cut_section_from_points(&in_mem_pts, p1, p2, thickness, decimate).map_err(oops)?
+    } else {
+        return Err(EngineError::Other(format!("cloud {i} has no points and file `{path}` not found")));
+    };
+
+    if let Some(out_p) = p.get("out").and_then(Value::as_str) {
+        cadcraft_pointcloud::export_section_dxf(&cut, Path::new(out_p)).map_err(oops)?;
+    }
+
+    let draw = p.get("draw").and_then(Value::as_bool).unwrap_or(true);
+    if draw {
+        let origin = if p.get("origin").is_some() {
+            xy(p, "origin")?
+        } else {
+            let ox = bounds.min[0];
+            let oy = bounds.min[1] - (bounds.max[2] - bounds.min[2] + 5.0).max(10.0);
+            [ox, oy]
+        };
+
+        // SECTION_FLOOR
+        let floor_vs: Vec<PolyVertex> = cut.floor_profile.iter().map(|pt| PolyVertex::new(Vec2::new(origin[0] + pt[0], origin[1] + pt[1]))).collect();
+        if floor_vs.len() >= 2 {
+            add_on_layer(s, "SECTION_FLOOR", lwpoly(floor_vs, false))?;
+        }
+
+        // SECTION_CEILING
+        let ceil_vs: Vec<PolyVertex> =
+            cut.ceiling_profile.iter().map(|pt| PolyVertex::new(Vec2::new(origin[0] + pt[0], origin[1] + pt[1]))).collect();
+        if ceil_vs.len() >= 2 {
+            add_on_layer(s, "SECTION_CEILING", lwpoly(ceil_vs, false))?;
+        }
+
+        // SECTION_LEVELS
+        let x0 = origin[0] - 1.0;
+        let x1 = origin[0] + cut.length + 1.0;
+        let fl_y = origin[1] + cut.floor_z;
+        let cl_y = origin[1] + cut.ceiling_z;
+
+        add_on_layer(s, "SECTION_LEVELS", line(Vec2::new(x0, fl_y), Vec2::new(x1, fl_y)))?;
+        add_on_layer(s, "SECTION_LEVELS", line(Vec2::new(x0, cl_y), Vec2::new(x1, cl_y)))?;
+
+        let floor_text = EntityKind::Text(Text {
+            insert: Vec3::new(x0 - 0.2, fl_y, 0.0),
+            align_pt: None,
+            height: 0.2,
+            value: format!("±0.00 / {:.2}m", cut.floor_z),
+            rotation: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+            style: "Standard".to_string(),
+            halign: HAlign::Right,
+            valign: VAlign::Middle,
+        });
+        add_on_layer(s, "SECTION_LEVELS", floor_text)?;
+
+        let ceil_text = EntityKind::Text(Text {
+            insert: Vec3::new(x0 - 0.2, cl_y, 0.0),
+            align_pt: None,
+            height: 0.2,
+            value: format!("+{:.2}m / {:.2}m", cut.clear_height, cut.ceiling_z),
+            rotation: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+            style: "Standard".to_string(),
+            halign: HAlign::Right,
+            valign: VAlign::Middle,
+        });
+        add_on_layer(s, "SECTION_LEVELS", ceil_text)?;
+
+        // SECTION_DIMS
+        let dim_x = origin[0] + cut.length + 0.5;
+        add_on_layer(s, "SECTION_DIMS", line(Vec2::new(dim_x, fl_y), Vec2::new(dim_x, cl_y)))?;
+        add_on_layer(s, "SECTION_DIMS", line(Vec2::new(dim_x - 0.15, fl_y), Vec2::new(dim_x + 0.15, fl_y)))?;
+        add_on_layer(s, "SECTION_DIMS", line(Vec2::new(dim_x - 0.15, cl_y), Vec2::new(dim_x + 0.15, cl_y)))?;
+
+        let dim_text = EntityKind::Text(Text {
+            insert: Vec3::new(dim_x + 0.25, (fl_y + cl_y) / 2.0, 0.0),
+            align_pt: None,
+            height: 0.2,
+            value: format!("H = {:.2}m", cut.clear_height),
+            rotation: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+            style: "Standard".to_string(),
+            halign: HAlign::Left,
+            valign: VAlign::Middle,
+        });
+        add_on_layer(s, "SECTION_DIMS", dim_text)?;
+
+        let dm = super::annotate::dim(
+            s,
+            DimKind::Linear { rotation: std::f64::consts::FRAC_PI_2 },
+            Vec2::new(dim_x, cl_y),
+            Vec2::new(dim_x - 0.5, fl_y),
+            Vec2::new(dim_x - 0.5, cl_y),
+            Vec2::new(dim_x, (fl_y + cl_y) / 2.0),
+            &format!("{:.2}m", cut.clear_height),
+        );
+        add_on_layer(s, "SECTION_DIMS", dm).ok();
+    }
+
+    let mut res = json!({
+        "message": format!("section cut: {:.2}m long, clear height: {:.2}m (floor {:.2}m, ceiling {:.2}m), {} points", cut.length, cut.clear_height, cut.floor_z, cut.ceiling_z, cut.points.len()),
+        "points": cut.points.len(),
+        "floor_z": cut.floor_z,
+        "ceiling_z": cut.ceiling_z,
+        "clear_height": cut.clear_height,
+        "length": cut.length,
+        "p1": cut.p1,
+        "p2": cut.p2,
+        "thickness": cut.thickness,
+        "floor_profile": cut.floor_profile,
+        "ceiling_profile": cut.ceiling_profile,
+    });
+    if let Some(out_p) = p.get("out").and_then(Value::as_str) {
+        res["out"] = json!(out_p);
+    }
+    Ok(res)
+}
+
+#[derive(Default)]
+struct LasSectionM {
+    p1: Option<Vec2>,
+    index: Option<usize>,
+}
+
+impl LasSectionM {
+    fn new(s: &Session) -> Self {
+        Self { p1: None, index: if s.clouds.is_empty() { None } else { Some(s.clouds.len().saturating_sub(1)) } }
+    }
+}
+
+impl Interactive for LasSectionM {
+    fn name(&self) -> &'static str {
+        "LASSECTION"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        if let Some(p1) = self.p1 {
+            Prompt::new("Specify second point for section cut line", Accept::POINT).base(p1)
+        } else {
+            Prompt::new("Specify first point for section cut line (or Enter for centerline)", Accept::POINT)
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        match i {
+            Input::Point(p) => {
+                if let Some(p1) = self.p1 {
+                    let mut params = json!({
+                        "p1": [p1.x, p1.y],
+                        "p2": [p.x, p.y],
+                    });
+                    if let Some(idx) = self.index {
+                        params["index"] = json!(idx);
+                    }
+                    let _ = lassection(s, &params)?;
+                    Ok(Step::Done)
+                } else {
+                    self.p1 = Some(p);
+                    Ok(Step::Continue)
+                }
+            }
+            Input::Enter => {
+                let mut params = json!({});
+                if let Some(idx) = self.index {
+                    params["index"] = json!(idx);
+                }
+                let _ = lassection(s, &params)?;
+                Ok(Step::Done)
+            }
+            Input::Cancel => Ok(Step::Cancel),
+            _ => Ok(Step::Continue),
+        }
+    }
 }
 
 /// Find the ground under a cloud, or show only the ground that was found.
@@ -1836,5 +2201,144 @@ mod tests {
         let classes = r.as_ref().and_then(|v| v["classes"].as_object()).cloned().unwrap_or_default();
         assert!(classes.contains_key("ground"), "the floor at 5 m is the ground: {classes:?}");
         assert!(s.clouds[0].levels.first().is_some_and(|l| l.classes.contains(&CLASS_GROUND)), "the classes are not left as the file carried them");
+    }
+
+    fn synthetic_room_cloud(name: &str, length: f64, width: f64, height: f64) -> cadcraft_pointcloud::Cloud {
+        use cadcraft_pointcloud::{Bounds3, Cloud, CloudColor, Pt, Slice};
+        let mut b = Bounds3::EMPTY;
+        let mut pts: Vec<Pt> = Vec::new();
+        let step = 0.1;
+
+        let mut x = 0.0;
+        while x <= length {
+            let mut y = -width / 2.0;
+            while y <= width / 2.0 {
+                pts.push(Pt { x, y, z: 0.0, rgb: None, intensity: 100, class: 2 });
+                pts.push(Pt { x, y, z: height, rgb: None, intensity: 100, class: 1 });
+                b.add(x, y, 0.0);
+                b.add(x, y, height);
+                y += step;
+            }
+            x += step;
+        }
+
+        let n = pts.len() as u64;
+        let slice = Slice { points: pts, total: n, in_band: n, bounds: b };
+        Cloud::from_slice(name.into(), String::new(), 0.0, height + 1.0, None, slice, 10_000, CloudColor::Rgb)
+    }
+
+    #[test]
+    fn lascropalign_aligns_to_wall_and_resets() {
+        let mut s = Session::new();
+        s.clouds.push(synthetic_room_cloud("room", 10.0, 4.0, 3.0));
+
+        // Align along diagonal from [0.0, 0.0] to [3.0, 4.0] (5m long, angle ~53.13 deg)
+        let r = lascropalign(
+            &mut s,
+            &json!({
+                "p1": [0.0, 0.0],
+                "p2": [3.0, 4.0],
+                "width": 6.0,
+                "depth": 2.0,
+                "zmin": 0.0,
+                "zmax": 2.5,
+            }),
+        );
+        assert!(r.is_ok(), "lascropalign should succeed: {r:?}");
+        let val = r.unwrap();
+        assert!((val["yaw_deg"].as_f64().unwrap() - 53.13).abs() < 0.1);
+        assert_eq!(val["width"], 6.0);
+        assert_eq!(val["depth"], 2.0);
+
+        let c = &s.clouds[0];
+        assert!(c.clip.is_some());
+        let clip = c.clip.unwrap();
+        assert!((clip.yaw_rad - (4.0f64).atan2(3.0)).abs() < 1e-6);
+        assert_eq!(clip.center, [1.5, 2.0]);
+
+        // Center point is inside
+        assert!(clip.contains(1.5, 2.0, 1.0));
+        // Point above zmax is outside
+        assert!(!clip.contains(1.5, 2.0, 2.6));
+
+        // Reset crop
+        let reset_res = lascropalign(&mut s, &json!({ "reset": true }));
+        assert!(reset_res.is_ok());
+        assert!(s.clouds[0].clip.is_none());
+    }
+
+    #[test]
+    fn lassection_extracts_profiles_and_draws_layers() {
+        let mut s = Session::new();
+        s.clouds.push(synthetic_room_cloud("room", 8.0, 4.0, 2.70));
+
+        let out_dir = std::env::temp_dir().join("cadcraft-engine-section-test");
+        std::fs::create_dir_all(&out_dir).ok();
+        let dxf_path = out_dir.join("cmd_section.dxf");
+
+        let res = lassection(
+            &mut s,
+            &json!({
+                "p1": [0.0, 0.0],
+                "p2": [8.0, 0.0],
+                "thickness": 0.4,
+                "draw": true,
+                "origin": [100.0, 200.0],
+                "out": dxf_path.to_str().unwrap(),
+            }),
+        );
+        assert!(res.is_ok(), "lassection should succeed: {res:?}");
+        let val = res.unwrap();
+
+        assert!((val["length"].as_f64().unwrap() - 8.0).abs() < 1e-6);
+        assert!((val["floor_z"].as_f64().unwrap() - 0.0).abs() < 0.05);
+        assert!((val["ceiling_z"].as_f64().unwrap() - 2.70).abs() < 0.05);
+        assert!((val["clear_height"].as_f64().unwrap() - 2.70).abs() < 0.05);
+        assert!(val["points"].as_u64().unwrap() > 50);
+
+        // Verify DXF was written
+        assert!(dxf_path.exists());
+        let content = std::fs::read_to_string(&dxf_path).unwrap();
+        assert!(content.contains("SECTION_POINTS"));
+        assert!(content.contains("SECTION_FLOOR"));
+        assert!(content.contains("SECTION_CEILING"));
+        assert!(content.contains("SECTION_LEVELS"));
+        assert!(content.contains("SECTION_DIMS"));
+        std::fs::remove_file(&dxf_path).ok();
+
+        // Verify layers and entities in document
+        let doc = s.doc().unwrap();
+        assert!(doc.layer("SECTION_FLOOR").is_some());
+        assert!(doc.layer("SECTION_CEILING").is_some());
+        assert!(doc.layer("SECTION_LEVELS").is_some());
+        assert!(doc.layer("SECTION_DIMS").is_some());
+
+        let space = s.space();
+        let ents: Vec<_> = doc.space(&space).unwrap().iter().collect();
+        assert!(ents.iter().any(|e| e.common.layer == "SECTION_FLOOR"));
+        assert!(ents.iter().any(|e| e.common.layer == "SECTION_CEILING"));
+        assert!(ents.iter().any(|e| e.common.layer == "SECTION_LEVELS"));
+        assert!(ents.iter().any(|e| e.common.layer == "SECTION_DIMS"));
+    }
+
+    #[test]
+    fn interactive_lassection_and_cropalign_machines() {
+        let mut s = Session::new();
+        s.clouds.push(synthetic_room_cloud("room", 6.0, 4.0, 2.50));
+
+        // Interactive LasSectionM
+        let mut sm = LasSectionM::new(&s);
+        let step1 = sm.input(&mut s, Input::Point(Vec2::new(0.0, 0.0))).unwrap();
+        assert!(matches!(step1, Step::Continue));
+        let step2 = sm.input(&mut s, Input::Point(Vec2::new(6.0, 0.0))).unwrap();
+        assert!(matches!(step2, Step::Done));
+
+        // Interactive LasCropAlignM
+        let mut cm = LasCropAlignM::new(&s);
+        let cstep1 = cm.input(&mut s, Input::Point(Vec2::new(0.0, 0.0))).unwrap();
+        assert!(matches!(cstep1, Step::Continue));
+        let cstep2 = cm.input(&mut s, Input::Point(Vec2::new(5.0, 0.0))).unwrap();
+        assert!(matches!(cstep2, Step::Done));
+        assert!(s.clouds[0].clip.is_some());
     }
 }
