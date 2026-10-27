@@ -11,7 +11,7 @@
 
 use crate::bim::raster::{Raster, close, contours, mask};
 use crate::bim::{BimError, BimOptions, MAX_CLOSE_RADIUS, MAX_RASTER_CELLS};
-use cadcraft_geom::{Vec2, shoelace};
+use cadcraft_geom::{Vec2, point_in_polygon, shoelace};
 
 #[cfg(test)]
 pub(crate) mod fixture;
@@ -41,6 +41,8 @@ pub struct Slab {
     /// [`Raster::to_world`], with the first corner not repeated. Empty when the band that would
     /// draw it holds nothing.
     pub polygon: Vec<[f64; 2]>,
+    /// Any inner voids / openings (e.g. stairwells, vertical shafts) contained within `polygon`.
+    pub holes: Vec<Vec<[f64; 2]>>,
     /// True when only one face of this body was scanned, so the other face is the option's
     /// thickness rather than a measurement.
     pub single_sided: bool,
@@ -102,7 +104,9 @@ pub fn find(points: &[[f64; 3]], opts: &BimOptions) -> Result<Vec<Slab>, BimErro
         let Some(mut slab) = body.slab(&tuning) else {
             continue;
         };
-        slab.polygon = plan(points, &body.faces, &tuning)?;
+        let (poly, holes) = plan(points, &body.faces, &tuning)?;
+        slab.polygon = poly;
+        slab.holes = holes;
         slabs.push(slab);
     }
     Ok(slabs)
@@ -221,7 +225,7 @@ impl Body {
             }
             (None, _) => return None,
         };
-        Some(Slab { base_z, top_z, thickness, polygon: Vec::new(), single_sided: self.single_sided })
+        Some(Slab { base_z, top_z, thickness, polygon: Vec::new(), holes: Vec::new(), single_sided: self.single_sided })
     }
 }
 
@@ -344,7 +348,10 @@ fn bin(z: f64, lo: f64, step: f64, bins: usize) -> Option<usize> {
 /// together, closed and traced, with the most prominent outer ring kept (§3.1: "the most prominent
 /// contour is extracted, scaled, and converted into a Polygon object that delineates the floor
 /// plan"). Holes are not carried: a slab is one ring here.
-fn plan(points: &[[f64; 3]], faces: &[f64], tuning: &Tuning) -> Result<Vec<[f64; 2]>, BimError> {
+/// The plan ring of a slab and its interior holes: the points lying within one `z_step` of any of its
+/// faces, rasterised together, closed and traced. The most prominent outer ring delineates the floor
+/// plan, and inner contours contained within it delineate voids / slab openings.
+fn plan(points: &[[f64; 3]], faces: &[f64], tuning: &Tuning) -> Result<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>), BimError> {
     let step = tuning.z_step;
     // Two passes rather than a band vector: the working level of a real scan is millions of
     // points, and this runs once per slab.
@@ -370,7 +377,7 @@ fn plan(points: &[[f64; 3]], faces: &[f64], tuning: &Tuning) -> Result<Vec<[f64;
     if in_band == 0 {
         // No point sits within a step of the measured face, so there is no plan to draw. Nothing
         // is invented and the caller sees an empty ring.
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     // A band one point deep, or one cell narrower than a cell, still needs a box to grid onto.
     let lo = [min[0], min[1]];
@@ -390,16 +397,33 @@ fn plan(points: &[[f64; 3]], faces: &[f64], tuning: &Tuning) -> Result<Vec<[f64;
     let (w, h) = grid.dims();
     let closed = close(&m, w, h, tuning.close_radius);
     let rings = contours(&closed, w, h);
-    let mut best: Option<&[_]> = None;
+    let mut best_outer: Option<&[_]> = None;
     let mut best_area = 0f64;
     for ring in rings.iter().filter(|c| c.outer) {
         let area = ring_area(&ring.ring).abs();
         if area > best_area {
             best_area = area;
-            best = Some(&ring.ring);
+            best_outer = Some(&ring.ring);
         }
     }
-    Ok(best.map(|ring| grid.to_world(ring)).unwrap_or_default())
+    let Some(outer_ring) = best_outer else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let outer_poly = grid.to_world(outer_ring);
+    let outer_pts: Vec<Vec2> = outer_ring.iter().map(|p| Vec2::new(p[0], p[1])).collect();
+    let mut holes = Vec::new();
+    for c in &rings {
+        if !c.outer
+            && c.ring.len() >= 3
+            && let Some(first_v) = c.ring.first()
+        {
+            let p = Vec2::new(first_v[0], first_v[1]);
+            if point_in_polygon(&outer_pts, p) {
+                holes.push(grid.to_world(&c.ring));
+            }
+        }
+    }
+    Ok((outer_poly, holes))
 }
 
 /// The signed area of a ring, in whatever units it is given: cell steps inside this module, world
@@ -607,8 +631,8 @@ mod tests {
         // still describes. Here the lower face is blocked past x = 4 m and the ceiling is whole.
         let half = half_lower_face_box();
         let tuning = Tuning::read(&BimOptions::default()).expect("the defaults are usable");
-        let alone = plan(&half, &[3.0], &tuning).expect("the blocked face rasterises");
-        let merged = plan(&half, &[3.0, 3.3], &tuning).expect("both faces together rasterise");
+        let alone = plan(&half, &[3.0], &tuning).expect("the blocked face rasterises").0;
+        let merged = plan(&half, &[3.0, 3.3], &tuning).expect("both faces together rasterise").0;
         assert!((ring_area(&alone).abs() - 16.0).abs() < 0.01, "the lower face alone draws 4 m x 4 m, got {}", ring_area(&alone).abs());
         assert!((ring_area(&merged).abs() - 24.0).abs() < 0.01, "the merged band draws the whole 6 m x 4 m, got {}", ring_area(&merged).abs());
         let slabs = find(&half, &BimOptions::default()).expect("the half box has slabs");
@@ -760,5 +784,35 @@ mod tests {
         let one = find(&[[2.0, 3.0, 4.0]], &o).expect("one point is still a surface");
         assert_eq!(one.len(), 1);
         assert!(one.first().is_some_and(|s| s.single_sided && (s.thickness - 0.20).abs() < 1e-9));
+    }
+
+    #[test]
+    fn slab_with_rectangular_hole_extracts_inner_hole_contour() {
+        // Floor slab at z = 0.0 with outer dimensions 10 x 10 m and a hole from [3.0, 3.0] to [7.0, 7.0].
+        let mut pts = Vec::new();
+        let step = 0.05;
+        let n_steps = 200; // 0.0 to 10.0 m
+        for ix in 0..=n_steps {
+            let x = ix as f64 * step;
+            for iy in 0..=n_steps {
+                let y = iy as f64 * step;
+                if (3.0..=7.0).contains(&x) && (3.0..=7.0).contains(&y) {
+                    continue; // hole void
+                }
+                pts.push([x, y, 0.0]);
+            }
+        }
+        let slabs = find(&pts, &BimOptions::default()).expect("finds the slab");
+        assert_eq!(slabs.len(), 1, "exactly one floor slab");
+        assert_eq!(slabs[0].holes.len(), 1, "exactly one hole detected");
+        let hole = &slabs[0].holes[0];
+        let min_x = hole.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+        let max_x = hole.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max);
+        let min_y = hole.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+        let max_y = hole.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max);
+        assert!((min_x - 3.0).abs() <= 0.2, "hole min x matches 3.0 within cell tolerance: {min_x}");
+        assert!((max_x - 7.0).abs() <= 0.2, "hole max x matches 7.0 within cell tolerance: {max_x}");
+        assert!((min_y - 3.0).abs() <= 0.2, "hole min y matches 3.0 within cell tolerance: {min_y}");
+        assert!((max_y - 7.0).abs() <= 0.2, "hole max y matches 7.0 within cell tolerance: {max_y}");
     }
 }

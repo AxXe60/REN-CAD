@@ -30,7 +30,7 @@ mod snap;
 mod spectrum;
 pub mod topo;
 
-pub use bim::{BimError, BimOptions, Slab, Storey};
+pub use bim::{BimError, BimOptions, Column, ColumnShape, Slab, Storey, Wall, detect_columns};
 pub use classify::{
     ALL_CLASSES, CLASS_BUILDING, CLASS_HIGH_VEG, CLASS_LOW_POINT, CLASS_LOW_VEG, CLASS_MED_VEG, ClassifyMode, ClassifyOptions, ClassifyResult, Shape,
     class_color, class_from_name, class_name, classify_level, heights_above_ground, sample_level, shape_of,

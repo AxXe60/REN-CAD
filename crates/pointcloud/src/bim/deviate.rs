@@ -51,11 +51,14 @@ struct PreparedWall {
     half_thickness: f64,
     base_z: f64,
     height: f64,
+    aabb_min: [f64; 3],
+    aabb_max: [f64; 3],
 }
 
 /// Pre-calculated prism representation of a slab body for fast point queries.
 struct PreparedSlab {
     polygon_vec2: Vec<Vec2>,
+    holes_vec2: Vec<Vec<Vec2>>,
     edges: Vec<Line>,
     base_z: f64,
     top_z: f64,
@@ -97,7 +100,7 @@ fn wall_dist(w: &PreparedWall, p: [f64; 3]) -> f64 {
 fn slab_dist(s: &PreparedSlab, p: [f64; 3]) -> f64 {
     let [px, py, pz] = p;
     let p2 = Vec2::new(px, py);
-    let d2 = if point_in_polygon(&s.polygon_vec2, p2) {
+    let d2 = if point_in_polygon(&s.polygon_vec2, p2) && !s.holes_vec2.iter().any(|h| point_in_polygon(h, p2)) {
         0.0
     } else {
         let mut min_edge_d = f64::INFINITY;
@@ -172,7 +175,17 @@ pub fn measure(points: &[[f64; 3]], walls: &[Wall], slabs: &[Slab], opts: &BimOp
         }
         let d = [dx / len, dy / len];
         let n = [-d[1], d[0]];
-        prepared_walls.push(PreparedWall { from: [fx, fy], d, n, len, half_thickness: w.thickness / 2.0, base_z: w.base_z, height: w.height });
+        let ht = w.thickness / 2.0;
+        let corners =
+            [[fx + n[0] * ht, fy + n[1] * ht], [fx - n[0] * ht, fy - n[1] * ht], [tx + n[0] * ht, ty + n[1] * ht], [tx - n[0] * ht, ty - n[1] * ht]];
+        let aabb_min =
+            [corners.iter().map(|c| c[0]).fold(f64::INFINITY, f64::min), corners.iter().map(|c| c[1]).fold(f64::INFINITY, f64::min), w.base_z];
+        let aabb_max = [
+            corners.iter().map(|c| c[0]).fold(f64::NEG_INFINITY, f64::max),
+            corners.iter().map(|c| c[1]).fold(f64::NEG_INFINITY, f64::max),
+            w.base_z + w.height,
+        ];
+        prepared_walls.push(PreparedWall { from: [fx, fy], d, n, len, half_thickness: ht, base_z: w.base_z, height: w.height, aabb_min, aabb_max });
     }
 
     // Filter and prepare valid slabs.
@@ -201,7 +214,29 @@ pub fn measure(points: &[[f64; 3]], walls: &[Wall], slabs: &[Slab], opts: &BimOp
             let Some(&b) = poly_vec2.get((i + 1) % n) else { continue };
             edges.push(Line::new(a, b));
         }
-        prepared_slabs.push(PreparedSlab { polygon_vec2: poly_vec2, edges, base_z: s.base_z.min(s.top_z), top_z: s.base_z.max(s.top_z) });
+        let mut holes_vec2 = Vec::new();
+        for hole in &s.holes {
+            let mut hole_v2 = Vec::with_capacity(hole.len());
+            let mut valid_hole = true;
+            for v in hole {
+                let [vx, vy] = *v;
+                if !vx.is_finite() || !vy.is_finite() {
+                    valid_hole = false;
+                    break;
+                }
+                hole_v2.push(Vec2::new(vx, vy));
+            }
+            if valid_hole && hole_v2.len() >= 3 {
+                let m = hole_v2.len();
+                for i in 0..m {
+                    let Some(&a) = hole_v2.get(i) else { continue };
+                    let Some(&b) = hole_v2.get((i + 1) % m) else { continue };
+                    edges.push(Line::new(a, b));
+                }
+                holes_vec2.push(hole_v2);
+            }
+        }
+        prepared_slabs.push(PreparedSlab { polygon_vec2: poly_vec2, holes_vec2, edges, base_z: s.base_z.min(s.top_z), top_z: s.base_z.max(s.top_z) });
     }
 
     if prepared_walls.is_empty() && prepared_slabs.is_empty() {
@@ -226,6 +261,12 @@ pub fn measure(points: &[[f64; 3]], walls: &[Wall], slabs: &[Slab], opts: &BimOp
 
         let mut min_d = f64::INFINITY;
         for w in &prepared_walls {
+            let dx = 0.0_f64.max(w.aabb_min[0] - px).max(px - w.aabb_max[0]);
+            let dy = 0.0_f64.max(w.aabb_min[1] - py).max(py - w.aabb_max[1]);
+            let dz = 0.0_f64.max(w.aabb_min[2] - pz).max(pz - w.aabb_max[2]);
+            if dx >= min_d || dy >= min_d || dz >= min_d {
+                continue;
+            }
             let d = wall_dist(w, [px, py, pz]);
             if d < min_d {
                 min_d = d;
@@ -236,6 +277,10 @@ pub fn measure(points: &[[f64; 3]], walls: &[Wall], slabs: &[Slab], opts: &BimOp
         }
         if min_d > 0.0 {
             for s in &prepared_slabs {
+                let dz = 0.0_f64.max(s.base_z - pz).max(pz - s.top_z);
+                if dz >= min_d {
+                    continue;
+                }
                 let d = slab_dist(s, [px, py, pz]);
                 if d < min_d {
                     min_d = d;
@@ -385,12 +430,26 @@ mod tests {
     use super::*;
 
     fn box_model() -> (Vec<Wall>, Vec<Slab>) {
-        let w = |from, to, exterior| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior };
+        let w = |from, to, exterior| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior, is_parapet: false };
         let walls =
             vec![w([0.0, 0.0], [6.0, 0.0], true), w([6.0, 0.0], [6.0, 4.0], true), w([6.0, 4.0], [0.0, 4.0], true), w([0.0, 4.0], [0.0, 0.0], true)];
         let slabs = vec![
-            Slab { base_z: -0.2, top_z: 0.0, thickness: 0.2, polygon: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]], single_sided: true },
-            Slab { base_z: 2.8, top_z: 3.0, thickness: 0.2, polygon: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]], single_sided: true },
+            Slab {
+                base_z: -0.2,
+                top_z: 0.0,
+                thickness: 0.2,
+                polygon: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]],
+                holes: Vec::new(),
+                single_sided: true,
+            },
+            Slab {
+                base_z: 2.8,
+                top_z: 3.0,
+                thickness: 0.2,
+                polygon: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]],
+                holes: Vec::new(),
+                single_sided: true,
+            },
         ];
         (walls, slabs)
     }
@@ -513,12 +572,13 @@ mod tests {
             [f64::NAN, 2.0, 0.0],
             [3.0, 2.0, 0.0], // on floor slab, d = 0
         ];
-        walls.push(Wall { from: [f64::NAN, 0.0], to: [1.0, 0.0], thickness: 0.2, base_z: 0.0, height: 2.8, exterior: false });
+        walls.push(Wall { from: [f64::NAN, 0.0], to: [1.0, 0.0], thickness: 0.2, base_z: 0.0, height: 2.8, exterior: false, is_parapet: false });
         slabs.push(Slab {
             base_z: 0.0,
             top_z: 0.2,
             thickness: 0.2,
             polygon: vec![[0.0, 0.0], [1.0, 1.0]], // only 2 vertices
+            holes: Vec::new(),
             single_sided: false,
         });
         let r = measure(&pts, &walls, &slabs, &o).expect("bad geometry and points skipped");
@@ -538,5 +598,31 @@ mod tests {
         let (clean_walls, clean_slabs) = box_model();
         let err = measure(&two_clusters, &clean_walls, &clean_slabs, &cap_opts).unwrap_err();
         assert!(matches!(err, BimError::TooLarge { what: "furniture clusters", limit: 1 }));
+    }
+
+    #[test]
+    fn points_inside_slab_void_have_distance_greater_than_zero() {
+        let o = BimOptions::default();
+        // Slab spanning [0.0, 0.0] to [10.0, 10.0], z in [0.0, 0.20]
+        // with a hole spanning [4.0, 4.0] to [6.0, 6.0].
+        let slab = Slab {
+            base_z: 0.0,
+            top_z: 0.20,
+            thickness: 0.20,
+            polygon: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            holes: vec![vec![[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0]]],
+            single_sided: false,
+        };
+        // Point in solid part of slab (e.g. [2.0, 2.0, 0.10]) -> d == 0
+        // Point in void hole (e.g. [5.0, 5.0, 0.10]) -> d == 1.0 m (dist to hole edge at x=4 or x=6, y=4 or y=6)
+        let pts = vec![
+            [2.0, 2.0, 0.10], // solid
+            [5.0, 5.0, 0.10], // void center
+        ];
+        let rep = measure(&pts, &[], &[slab], &o).expect("measure succeeds");
+        assert_eq!(rep.points, 2);
+        // The point at [5.0, 5.0, 0.10] has distance ~1.0 m = 1000 mm to the nearest hole boundary edge
+        assert!(rep.max_mm >= 950.0 && rep.max_mm <= 1050.0, "point inside void has distance ~1.0 m to boundary, got {}", rep.max_mm);
+        assert_eq!(rep.above_threshold, 1, "void point is above the 50 mm threshold");
     }
 }

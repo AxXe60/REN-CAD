@@ -52,48 +52,114 @@ pub fn build(walls: &[Wall], opts: &BimOptions) -> Result<Vec<Zone>, BimError> {
     if walls.len() > MAX_ZONE_WALLS {
         return Err(BimError::TooLarge { what: "zone walls", limit: MAX_ZONE_WALLS });
     }
-    let mut axes = usable_axes(walls);
+
+    // 1. Structural-Only Filtering:
+    // Filter walls to retain only full-height structural walls (!w.is_parapet && w.height >= height * 0.75
+    // where height = walls.iter().map(|w| w.height).fold(0.0, f64::max)).
+    // Partial-height parapets and furniture must NOT participate in zone boundary tracing.
+    let max_height = walls.iter().map(|w| w.height).filter(|h| h.is_finite()).fold(0.0f64, f64::max);
+    let structural_walls: Vec<Wall> =
+        walls.iter().filter(|w| !w.is_parapet && w.height.is_finite() && w.height >= max_height * 0.75).cloned().collect();
+
+    let mut axes = usable_axes(&structural_walls);
     if axes.is_empty() {
         return Ok(Vec::new());
     }
     snap(&mut axes, t.zone_gap);
-    let rects: Vec<Vec<Vec2>> = axes.iter().map(rect).collect();
-    let soup = segments(&axes);
+    split_t_junctions(&mut axes);
+
+    // 2. Degree-1 Dead-end Pruning:
+    // After snapping and splitting T-junctions, prune degree-1 antenna stubs (< 0.60m)
+    // from centerline axes before tracing boundaries, leaving structural walls intact.
+    add_doorway_closures_to_axes(&mut axes, 2.00);
+    prune_degree_one_axes(&mut axes);
+
+    if axes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rects: Vec<Vec<Vec2>> = axes.iter().filter(|a| a.thickness > 1e-6).map(rect).collect();
+    let mut soup = segments(&axes);
+    add_doorway_closures(&axes, &mut soup, 2.00);
     if soup.is_empty() {
         return Ok(Vec::new());
     }
+    let bridge_gap = t.zone_gap.max(1.60);
     let mut zones: Vec<Zone> = Vec::new();
     let mut traced = 0usize;
     for a in &axes {
+        if a.thickness <= 1e-6 {
+            continue;
+        }
         let d = a.to - a.from;
         let len = d.len();
         if !len.is_finite() || len <= EPS_LEN {
             continue;
         }
         let along = d / len;
-        let out = Vec2::new(-along.y, along.x) * (a.thickness / 2.0 + SEED_CLEARANCE);
-        for side in [1.0, -1.0] {
-            for f in STATIONS {
-                let seed = a.from + d * f + out * side;
-                if !seed.is_finite() || rects.iter().any(|r| point_in_polygon(r, seed)) {
+        for clearance in [0.05, 0.20, 0.40] {
+            let out = Vec2::new(-along.y, along.x) * (a.thickness / 2.0 + clearance);
+            for side in [1.0, -1.0] {
+                for f in STATIONS {
+                    let seed = a.from + d * f + out * side;
+                    if !seed.is_finite() || rects.iter().any(|r| point_in_polygon(r, seed)) {
+                        continue;
+                    }
+                    if zones.iter().any(|z| ring_holds(z, seed)) {
+                        break;
+                    }
+                    if traced >= MAX_ZONE_SEEDS {
+                        return Err(BimError::TooLarge { what: "zone seeds", limit: MAX_ZONE_SEEDS });
+                    }
+                    traced += 1;
+                    let Some(boundary) = region::boundary_at_gap(&soup, seed, TRACE_TOL, bridge_gap) else {
+                        continue;
+                    };
+                    let Some(zone) = zone_of(&boundary.outer, t.min_zone_area) else {
+                        continue;
+                    };
+                    if !zones.iter().any(|existing| is_same_zone(existing, &zone)) {
+                        zones.push(zone);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Grid probe seeds across bounding box (0.60m step) to capture open-plan living spaces.
+    let min_x = axes.iter().map(|a| a.from.x.min(a.to.x)).fold(f64::INFINITY, f64::min);
+    let max_x = axes.iter().map(|a| a.from.x.max(a.to.x)).fold(f64::NEG_INFINITY, f64::max);
+    let min_y = axes.iter().map(|a| a.from.y.min(a.to.y)).fold(f64::INFINITY, f64::min);
+    let max_y = axes.iter().map(|a| a.from.y.max(a.to.y)).fold(f64::NEG_INFINITY, f64::max);
+    if min_x.is_finite() && max_x.is_finite() && min_y.is_finite() && max_y.is_finite() {
+        let mut gx = min_x + 0.60;
+        while gx < max_x {
+            let mut gy = min_y + 0.60;
+            while gy < max_y {
+                let seed = Vec2::new(gx, gy);
+                gy += 0.60;
+                if rects.iter().any(|r| point_in_polygon(r, seed)) {
                     continue;
                 }
                 if zones.iter().any(|z| ring_holds(z, seed)) {
-                    break;
+                    continue;
                 }
                 if traced >= MAX_ZONE_SEEDS {
-                    return Err(BimError::TooLarge { what: "zone seeds", limit: MAX_ZONE_SEEDS });
+                    break;
                 }
                 traced += 1;
-                let Some(boundary) = region::boundary_at_gap(&soup, seed, TRACE_TOL, 0.0) else {
+                let Some(boundary) = region::boundary_at_gap(&soup, seed, TRACE_TOL, bridge_gap) else {
                     continue;
                 };
                 let Some(zone) = zone_of(&boundary.outer, t.min_zone_area) else {
                     continue;
                 };
-                zones.push(zone);
-                break;
+                if !zones.iter().any(|existing| is_same_zone(existing, &zone)) {
+                    zones.push(zone);
+                }
             }
+            gx += 0.60;
         }
     }
     // Quantized keys, not raw floats: two rooms of one row trace at x = 1.4999999999999993 and
@@ -106,6 +172,12 @@ pub fn build(walls: &[Wall], opts: &BimOptions) -> Result<Vec<Zone>, BimError> {
 fn centroid_key(z: &Zone) -> (i64, i64) {
     let (x, y) = centroid(z);
     ((x * 1e6).round() as i64, (y * 1e6).round() as i64)
+}
+
+fn is_same_zone(a: &Zone, b: &Zone) -> bool {
+    let (ax, ay) = centroid(a);
+    let (bx, by) = centroid(b);
+    (ax - bx).hypot(ay - by) < 0.20 && (a.area - b.area).abs() < 0.20
 }
 
 /// The options this stage reads, checked once so the loops below are arithmetic only.
@@ -132,10 +204,6 @@ const EPS_LEN: f64 = 1e-9;
 /// the soup is deduplicated on a micrometre, so only float noise is left to absorb.
 const TRACE_TOL: f64 = 1e-6;
 
-/// How far outside a wall's face a seed is placed, in metres. Large enough to clear the face by
-/// a float margin, small enough that no real wall stands closer than the seed.
-const SEED_CLEARANCE: f64 = 1e-3;
-
 /// How many passes of snap-then-merge run before the axes are taken as final. Two ends that
 /// choose each other meet on the first pass; a chain of three needs one more.
 const SNAP_PASSES: usize = 3;
@@ -146,11 +214,17 @@ const SNAP_PASSES: usize = 3;
 const STATIONS: [f64; 7] = [0.5, 0.25, 0.75, 0.125, 0.375, 0.625, 0.875];
 
 /// One wall's axis after the ends have been made to meet its neighbours.
-#[derive(Clone, Copy)]
-struct Axis {
-    from: Vec2,
-    to: Vec2,
-    thickness: f64,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Axis {
+    pub from: Vec2,
+    pub to: Vec2,
+    pub thickness: f64,
+}
+
+impl Axis {
+    pub fn new(from: Vec2, to: Vec2, thickness: f64) -> Self {
+        Self { from, to, thickness }
+    }
 }
 
 /// The walls that can be traced at all: numbers, some length, and a positive thickness. A wall
@@ -297,9 +371,222 @@ fn rect(a: &Axis) -> Vec<Vec2> {
 
 /// Every wall edge as a two-point polyline, the line soup the region tracer walks. A zero-length
 /// edge is dropped: it is not a line and would only put a self-loop in the graph.
+/// Project T-junction axis endpoints onto target axis lines and split target axes so T-junctions
+/// become explicit vertices in the planar graph.
+fn split_t_junctions(axes: &mut Vec<Axis>) {
+    // 1. Snap qualifying endpoints to target axis lines.
+    let mut new_from: Vec<Option<Vec2>> = vec![None; axes.len()];
+    let mut new_to: Vec<Option<Vec2>> = vec![None; axes.len()];
+
+    for i in 0..axes.len() {
+        let (from_pt, to_pt) = (axes[i].from, axes[i].to);
+        for (is_from, pt) in [(true, from_pt), (false, to_pt)] {
+            let mut best: Option<(f64, Vec2)> = None;
+            for (j, aj) in axes.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                let dj = aj.to - aj.from;
+                let len_j = dj.len();
+                if len_j < 0.10 {
+                    continue;
+                }
+                let uj = dj / len_j;
+                let t = (pt - aj.from).dot(uj);
+                if t < 0.05 || t > len_j - 0.05 {
+                    continue;
+                }
+                let proj = aj.from + uj * t;
+                let d_perp = pt.dist(proj);
+                if d_perp <= 0.35 && best.as_ref().is_none_or(|(best_d, _)| d_perp < *best_d) {
+                    best = Some((d_perp, proj));
+                }
+            }
+            if let Some((_, proj)) = best {
+                if is_from {
+                    new_from[i] = Some(proj);
+                } else {
+                    new_to[i] = Some(proj);
+                }
+            }
+        }
+    }
+
+    for i in 0..axes.len() {
+        if let Some(p) = new_from[i] {
+            axes[i].from = p;
+        }
+        if let Some(p) = new_to[i] {
+            axes[i].to = p;
+        }
+    }
+
+    // 2. Planar splitting: split each axis at any internal T-junction projection points.
+    let mut split_axes: Vec<Axis> = Vec::with_capacity(axes.len() * 2);
+    for j in 0..axes.len() {
+        let aj = axes[j];
+        let dj = aj.to - aj.from;
+        let len_j = dj.len();
+        if len_j < 0.10 {
+            split_axes.push(aj);
+            continue;
+        }
+        let uj = dj / len_j;
+
+        let mut split_ts: Vec<f64> = Vec::new();
+        for (k, ak) in axes.iter().enumerate() {
+            if k == j {
+                continue;
+            }
+            for pt in [ak.from, ak.to] {
+                let t = (pt - aj.from).dot(uj);
+                if t >= 0.05 && t <= len_j - 0.05 {
+                    let proj = aj.from + uj * t;
+                    if pt.dist(proj) <= 1e-3 {
+                        split_ts.push(t);
+                    }
+                }
+            }
+        }
+
+        if split_ts.is_empty() {
+            split_axes.push(aj);
+            continue;
+        }
+
+        split_ts.sort_by(f64::total_cmp);
+        let mut unique_ts: Vec<f64> = Vec::new();
+        for t in split_ts {
+            if unique_ts.last().is_none_or(|&last_t| (t - last_t).abs() > 0.02) {
+                unique_ts.push(t);
+            }
+        }
+
+        let mut prev_pt = aj.from;
+        for t in unique_ts {
+            let split_pt = aj.from + uj * t;
+            if prev_pt.dist(split_pt) > EPS_LEN {
+                split_axes.push(Axis { from: prev_pt, to: split_pt, thickness: aj.thickness });
+                prev_pt = split_pt;
+            }
+        }
+        if prev_pt.dist(aj.to) > EPS_LEN {
+            split_axes.push(Axis { from: prev_pt, to: aj.to, thickness: aj.thickness });
+        }
+    }
+    *axes = split_axes;
+}
+
+/// Close open doorway gaps between axis endpoints or adjacent walls by adding virtual closure
+/// segments directly into the region tracer's line soup.
+fn add_doorway_closures(axes: &[Axis], soup: &mut Vec<Vec<Vec2>>, max_gap: f64) {
+    if axes.is_empty() {
+        return;
+    }
+    let is_connected = |pt: Vec2, axis_idx: usize| -> bool {
+        for (j, aj) in axes.iter().enumerate() {
+            if j == axis_idx {
+                continue;
+            }
+            if pt.dist(aj.from) <= 0.05 || pt.dist(aj.to) <= 0.05 {
+                return true;
+            }
+            let dj = aj.to - aj.from;
+            let len_j = dj.len();
+            if len_j > 0.05 {
+                let uj = dj / len_j;
+                let t = (pt - aj.from).dot(uj);
+                if t >= 0.02 && t <= len_j - 0.02 {
+                    let proj = aj.from + uj * t;
+                    if pt.dist(proj) <= 0.05 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    };
+
+    let mut open_ends: Vec<(usize, Vec2)> = Vec::new();
+    for (i, a) in axes.iter().enumerate() {
+        if !is_connected(a.from, i) {
+            open_ends.push((i, a.from));
+        }
+        if !is_connected(a.to, i) {
+            open_ends.push((i, a.to));
+        }
+    }
+
+    let mut used_ends = vec![false; open_ends.len()];
+
+    // 1. First pair open ends with other open ends across doorway openings (gap in [0.35, max_gap])
+    for i in 0..open_ends.len() {
+        if used_ends[i] {
+            continue;
+        }
+        let (axis_i, pi) = open_ends[i];
+        let mut best: Option<(f64, usize, Vec2)> = None;
+        for j in (i + 1)..open_ends.len() {
+            if used_ends[j] {
+                continue;
+            }
+            let (axis_j, pj) = open_ends[j];
+            if axis_i == axis_j {
+                continue;
+            }
+            let d = pi.dist(pj);
+            if d > 0.05 && d <= max_gap && best.as_ref().is_none_or(|(bd, ..)| d < *bd) {
+                best = Some((d, j, pj));
+            }
+        }
+        if let Some((_, j, pj)) = best {
+            used_ends[i] = true;
+            used_ends[j] = true;
+            soup.push(vec![pi, pj]);
+        }
+    }
+
+    // 2. For remaining open ends, check if they meet an adjacent wall line
+    for i in 0..open_ends.len() {
+        if used_ends[i] {
+            continue;
+        }
+        let (axis_i, pi) = open_ends[i];
+        let mut best_wall: Option<(f64, Vec2)> = None;
+        for (j, aj) in axes.iter().enumerate() {
+            if j == axis_i {
+                continue;
+            }
+            let dj = aj.to - aj.from;
+            let len_j = dj.len();
+            if len_j > 0.05 {
+                let uj = dj / len_j;
+                let t = (pi - aj.from).dot(uj);
+                if t >= 0.05 && t <= len_j - 0.05 {
+                    let proj = aj.from + uj * t;
+                    let d = pi.dist(proj);
+                    if d > 0.05 && d <= max_gap && best_wall.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                        best_wall = Some((d, proj));
+                    }
+                }
+            }
+        }
+        if let Some((_, proj)) = best_wall {
+            used_ends[i] = true;
+            soup.push(vec![pi, proj]);
+        }
+    }
+}
+
 fn segments(axes: &[Axis]) -> Vec<Vec<Vec2>> {
     let mut out = Vec::new();
     for a in axes {
+        if a.thickness <= 1e-6 {
+            if !a.from.near(a.to, EPS_LEN) {
+                out.push(vec![a.from, a.to]);
+            }
+            continue;
+        }
         let ring = rect(a);
         for w in ring.windows(2) {
             if let [p, q] = w
@@ -310,6 +597,139 @@ fn segments(axes: &[Axis]) -> Vec<Vec<Vec2>> {
         }
     }
     out
+}
+
+fn is_connected_to_any(pt: Vec2, skip_axis: usize, axes: &[Axis], tol: f64) -> bool {
+    for (j, aj) in axes.iter().enumerate() {
+        if j == skip_axis {
+            continue;
+        }
+        if pt.dist(aj.from) <= tol || pt.dist(aj.to) <= tol {
+            return true;
+        }
+        let dj = aj.to - aj.from;
+        let len_j = dj.len();
+        if len_j > 1e-6 {
+            let uj = dj / len_j;
+            let t = (pt - aj.from).dot(uj);
+            if t >= -tol && t <= len_j + tol {
+                let proj = aj.from + uj * t.clamp(0.0, len_j);
+                if pt.dist(proj) <= tol {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn add_doorway_closures_to_axes(axes: &mut Vec<Axis>, max_gap: f64) {
+    if axes.is_empty() {
+        return;
+    }
+
+    let mut open_ends: Vec<(usize, Vec2)> = Vec::new();
+    for (i, a) in axes.iter().enumerate() {
+        if !is_connected_to_any(a.from, i, axes, 0.15) {
+            open_ends.push((i, a.from));
+        }
+        if !is_connected_to_any(a.to, i, axes, 0.15) {
+            open_ends.push((i, a.to));
+        }
+    }
+
+    let mut used_ends = vec![false; open_ends.len()];
+    let mut closures: Vec<Axis> = Vec::new();
+
+    // 1. Pair open ends across doorways
+    for i in 0..open_ends.len() {
+        if used_ends.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        let (axis_i, pi) = open_ends[i];
+        let mut best: Option<(f64, usize, Vec2)> = None;
+        for (j, &(axis_j, pj)) in open_ends.iter().enumerate().skip(i + 1) {
+            if used_ends.get(j).copied().unwrap_or(true) || axis_i == axis_j {
+                continue;
+            }
+            let d = pi.dist(pj);
+            if d > 0.05 && d <= max_gap && best.as_ref().is_none_or(|(bd, ..)| d < *bd) {
+                best = Some((d, j, pj));
+            }
+        }
+        if let Some((_, j, pj)) = best {
+            if let Some(u) = used_ends.get_mut(i) {
+                *u = true;
+            }
+            if let Some(u) = used_ends.get_mut(j) {
+                *u = true;
+            }
+            closures.push(Axis { from: pi, to: pj, thickness: 0.0 });
+        }
+    }
+
+    // 2. Connect remaining open ends to nearby wall lines
+    for (i, &(axis_i, pi)) in open_ends.iter().enumerate() {
+        if used_ends.get(i).copied().unwrap_or(true) {
+            continue;
+        }
+        let mut best_wall: Option<(f64, Vec2)> = None;
+        for (j, aj) in axes.iter().enumerate() {
+            if j == axis_i {
+                continue;
+            }
+            let dj = aj.to - aj.from;
+            let len_j = dj.len();
+            if len_j > 0.05 {
+                let uj = dj / len_j;
+                let t = (pi - aj.from).dot(uj);
+                if t >= 0.05 && t <= len_j - 0.05 {
+                    let proj = aj.from + uj * t;
+                    let d = pi.dist(proj);
+                    if d > 0.05 && d <= max_gap && best_wall.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                        best_wall = Some((d, proj));
+                    }
+                }
+            }
+        }
+        if let Some((_, proj)) = best_wall {
+            if let Some(u) = used_ends.get_mut(i) {
+                *u = true;
+            }
+            closures.push(Axis { from: pi, to: proj, thickness: 0.0 });
+        }
+    }
+
+    axes.extend(closures);
+}
+
+/// Prune degree-1 antenna / dead-end segments from centerline axes before tracing.
+pub fn prune_degree_one_axes(axes: &mut Vec<Axis>) {
+    let eps = 0.35;
+    loop {
+        let n = axes.len();
+        if n <= 3 {
+            break;
+        }
+        let to_remove: Vec<bool> = (0..n)
+            .map(|i| {
+                let Some(ai) = axes.get(i) else { return false };
+                let from_connected = is_connected_to_any(ai.from, i, axes, eps);
+                let to_connected = is_connected_to_any(ai.to, i, axes, eps);
+                !from_connected || !to_connected
+            })
+            .collect();
+        if !to_remove.iter().any(|&r| r) {
+            break;
+        }
+
+        let mut idx = 0;
+        axes.retain(|_| {
+            let keep = !to_remove.get(idx).copied().unwrap_or(false);
+            idx += 1;
+            keep
+        });
+    }
 }
 
 /// The zone a traced loop describes, or `None` when the loop is not a room: fewer than three
@@ -353,7 +773,7 @@ mod tests {
     use crate::bim::walls::Wall;
 
     fn wall(from: [f64; 2], to: [f64; 2], thickness: f64) -> Wall {
-        Wall { from, to, thickness, base_z: 0.1, height: 2.8, exterior: false }
+        Wall { from, to, thickness, base_z: 0.1, height: 2.8, exterior: false, is_parapet: false }
     }
 
     /// A 6 × 6 m floor with one cross wall in each direction, so four rooms of 2.8 × 2.8 m once
@@ -528,7 +948,7 @@ mod tests {
         walls.push(wall([0.0, 0.0], [0.0, 0.0], 0.2));
         walls.push(wall([0.0, 0.0], [1.0, 0.0], -0.2));
         walls.push(wall([0.0, 0.0], [1.0, 0.0], f64::INFINITY));
-        walls.push(Wall { from: [0.0, 0.0], to: [1.0, 0.0], thickness: 0.2, base_z: f64::NAN, height: f64::NAN, exterior: false });
+        walls.push(Wall { from: [0.0, 0.0], to: [1.0, 0.0], thickness: 0.2, base_z: f64::NAN, height: f64::NAN, exterior: false, is_parapet: false });
         let zones = build(&walls, &BimOptions::default()).expect("the room still stands");
         assert_eq!(zones.len(), 1, "the unusable walls neither add a zone nor remove the room");
         assert!(zones[0].ring.len() >= 4, "the room is a quadrilateral, not a sliver");
@@ -569,5 +989,93 @@ mod tests {
             vec![(1_500_000, 1_500_000), (1_500_000, 4_500_000), (4_500_000, 1_500_000), (4_500_000, 4_500_000)],
             "sorted by centroid x, then y"
         );
+    }
+
+    #[test]
+    fn t_junction_splitting_and_dead_end_antenna_pruning() {
+        let t = 0.20;
+        let walls = vec![
+            // Outer 6 x 4 rectangle
+            wall([0.0, 0.0], [6.0, 0.0], t),
+            wall([6.0, 0.0], [6.0, 4.0], t),
+            wall([6.0, 4.0], [0.0, 4.0], t),
+            wall([0.0, 4.0], [0.0, 0.0], t),
+            // T-junction dividing wall from (3.0, 0.15) to (3.0, 3.85) (gap of 0.15 m <= 0.35 m at each end)
+            wall([3.0, 0.15], [3.0, 3.85], t),
+        ];
+
+        let zones = build(&walls, &BimOptions::default()).expect("zones should build");
+        assert_eq!(zones.len(), 2, "T-junction dividing wall splits the room into 2 zones");
+        for z in &zones {
+            assert!(ring_is_closed(&z.ring) && ring_is_simple(&z.ring));
+            assert!((z.area - (2.8 * 3.8)).abs() < 0.2, "each room is ~2.8 x 3.6 m, got {}", z.area);
+        }
+    }
+
+    #[test]
+    fn doorway_closure_bridges_gap_into_closed_zone() {
+        let t = 0.20;
+        // A 4x4 room with an open doorway of 0.90m in the bottom wall (from x=1.55 to x=2.45)
+        let walls = vec![
+            wall([0.0, 0.0], [1.55, 0.0], t),
+            wall([2.45, 0.0], [4.0, 0.0], t),
+            wall([4.0, 0.0], [4.0, 4.0], t),
+            wall([4.0, 4.0], [0.0, 4.0], t),
+            wall([0.0, 4.0], [0.0, 0.0], t),
+        ];
+
+        let zones = build(&walls, &BimOptions::default()).expect("zones should bridge doorway");
+        assert_eq!(zones.len(), 1, "doorway of 0.90m is bridged into a closed room");
+        assert!(ring_is_closed(&zones[0].ring));
+        assert!((zones[0].area - (3.8 * 3.8)).abs() < 0.3, "room area is preserved: {}", zones[0].area);
+    }
+
+    #[test]
+    fn degree_one_dead_end_pruning_removes_antennas_and_isolated_segments() {
+        use super::{Axis, prune_degree_one_axes};
+        use cadcraft_geom::Vec2;
+
+        let mut axes = vec![
+            // Closed 4 x 4 loop (edges 0..4)
+            Axis::new(Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), 0.20),
+            Axis::new(Vec2::new(4.0, 0.0), Vec2::new(4.0, 4.0), 0.20),
+            Axis::new(Vec2::new(4.0, 4.0), Vec2::new(0.0, 4.0), 0.20),
+            Axis::new(Vec2::new(0.0, 4.0), Vec2::new(0.0, 0.0), 0.20),
+            // Antenna 1: single spur connected at (0.0, 2.0) sticking into room to (1.5, 2.0)
+            Axis::new(Vec2::new(0.0, 2.0), Vec2::new(1.5, 2.0), 0.20),
+            // Antenna 2: 2-segment chain connected at (4.0, 2.0) sticking outside
+            Axis::new(Vec2::new(4.0, 2.0), Vec2::new(5.0, 2.0), 0.20),
+            Axis::new(Vec2::new(5.0, 2.0), Vec2::new(6.0, 2.0), 0.20),
+            // Isolated segment not connected to anything
+            Axis::new(Vec2::new(10.0, 10.0), Vec2::new(12.0, 10.0), 0.20),
+        ];
+
+        prune_degree_one_axes(&mut axes);
+        assert_eq!(axes.len(), 4, "all antennas and isolated segments pruned, only 4 walls of closed loop remain");
+        // Verify only original 4 walls remain
+        for a in &axes {
+            assert!(a.from.x >= 0.0 && a.from.x <= 4.0 && a.from.y >= 0.0 && a.from.y <= 4.0);
+            assert!(a.to.x >= 0.0 && a.to.x <= 4.0 && a.to.y >= 0.0 && a.to.y <= 4.0);
+        }
+    }
+
+    #[test]
+    fn structural_only_filtering_ignores_parapets_and_furniture() {
+        let t = 0.20;
+        let walls = vec![
+            // Full-height 4 x 4 room (height = 2.80 m)
+            wall([0.0, 0.0], [4.0, 0.0], t),
+            wall([4.0, 0.0], [4.0, 4.0], t),
+            wall([4.0, 4.0], [0.0, 4.0], t),
+            wall([0.0, 4.0], [0.0, 0.0], t),
+            // Parapet wall (is_parapet: true, height: 1.0 m)
+            Wall { from: [1.0, 1.0], to: [3.0, 1.0], thickness: 0.20, base_z: 0.0, height: 1.0, exterior: false, is_parapet: true },
+            // Partial-height furniture / low wall (is_parapet: false, height: 1.2 m < 2.8 * 0.75 = 2.1 m)
+            Wall { from: [2.0, 1.0], to: [2.0, 3.0], thickness: 0.20, base_z: 0.0, height: 1.20, exterior: false, is_parapet: false },
+        ];
+
+        let zones = build(&walls, &BimOptions::default()).expect("zones should build");
+        assert_eq!(zones.len(), 1, "parapet and low furniture are filtered out; only 1 full room zone traced");
+        assert!((zones[0].area - (3.8 * 3.8)).abs() < 0.2, "room area is ~14.4 m2: {}", zones[0].area);
     }
 }

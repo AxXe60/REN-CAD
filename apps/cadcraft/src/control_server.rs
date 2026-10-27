@@ -43,7 +43,7 @@ impl Default for Limits {
             queue: 64,
             idle_timeout: Duration::from_secs(600),
             write_timeout: Duration::from_secs(30),
-            reply_timeout: Duration::from_secs(60),
+            reply_timeout: Duration::from_secs(180),
         }
     }
 }

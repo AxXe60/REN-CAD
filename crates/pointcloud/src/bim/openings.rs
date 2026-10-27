@@ -296,7 +296,6 @@ pub fn detect(points: &[[f64; 3]], wall: &Wall, wall_index: usize, opts: &BimOpt
         let mut region_max_z = 0usize;
         let mut touches_left = false;
         let mut touches_right = false;
-        let mut touches_top = false;
 
         stack.push(seed as u32);
         if let Some(v) = visited.get_mut(seed) {
@@ -328,9 +327,6 @@ pub fn detect(points: &[[f64; 3]], wall: &Wall, wall_index: usize, opts: &BimOpt
             if cx + 1 >= w {
                 touches_right = true;
             }
-            if cy + 1 >= h {
-                touches_top = true;
-            }
 
             // 4-neighbour expansion.
             for (nx2, ny2) in [(cx.wrapping_sub(1), cy), (cx + 1, cy), (cx, cy.wrapping_sub(1)), (cx, cy + 1)] {
@@ -353,9 +349,9 @@ pub fn detect(points: &[[f64; 3]], wall: &Wall, wall_index: usize, opts: &BimOpt
             continue;
         }
 
-        // Step 8: reject candidates that touch wall ends or the top edge, or whose width is
-        // outside the accepted range. *(ours for the numbers, paper for the tests)*
-        if touches_left || touches_right || touches_top {
+        // Step 8: reject candidates that span the entire wall length (unpopulated wall)
+        // or whose width is outside the accepted range.
+        if touches_left && touches_right {
             continue;
         }
 
@@ -433,7 +429,7 @@ mod tests {
     use crate::bim::BimOptions;
 
     fn wall() -> Wall {
-        Wall { from: [0.0, 0.0], to: [4.0, 0.0], thickness: 0.20, base_z: 0.0, height: 3.0, exterior: false }
+        Wall { from: [0.0, 0.0], to: [4.0, 0.0], thickness: 0.20, base_z: 0.0, height: 3.0, exterior: false, is_parapet: false }
     }
 
     /// Points on both faces of the wall, on a 2 cm grid, skipping the two holes.

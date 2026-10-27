@@ -60,7 +60,7 @@ bar is the survey workflow: open the scan, cut it, look at it, trace it, export 
 | M25 | **The cloud belongs to the drawing**: `LASOPEN {attach}` / `LASATTACH` — the drawing *refers* to the scan (the LAS file, the band, the grid, the colour mode and where the scan sits in the drawing) in an `XRECORD` of the named object dictionary; the file keeps no points and the scan is loaded from the disk when the file is opened (done) | done |
 | M26 | The scan that is not on this computer: a relative path beside the drawing, the search in the folders the survey uses, and the choice to look for it by hand (≈ 4–6 h) | planned |
 | M23 | The comparison grown up: a coarse-to-fine registration (ICP) before the comparison, and the least-square local plane instead of the plain nearest point — the two refinements the comparison literature measures (≈ 8–14 h) | planned |
-| M24 | The scan-to-BIM parts that need no learning — `AUTORLV` / `AUTO3D` run the Cloud2BIM stages: slabs from the vertical histogram, the storeys between them, the walls from a horizontal slice with parallel-face pairing, the closed room zones with the schedule, the opening search in every wall, the cloud-to-model deviation with its furniture clusters, and a self-checked IFC 4 STEP export. Automatic dimensions remain | ≈ 80% (all stages but automatic dimensions done) |
+| M24 | The scan-to-BIM parts that need no learning — `AUTORLV` / `AUTO3D` run the full Cloud2BIM pipeline: slabs with inner hole/void detection, storeys, walls from parallel-face slice, closed room zones with schedule, wall openings (doors/windows), cloud-to-model deviation with furniture clusters, automatic aligned room dimensions on `RLV_DIMS`, and self-checked IFC 4 STEP export | done |
 | M11 | The 3D strokes as real drawing entities — waits for the 3D kernel, so the upstream's own 3D milestone is the blocker | planned |
 | M13 | A height/DSM grid over the band, with contours (≈ 12–18 h) | planned |
 | M14 | A local cache of the decimated pyramid next to the scan, so a 1.8 GB survey opens in a second the second time (≈ 6–10 h) | planned |
@@ -146,6 +146,7 @@ AutoLISP surface, AI features with openly licensed local models, and every remai
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-26 | minor | M24: scan-to-BIM Plan C landed — P12 slab holes / voids and P13 automatic room dimensions on `RLV_DIMS`; `notAvailable` now empty; M24 complete |
 | 2026-10-25 | minor | M24: scan-to-BIM Plan B landed — openings from each wall's elevation raster, cloud-to-model deviation with furniture clusters on `RLV_FURNITURE`, and a self-checked IFC 4 STEP export through `ifc`; automatic dimensions remain |
 | 2026-10-25 | minor | M24: scan-to-BIM Plan A landed — `AUTORLV` and `AUTO3D` now run the Cloud2BIM stages (slabs, storeys, walls, zones) instead of a bounding-box fake; openings, deviation and IFC are Plan B |
 | 2026-10-12 | minor | Block Editor for static blocks landed: "Use blocks" evidence updated; status and hours unchanged (REFEDIT and dynamic blocks remain) |

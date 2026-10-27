@@ -86,8 +86,8 @@ mod tests {
     fn two_slabs_at(floor_z: f64, ceiling_z: f64) -> Vec<Slab> {
         let t = BimOptions::default().single_sided_slab_thickness;
         vec![
-            Slab { base_z: floor_z - t, top_z: floor_z, thickness: t, polygon: Vec::new(), single_sided: true },
-            Slab { base_z: ceiling_z, top_z: ceiling_z + t, thickness: t, polygon: Vec::new(), single_sided: true },
+            Slab { base_z: floor_z - t, top_z: floor_z, thickness: t, polygon: Vec::new(), holes: Vec::new(), single_sided: true },
+            Slab { base_z: ceiling_z, top_z: ceiling_z + t, thickness: t, polygon: Vec::new(), holes: Vec::new(), single_sided: true },
         ]
     }
 
@@ -128,8 +128,8 @@ mod tests {
         let mut slabs = two_slabs_at(0.0, 3.0);
         // A third slab whose underside touches the ceiling slab's top: the void between them is
         // 3.2 .. 3.2 before the margin and 3.3 .. 3.1 after it, i.e. inside itself.
-        slabs.push(Slab { base_z: 3.2, top_z: 3.35, thickness: 0.15, polygon: Vec::new(), single_sided: false });
-        slabs.push(Slab { base_z: 6.0, top_z: 6.3, thickness: 0.3, polygon: Vec::new(), single_sided: false });
+        slabs.push(Slab { base_z: 3.2, top_z: 3.35, thickness: 0.15, polygon: Vec::new(), holes: Vec::new(), single_sided: false });
+        slabs.push(Slab { base_z: 6.0, top_z: 6.3, thickness: 0.3, polygon: Vec::new(), holes: Vec::new(), single_sided: false });
         let storeys = split(&slabs, &BimOptions::default());
         assert_eq!(storeys.len(), 2, "the squeezed void is not a room and is not listed");
         assert_eq!(storeys.iter().map(|s| s.index).collect::<Vec<_>>(), vec![0, 1], "and the numbering does not gap over it");

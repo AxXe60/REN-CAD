@@ -281,7 +281,7 @@ fn headless_with_room_scan() -> Headless {
         }
         i += 1;
     }
-    let levels = [0.1, 0.9, 1.7, 2.45, 2.55, 2.65];
+    let levels = [0.1, 0.5, 0.9, 1.3, 1.7, 2.1, 2.45, 2.55, 2.65];
     let mut k = 0;
     while k <= 300 {
         let t = -0.01 + 0.02 * f64::from(k);
@@ -342,11 +342,14 @@ fn rencad_mcp_tools_execute_end_to_end() {
 
     let rlv = tool(&mut s, "pointcloud_rlv", json!({"index": 0}));
     assert_eq!(rlv["walls"].as_u64(), Some(5), "four room sides and the partition, not a bounding box: {rlv}");
+    assert!(rlv["columns"].as_u64().is_some(), "{rlv}");
+    assert!(rlv["parapets"].as_u64().is_some(), "{rlv}");
     assert_eq!(rlv["zones"].as_u64(), Some(2), "the partition splits the room in two: {rlv}");
     assert_eq!(rlv["slabs"].as_u64(), Some(2), "floor and ceiling: {rlv}");
     assert_eq!(rlv["rooms"].as_array().map(Vec::len), Some(2), "{rlv}");
     assert!(rlv["totalUsableAreaM2"].as_f64().unwrap_or(0.0) > 15.0, "{rlv}");
-    assert_eq!(rlv["notAvailable"], json!(["dimensions"]), "{rlv}");
+    assert_eq!(rlv["notAvailable"], json!([]), "{rlv}");
+    assert!(rlv["dimensions"].as_u64().unwrap_or(0) > 0, "{rlv}");
     assert!(rlv["openings"]["count"].as_u64().is_some(), "the wall search reports: {rlv}");
     assert!(rlv["deviation"]["rmseMm"].as_f64().is_some(), "the deviation is measured: {rlv}");
     assert_eq!(rlv["drawn"]["walls"].as_u64(), rlv["walls"].as_u64(), "{rlv}");
@@ -357,8 +360,10 @@ fn rencad_mcp_tools_execute_end_to_end() {
 
     let b3d = tool(&mut s, "pointcloud_auto3d", json!({"index": 0}));
     assert_eq!(b3d["walls3d"].as_u64(), Some(5), "the same five walls, extruded: {b3d}");
+    assert!(b3d["columns"].as_u64().is_some(), "{b3d}");
+    assert!(b3d["parapets"].as_u64().is_some(), "{b3d}");
     assert_eq!(b3d["slabs"].as_u64(), Some(2), "{b3d}");
-    assert_eq!(b3d["notAvailable"], json!(["dimensions"]), "{b3d}");
+    assert_eq!(b3d["notAvailable"], json!([]), "{b3d}");
 
     let cls = tool(&mut s, "pointcloud_classify", json!({}));
     assert!(cls["vectorized"]["fences"].as_u64().unwrap_or(0) >= 1, "{cls}");

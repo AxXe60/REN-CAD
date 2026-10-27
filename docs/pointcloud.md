@@ -797,13 +797,14 @@ the value is this fork's and is labelled so in `BimOptions`
 (`crates/pointcloud/src/bim/mod.rs`). The commands model **slabs, storeys, walls and rooms**, detect
 **openings** in every wall, measure the **cloud-to-model deviation** and route what the model cannot
 explain to `RLV_FURNITURE`, and `AUTORLV` writes an **IFC 4 STEP** file when `ifc` names a path.
-Automatic dimensions are the one stage still to come, and the reply says so in `notAvailable`.
+All stages are fully functional: automatic dimensions are placed on `RLV_DIMS`, slab holes are carried, and `notAvailable` is empty.
 
 ### The stages
 
 | Stage | Module | What it does |
 |---|---|---|
-| slabs | `bim/raster.rs`, `bim/slabs.rs` | A 5 cm vertical histogram of the band. A run of bins at least half as tall as the tallest is a slab candidate; a single below-cut bin with candidates on both sides joins the run, so the trough inside a rough floor is not read as two faces; neighbouring runs are paired into one slab a storey apart, and a lone face is thickened by `single_sided_slab_thickness`. The plan comes from a 5 cm density mask. |
+| slabs | `bim/raster.rs`, `bim/slabs.rs` | A 5 cm vertical histogram of the band. A run of bins at least half as tall as the tallest is a slab candidate; a single below-cut bin with candidates on both sides joins the run, so the trough inside a rough floor is not read as two faces; neighbouring runs are paired into one slab a storey apart, and a lone face is thickened by `single_sided_slab_thickness`. The plan comes from a 5 cm density mask, carrying outer contours and inner void `holes` (e.g. stairwells). |
+| dimensions | `bim/dimensions.rs` | Aligned interior room dimensions along inner zone walls, offset inward 0.25 m towards the room centroid, filtered by `min_wall_length` and drawn on `RLV_DIMS`. |
 | storeys | `bim/storeys.rs` | The band between one slab's top and the next slab's base, each face pulled back by `safety_margin` (0.10 m) so floor and ceiling points cannot enter a wall slice. |
 | walls | `bim/walls.rs` | A horizontal slice at 0.9–1.0 of the storey's clear height, a 5 cm density mask at `threshold`, closing with radius `close_radius` cells, contours simplified by `epsilon` (never finer than one cell, because a 45° face cannot be placed more precisely than the lattice) and `angle_tolerance`, collinear pieces joined, then **parallel faces paired** 0.06–0.60 m apart into one wall axis with its thickness. A lone face on the outer contour becomes an exterior wall of `exterior_wall_thickness`, set half a thickness outside the face; a lone face inside the building (a courtyard) is never thickened. |
 | zones | `bim/zones.rs` | Axis ends snapped onto other walls within `zone_gap`, each wall body laid out as the rectangle it occupies, probes 1 mm outside each face at seven stations, and the rectangle soup traced into closed rings; rings below `min_zone_area` are dropped. |
@@ -814,8 +815,8 @@ Automatic dimensions are the one stage still to come, and the reply says so in `
 `extract_auto_rlv` returns `AutoRlvResult`: per storey a `StoreyModel` with its walls and zones, the
 slabs, and one `RoomScheduleRow` per closed room (code `E01`…, name `Spațiu`, usable area in m²,
 perimeter in m, clear height). `AUTORLV` then detects the openings wall by wall, measures the cloud
-against the model, and draws `RLV_WALLS` wall axes, `RLV_ZONES` room rings, `RLV_SLABS` slab plans,
-`RLV_OPENINGS` two jamb lines per opening, `RLV_FURNITURE` one plan rectangle per deviation cluster,
+against the model, and draws `RLV_WALLS` wall axes, `RLV_ZONES` room rings, `RLV_SLABS` slab plans and hole outlines,
+`RLV_OPENINGS` two jamb lines per opening, `RLV_DIMS` aligned room dimensions, `RLV_FURNITURE` one plan rectangle per deviation cluster,
 and the schedule text on `RLV_SCHEDULE`. `AUTO3D` reads the same model and extrudes each wall axis
 into two face planes; it adds no roof, because a roof is a slab the stage found above the top storey,
 not an invention.
@@ -928,10 +929,10 @@ deviation (measured in a scratch harness on 6.0 M points; the app holds 5,826,74
 price of reading every wall's elevation and testing every point against the model; the modelling
 stages alone still take 0.50 s.
 
-### What the commands do not do yet
+### Completeness of the pipeline
 
-- **Automatic dimensions** are not placed; `RLV_DIMS` stays empty and the reply lists `dimensions`
-  in `notAvailable`.
+- **All scan-to-BIM Plan A, B, and C stages are implemented**: slabs with holes, storeys, walls, room zones, schedule, wall openings, cloud-to-model deviation with furniture clusters, aligned room dimensions on `RLV_DIMS`, and self-checked IFC 4 STEP export. `notAvailable` is empty.
+
 
 Everything else is computed, not promised. The IFC file is text this repository writes from the
 public ISO 10303-21 encoding and the IFC 4 attribute tables, and its entity graph is checked by this

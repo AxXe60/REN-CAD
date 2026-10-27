@@ -7,7 +7,9 @@
 //! The numbers come from the design doc §5: Table 6 of the paper is adopted verbatim, and where
 //! the paper is silent or contradicts itself the choice is ours and is labelled as ours.
 
+pub mod columns;
 pub mod deviate;
+pub mod dimensions;
 pub mod ifc;
 pub mod openings;
 pub mod raster;
@@ -16,7 +18,9 @@ pub mod storeys;
 pub mod walls;
 pub mod zones;
 
+pub use columns::{Column, ColumnShape, detect_columns};
 pub use deviate::{DeviationReport, FurnitureCluster, measure as measure_deviation};
+pub use dimensions::{AutoDimension, generate_dimensions};
 pub use ifc::{Building as IfcBuilding, BuildingStorey as IfcStorey, IfcCheck, check as check_ifc, write as write_ifc};
 pub use openings::{Opening, OpeningKind, band as opening_band, detect as detect_openings, detect_all as detect_all_openings};
 pub use raster::{Contour, MAX_RASTER_CELLS, Raster, close, contours, mask};
@@ -136,6 +140,13 @@ pub struct BimOptions {
     pub min_furniture_points: usize,
     /// *(ours)* the most furniture clusters one report may hold; past it the stage refuses.
     pub max_furniture_clusters: usize,
+    // --- Plan B: columns ---
+    /// *(ours)* the smallest structural column cross-section dimension accepted, in metres.
+    pub min_column_size: f64,
+    /// *(ours)* the largest structural column cross-section dimension accepted, in metres.
+    pub max_column_size: f64,
+    /// *(ours)* the maximum cross-section aspect ratio (width / depth) accepted for columns.
+    pub max_column_aspect_ratio: f64,
 }
 
 impl Default for BimOptions {
@@ -174,6 +185,9 @@ impl Default for BimOptions {
             deviation_cell: 0.10,
             min_furniture_points: 50,
             max_furniture_clusters: 4_096,
+            min_column_size: 0.15,
+            max_column_size: 1.00,
+            max_column_aspect_ratio: 2.50,
         }
     }
 }
@@ -292,6 +306,16 @@ impl BimOptions {
         }
         if let Some(v) = count_up_to(params, "max_furniture_clusters", "furniture cluster budget", MAX_FURNITURE_CLUSTERS)? {
             o.max_furniture_clusters = v;
+        }
+        // Plan B: columns.
+        if let Some(v) = positive(params, "min_column_size")? {
+            o.min_column_size = v;
+        }
+        if let Some(v) = positive(params, "max_column_size")? {
+            o.max_column_size = v;
+        }
+        if let Some(v) = positive(params, "max_column_aspect_ratio")? {
+            o.max_column_aspect_ratio = v;
         }
         Ok(o)
     }
@@ -443,6 +467,7 @@ mod tests {
         assert_eq!(o.deviation_threshold, 0.05);
         assert_eq!(o.deviation_cell, 0.10);
         assert_eq!((o.min_furniture_points, o.max_furniture_clusters), (50, 4_096));
+        assert_eq!((o.min_column_size, o.max_column_size, o.max_column_aspect_ratio), (0.15, 1.00, 2.50));
     }
 
     #[test]

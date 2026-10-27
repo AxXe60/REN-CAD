@@ -8,12 +8,13 @@
 
 use std::path::Path;
 
-use cadcraft_doc::{Common, EntityKind, HAlign, Space, Text, VAlign};
+use cadcraft_doc::{Common, DimKind, EntityKind, HAlign, Space, Text, VAlign};
 use cadcraft_geom::{PolyVertex, Vec2, Vec3};
-use cadcraft_pointcloud::bim::{deviate, ifc, openings};
+use cadcraft_pointcloud::bim::{deviate, dimensions, ifc, openings};
 use cadcraft_pointcloud::{AutoRlvResult, BimOptions, StoreyModel, slice_bands_capped};
 use serde_json::{Value, json};
 
+use super::annotate::dim;
 use super::helpers::{circle, line, lwpoly};
 use super::*;
 
@@ -26,11 +27,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .noundo(),
         CommandSpec::new("autorlv", "Auto-RLV 2D & Room Schedule from Point Cloud", autorlv)
             .menu(&["Tools", "Point Cloud & RLV", "Auto-RLV 2D (Apartment Releveu)"])
-            .params("{index?: int, ifc?: string, params?: {cell?, z_step?, slab_ratio?, slice_from?, slice_to?, threshold?, close_radius?, epsilon?, safety_margin?, single_sided_slab_thickness?, min_wall_length?, min_wall_thickness?, max_wall_thickness?, angle_tolerance_deg?, exterior_wall_thickness?, exterior_scan?, zone_gap?, min_zone_area?, opening_cell?, opening_threshold?, opening_rank?, min_opening_width?, max_opening_width?, door_min_height?, door_max_sill?, window_min_sill?, opening_band?, opening_decimate?, max_wall_band_points?, deviation_threshold?, deviation_cell?, min_furniture_points?, max_furniture_clusters?}}")
+            .params("{index?: int, ifc?: string, params?: {cell?, z_step?, slab_ratio?, slice_from?, slice_to?, threshold?, close_radius?, epsilon?, safety_margin?, single_sided_slab_thickness?, min_wall_length?, min_wall_thickness?, max_wall_thickness?, angle_tolerance_deg?, exterior_wall_thickness?, exterior_scan?, zone_gap?, min_zone_area?, opening_cell?, opening_threshold?, opening_rank?, min_opening_width?, max_opening_width?, door_min_height?, door_max_sill?, window_min_sill?, opening_band?, opening_decimate?, max_wall_band_points?, deviation_threshold?, deviation_cell?, min_furniture_points?, max_furniture_clusters?, min_column_size?, max_column_size?, max_column_aspect_ratio?}}")
             .enabled(always),
         CommandSpec::new("auto3d", "Auto-3D Building Structure from Point Cloud", auto3d)
             .menu(&["Tools", "Point Cloud & RLV", "Auto-3D Building (Walls, Slabs)"])
-            .params("{index?: int, ifc?: string, params?: {cell?, z_step?, slab_ratio?, slice_from?, slice_to?, threshold?, close_radius?, epsilon?, safety_margin?, single_sided_slab_thickness?, min_wall_length?, min_wall_thickness?, max_wall_thickness?, angle_tolerance_deg?, exterior_wall_thickness?, exterior_scan?, zone_gap?, min_zone_area?, opening_cell?, opening_threshold?, opening_rank?, min_opening_width?, max_opening_width?, door_min_height?, door_max_sill?, window_min_sill?, opening_band?, opening_decimate?, max_wall_band_points?}}")
+            .params("{index?: int, ifc?: string, params?: {cell?, z_step?, slab_ratio?, slice_from?, slice_to?, threshold?, close_radius?, epsilon?, safety_margin?, single_sided_slab_thickness?, min_wall_length?, min_wall_thickness?, max_wall_thickness?, angle_tolerance_deg?, exterior_wall_thickness?, exterior_scan?, zone_gap?, min_zone_area?, opening_cell?, opening_threshold?, opening_rank?, min_opening_width?, max_opening_width?, door_min_height?, door_max_sill?, window_min_sill?, opening_band?, opening_decimate?, max_wall_band_points?, min_column_size?, max_column_size?, max_column_aspect_ratio?}}")
             .enabled(always),
         CommandSpec::new("autovectorize", "AI Classify & Vectorize Topography", autovectorize)
             .menu(&["Tools", "Point Cloud & RLV", "AI Classify & Vectorize (Buildings, Fences, Poles, Roads, Ditches)"])
@@ -178,6 +179,10 @@ fn cloud_path_for_model(s: &Session, p: &Value) -> Result<String> {
 fn storey_openings(path: &str, storeys: &[StoreyModel], opts: &BimOptions) -> Vec<Vec<openings::Opening>> {
     let mut out = Vec::with_capacity(storeys.len());
     for model in storeys {
+        if !model.openings.is_empty() {
+            out.push(model.openings.clone());
+            continue;
+        }
         if path.is_empty() {
             out.push(Vec::new());
             continue;
@@ -298,6 +303,7 @@ fn building_from_rlv(rlv: &AutoRlvResult, per_storey: &[Vec<openings::Opening>])
                 slabs,
                 zones: model.zones.clone(),
                 openings: per_storey.get(i).cloned().unwrap_or_default(),
+                columns: model.columns.clone(),
             }
         })
         .collect();
@@ -396,6 +402,35 @@ fn autorlv(s: &mut Session, p: &Value) -> Result<Value> {
         }));
     }
 
+    let mut col_handles = Vec::new();
+    for model in &rlv.storeys {
+        for col in &model.columns {
+            match &col.shape {
+                cadcraft_pointcloud::bim::ColumnShape::Circular { diameter } => {
+                    let c = Vec2::new(col.center[0], col.center[1]);
+                    col_handles.push(add_on_layer(s, "RLV_COLUMNS", circle(c, diameter / 2.0))?);
+                }
+                cadcraft_pointcloud::bim::ColumnShape::Rectangular { width, depth, rotation_deg } => {
+                    let rad = rotation_deg.to_radians();
+                    let cos_a = rad.cos();
+                    let sin_a = rad.sin();
+                    let hw = width / 2.0;
+                    let hd = depth / 2.0;
+                    let corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]];
+                    let vs: Vec<PolyVertex> = corners
+                        .iter()
+                        .map(|[lx, ly]| {
+                            let gx = col.center[0] + lx * cos_a - ly * sin_a;
+                            let gy = col.center[1] + lx * sin_a + ly * cos_a;
+                            PolyVertex::new(Vec2::new(gx, gy))
+                        })
+                        .collect();
+                    col_handles.push(add_on_layer(s, "RLV_COLUMNS", lwpoly(vs, true))?);
+                }
+            }
+        }
+    }
+
     let mut slab_handles = Vec::new();
     let mut slabs_json = Vec::new();
     for slab in &rlv.slabs {
@@ -403,12 +438,19 @@ fn autorlv(s: &mut Session, p: &Value) -> Result<Value> {
             let vs: Vec<PolyVertex> = slab.polygon.iter().map(|pt| PolyVertex::new(Vec2::new(pt[0], pt[1]))).collect();
             slab_handles.push(add_on_layer(s, "RLV_SLABS", lwpoly(vs, true))?);
         }
+        for hole in &slab.holes {
+            if hole.len() >= 3 {
+                let hvs: Vec<PolyVertex> = hole.iter().map(|pt| PolyVertex::new(Vec2::new(pt[0], pt[1]))).collect();
+                slab_handles.push(add_on_layer(s, "RLV_SLABS", lwpoly(hvs, true))?);
+            }
+        }
         slabs_json.push(json!({
             "baseZ": slab.base_z,
             "topZ": slab.top_z,
             "thicknessM": slab.thickness,
             "singleSided": slab.single_sided,
             "vertices": slab.polygon.len(),
+            "holes": slab.holes.len(),
         }));
     }
 
@@ -416,6 +458,16 @@ fn autorlv(s: &mut Session, p: &Value) -> Result<Value> {
     let all_walls: Vec<cadcraft_pointcloud::bim::Wall> = rlv.storeys.iter().flat_map(|m| m.walls.iter().cloned()).collect();
     let dev = deviate::measure(&pts, &all_walls, &rlv.slabs, &opts).map_err(|e| EngineError::Other(format!("Deviation: {e}")))?;
     let furniture_rects = draw_furniture(s, &dev.furniture)?;
+
+    let auto_dims = dimensions::generate_dimensions(&rlv.storeys, &opts);
+    let mut dim_handles = Vec::new();
+    for d in &auto_dims {
+        let p1 = Vec2::new(d.p1[0], d.p1[1]);
+        let p2 = Vec2::new(d.p2[0], d.p2[1]);
+        let at = Vec2::new(d.at[0], d.at[1]);
+        let k = dim(s, DimKind::Aligned, at, p1, p2, Vec2::ZERO, "");
+        dim_handles.push(add_on_layer(s, "RLV_DIMS", k)?);
+    }
 
     let mut label_handles = Vec::new();
     for model in &rlv.storeys {
@@ -457,9 +509,12 @@ fn autorlv(s: &mut Session, p: &Value) -> Result<Value> {
         "walls": rlv.walls(),
         "zones": rlv.zones(),
         "slabs": rlv.slabs.len(),
+        "columns": rlv.columns(),
+        "parapets": rlv.parapets(),
         "roomCount": rlv.rooms(),
         "totalUsableAreaM2": rlv.total_usable_area_m2,
         "totalPerimeterM": rlv.total_perimeter_m,
+        "dimensions": dim_handles.len(),
         "storeyDetails": storeys_json,
         "slabDetails": slabs_json,
         "rooms": rooms_json,
@@ -478,14 +533,17 @@ fn autorlv(s: &mut Session, p: &Value) -> Result<Value> {
             "aboveThreshold": dev.above_threshold,
             "furniture": dev.furniture.len(),
         },
-        "notAvailable": ["dimensions"],
+        "notAvailable": [],
         "drawn": {
             "walls": wall_handles.len(),
             "zones": zone_handles.len(),
             "slabs": slab_handles.len(),
+            "columns": col_handles.len(),
+            "parapets": rlv.parapets(),
             "openings": opening_lines,
             "furniture": furniture_rects,
             "labels": label_handles.len(),
+            "dimensions": dim_handles.len(),
         },
     });
     if let Some(ifc) = ifc_json {
@@ -528,6 +586,45 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
 
+    let mut col_count = 0usize;
+    for model in &rlv.storeys {
+        for col in &model.columns {
+            let z0 = col.base_z;
+            let z1 = col.base_z + col.height;
+            match &col.shape {
+                cadcraft_pointcloud::bim::ColumnShape::Circular { diameter } => {
+                    let r = diameter / 2.0;
+                    let segments = 16;
+                    for i in 0..segments {
+                        let a1 = (i as f64 * 360.0 / segments as f64).to_radians();
+                        let a2 = ((i + 1) as f64 * 360.0 / segments as f64).to_radians();
+                        let p1 = [col.center[0] + r * a1.cos(), col.center[1] + r * a1.sin()];
+                        let p2 = [col.center[0] + r * a2.cos(), col.center[1] + r * a2.sin()];
+                        let face = [[p1[0], p1[1], z0], [p2[0], p2[1], z0], [p2[0], p2[1], z1], [p1[0], p1[1], z1]];
+                        s.sketch.add(&face, "RLV_3D_COLUMNS", true);
+                    }
+                }
+                cadcraft_pointcloud::bim::ColumnShape::Rectangular { width, depth, rotation_deg } => {
+                    let rad = rotation_deg.to_radians();
+                    let cos_a = rad.cos();
+                    let sin_a = rad.sin();
+                    let hw = width / 2.0;
+                    let hd = depth / 2.0;
+                    let corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]];
+                    let world_pts: Vec<[f64; 2]> =
+                        corners.iter().map(|[lx, ly]| [col.center[0] + lx * cos_a - ly * sin_a, col.center[1] + lx * sin_a + ly * cos_a]).collect();
+                    for i in 0..4 {
+                        let p1 = world_pts[i];
+                        let p2 = world_pts[(i + 1) % 4];
+                        let face = [[p1[0], p1[1], z0], [p2[0], p2[1], z0], [p2[0], p2[1], z1], [p1[0], p1[1], z1]];
+                        s.sketch.add(&face, "RLV_3D_COLUMNS", true);
+                    }
+                }
+            }
+            col_count += 1;
+        }
+    }
+
     let mut slab_faces = 0usize;
     for (i, slab) in rlv.slabs.iter().enumerate() {
         if slab.polygon.len() < 3 {
@@ -538,6 +635,12 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
         let z = if i == 0 { slab.top_z } else { slab.base_z };
         let face: Vec<[f64; 3]> = slab.polygon.iter().map(|pt| [pt[0], pt[1], z]).collect();
         s.sketch.add(&face, "RLV_3D_SLABS", true);
+        for hole in &slab.holes {
+            if hole.len() >= 3 {
+                let hface: Vec<[f64; 3]> = hole.iter().map(|pt| [pt[0], pt[1], z]).collect();
+                s.sketch.add(&hface, "RLV_3D_SLABS", true);
+            }
+        }
         slab_faces += 1;
     }
 
@@ -556,6 +659,8 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
         "ceilingZ": rlv.ceiling_z,
         "walls3d": wall_planes,
         "slabs": slab_faces,
+        "columns": col_count,
+        "parapets": rlv.parapets(),
         "openings": {
             "count": opening_count,
             "doors": doors,
@@ -563,8 +668,8 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
             "perStorey": per_storey.iter().map(Vec::len).collect::<Vec<_>>(),
             "fineBands": if path.is_empty() { "unavailable" } else { "streamed" },
         },
-        "notAvailable": ["dimensions"],
-        "drawn": {"walls": wall_planes, "slabs": slab_faces},
+        "notAvailable": [],
+        "drawn": {"walls": wall_planes, "slabs": slab_faces, "columns": col_count, "parapets": rlv.parapets()},
     });
     if let Some(ifc) = ifc_json {
         reply["ifc"] = ifc;
@@ -1132,6 +1237,10 @@ mod tests {
         let reply = r.expect("the reply");
         assert_eq!(reply["walls"].as_u64(), Some(5), "the partition and four sides, not a fabricated six: {reply}");
         assert_eq!(reply["zones"].as_u64(), Some(2), "the partition splits the room in two: {reply}");
+        assert!(reply["columns"].as_u64().is_some());
+        assert!(reply["parapets"].as_u64().is_some());
+        assert_eq!(reply["drawn"]["columns"].as_u64(), reply["columns"].as_u64());
+        assert_eq!(reply["drawn"]["parapets"].as_u64(), reply["parapets"].as_u64());
         assert_eq!(reply["drawn"]["walls"].as_u64(), reply["walls"].as_u64(), "every found wall is drawn: {reply}");
         assert_eq!(reply["drawn"]["zones"].as_u64(), reply["zones"].as_u64(), "and every zone: {reply}");
         assert_eq!(count_on_layer(&s, "RLV_WALLS"), 5);
@@ -1143,7 +1252,9 @@ mod tests {
         assert_eq!(reply["openings"]["doors"].as_u64(), Some(1), "and it is a door, not a window: {reply}");
         assert_eq!(reply["openings"]["windows"].as_u64(), Some(0), "{reply}");
         assert!(reply["deviation"]["rmseMm"].as_f64().is_some_and(|v| v.is_finite()), "the scan is measured against the model: {reply}");
-        assert_eq!(reply["notAvailable"].as_array().map(Vec::len), Some(1), "dimensions alone are still to come: {reply}");
+        assert_eq!(reply["notAvailable"].as_array().map(Vec::len), Some(0), "all stages implemented: {reply}");
+        assert!(count_on_layer(&s, "RLV_DIMS") > 0, "dimensions are placed on RLV_DIMS: {reply}");
+        assert!(reply["drawn"]["dimensions"].as_u64().is_some_and(|n| n > 0), "drawn dimensions count reported: {reply}");
     }
 
     #[test]
@@ -1165,5 +1276,20 @@ mod tests {
         let r = s.execute("autorlv", &json!({}));
         assert!(r.is_err(), "no cloud, no model: {r:?}");
         assert_eq!(count_on_layer(&s, "RLV_WALLS"), 0, "and nothing is drawn from a fallback scan");
+    }
+
+    #[test]
+    fn auto3d_reconstructs_3d_faces_and_notavailable_is_empty() {
+        let mut s = session_with_room();
+        let r = s.execute("auto3d", &json!({"index": 0}));
+        assert!(r.is_ok(), "the 3d pipeline runs: {r:?}");
+        let reply = r.expect("the reply");
+        assert_eq!(reply["notAvailable"].as_array().map(Vec::len), Some(0));
+        assert!(reply["slabs"].as_u64().is_some_and(|n| n >= 2));
+        assert!(reply["walls3d"].as_u64().is_some_and(|n| n >= 5));
+        assert!(reply["columns"].as_u64().is_some());
+        assert!(reply["parapets"].as_u64().is_some());
+        assert!(reply["drawn"]["columns"].as_u64().is_some());
+        assert!(reply["drawn"]["parapets"].as_u64().is_some());
     }
 }

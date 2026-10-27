@@ -19,6 +19,7 @@
 //!   trailing `.` (e.g. `0.`, `4.`); non-finite values become `0.`.
 
 use crate::bim::BimError;
+use crate::bim::columns::{Column, ColumnShape};
 use crate::bim::openings::{Opening, OpeningKind};
 use crate::bim::slabs::Slab;
 use crate::bim::walls::Wall;
@@ -33,6 +34,7 @@ pub struct BuildingStorey {
     pub slabs: Vec<Slab>,
     pub zones: Vec<Zone>,
     pub openings: Vec<Opening>,
+    pub columns: Vec<Column>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -52,6 +54,7 @@ pub struct IfcCheck {
     pub openings: usize,
     pub doors: usize,
     pub windows: usize,
+    pub columns: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +392,23 @@ pub fn write(building: &Building) -> Result<String, BimError> {
             let slab_ent = w.entity("IFCSLAB", &format!("'{}',#{},{},$,$,#{},#{},$,{}", slab_guid, owner, slab_name, slab_place, pds, pred_type));
 
             sd.element_ids.push(slab_ent);
+
+            for (hi, hole) in slab.holes.iter().enumerate() {
+                let valid_hole: Vec<[f64; 2]> = hole.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).copied().collect();
+                if valid_hole.len() < 3 {
+                    continue;
+                }
+                let hole_place = write_element_placement(&mut w, storey_place, 0.0, 0.0, slab.base_z, 1.0, 0.0, 0.0, z_dir);
+                let (hole_shape, hole_pds) = write_element_body(&mut w, &valid_hole, slab.thickness, z_dir, body_ctx);
+                let hole_guid = w.next_guid();
+                let hole_name = step_string(&format!("Slab Opening {}", hi + 1));
+                let hole_ent = w.entity(
+                    "IFCOPENINGELEMENT",
+                    &format!("'{}',#{},{},{},#{},#{},$,.OPENING.", hole_guid, owner, hole_name, "$", hole_place, hole_pds),
+                );
+                sd.void_rels.push((slab_ent, hole_ent));
+                let _ = hole_shape;
+            }
             let _ = shape;
         }
 
@@ -519,6 +539,49 @@ pub fn write(building: &Building) -> Result<String, BimError> {
                 }
             }
             let _ = fill_shape;
+        }
+
+        // --- Columns ---
+        for (ci, column) in storey.columns.iter().enumerate() {
+            let col_name = step_string(&format!("Column {}", ci + 1));
+            let col_guid = w.next_guid();
+
+            let (col_place, profile) = match &column.shape {
+                ColumnShape::Circular { diameter } => {
+                    let place =
+                        write_element_placement(&mut w, storey_place, column.center[0], column.center[1], column.base_z, 1.0, 0.0, 0.0, z_dir);
+                    let p2d = w.entity("IFCCARTESIANPOINT", "(0.,0.)");
+                    let axis2d = w.entity("IFCAXIS2PLACEMENT2D", &format!("#{},$", p2d));
+                    let radius = fmt_real(*diameter / 2.0);
+                    let prof = w.entity("IFCCIRCLEPROFILEDEF", &format!(".AREA.,$,#{},{}", axis2d, radius));
+                    (place, prof)
+                }
+                ColumnShape::Rectangular { width, depth, rotation_deg } => {
+                    let rad = rotation_deg.to_radians();
+                    let (dx, dy) = (rad.cos(), rad.sin());
+                    let place = write_element_placement(&mut w, storey_place, column.center[0], column.center[1], column.base_z, dx, dy, 0.0, z_dir);
+                    let p2d = w.entity("IFCCARTESIANPOINT", "(0.,0.)");
+                    let axis2d = w.entity("IFCAXIS2PLACEMENT2D", &format!("#{},$", p2d));
+                    let x_dim = fmt_real(*width);
+                    let y_dim = fmt_real(*depth);
+                    let prof = w.entity("IFCRECTANGLEPROFILEDEF", &format!(".AREA.,$,#{},{},{}", axis2d, x_dim, y_dim));
+                    (place, prof)
+                }
+            };
+
+            // Axis for extrusion
+            let axis_origin = w.entity("IFCCARTESIANPOINT", "(0.,0.,0.)");
+            let axis_z = w.entity("IFCDIRECTION", "(0.,0.,1.)");
+            let axis_x = w.entity("IFCDIRECTION", "(1.,0.,0.)");
+            let axis_place = w.entity("IFCAXIS2PLACEMENT3D", &format!("#{},#{},#{}", axis_origin, axis_z, axis_x));
+
+            let solid = w.entity("IFCEXTRUDEDAREASOLID", &format!("#{},#{},#{},{}", profile, axis_place, z_dir, fmt_real(column.height)));
+            let shape = w.entity("IFCSHAPEREPRESENTATION", &format!("#{},'Body','SweptSolid',(#{})", body_ctx, solid));
+            let pds = w.entity("IFCPRODUCTDEFINITIONSHAPE", &format!("$,$,(#{})", shape));
+
+            let col_ent = w.entity("IFCCOLUMN", &format!("'{}',#{},{},$,$,#{},#{},$,.COLUMN.", col_guid, owner, col_name, col_place, pds));
+
+            sd.element_ids.push(col_ent);
         }
 
         storey_data.push(sd);
@@ -755,6 +818,7 @@ pub fn check(step: &str) -> Result<IfcCheck, BimError> {
                 check.windows += 1;
                 door_window_count += 1;
             }
+            "IFCCOLUMN" => check.columns += 1,
             "IFCRELVOIDSELEMENT" => has_void_rel = true,
             "IFCRELFILLSELEMENT" => fill_rel_count += 1,
             _ => {}
@@ -820,13 +884,14 @@ pub fn check(step: &str) -> Result<IfcCheck, BimError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bim::columns::{Column, ColumnShape};
     use crate::bim::openings::{Opening, OpeningKind};
     use crate::bim::slabs::Slab;
     use crate::bim::walls::Wall;
     use crate::bim::zones::Zone;
 
     fn fixture() -> Building {
-        let wall = |from: [f64; 2], to: [f64; 2]| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true };
+        let wall = |from: [f64; 2], to: [f64; 2]| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true, is_parapet: false };
         Building {
             name: "Fixture".to_string(),
             timestamp: 1_761_350_400,
@@ -840,6 +905,7 @@ mod tests {
                     top_z: 0.0,
                     thickness: 0.2,
                     polygon: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]],
+                    holes: Vec::new(),
                     single_sided: true,
                 }],
                 zones: vec![Zone { ring: vec![[0.1, 0.1], [3.9, 0.1], [3.9, 3.9], [0.1, 3.9]], area: 14.44, perimeter: 15.2 }],
@@ -852,6 +918,7 @@ mod tests {
                     sill_z: 0.0,
                     head_z: 2.1,
                 }],
+                columns: Vec::new(),
             }],
         }
     }
@@ -897,7 +964,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn hostile_geometry_is_skipped_not_fatal() {
-        let wall = |from: [f64; 2], to: [f64; 2]| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true };
+        let wall = |from: [f64; 2], to: [f64; 2]| Wall { from, to, thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true, is_parapet: false };
         let building = Building {
             name: "Hostile".to_string(),
             timestamp: 100,
@@ -912,7 +979,14 @@ mod tests {
                 ],
                 slabs: vec![
                     // Slab ring with a NaN — should be skipped
-                    Slab { base_z: -0.2, top_z: 0.0, thickness: 0.2, polygon: vec![[0.0, 0.0], [4.0, f64::NAN], [4.0, 4.0]], single_sided: true },
+                    Slab {
+                        base_z: -0.2,
+                        top_z: 0.0,
+                        thickness: 0.2,
+                        polygon: vec![[0.0, 0.0], [4.0, f64::NAN], [4.0, 4.0]],
+                        holes: Vec::new(),
+                        single_sided: true,
+                    },
                 ],
                 zones: vec![
                     // Zone with only two points — should be skipped
@@ -922,6 +996,7 @@ mod tests {
                     // Opening with wall index 99 — out of range, should be skipped
                     Opening { wall: 99, kind: OpeningKind::Door, from: [1.0, 0.0], to: [1.9, 0.0], thickness: 0.2, sill_z: 0.0, head_z: 2.1 },
                 ],
+                columns: Vec::new(),
             }],
         };
         let step = write(&building).expect("hostile geometry does not prevent writing");
@@ -947,10 +1022,11 @@ mod tests {
                 name: "Parter — Spa\u{021B}iu d'Or".to_string(),
                 elevation: 0.0,
                 height: 2.8,
-                walls: vec![Wall { from: [0.0, 0.0], to: [4.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true }],
+                walls: vec![Wall { from: [0.0, 0.0], to: [4.0, 0.0], thickness: 0.20, base_z: 0.0, height: 2.8, exterior: true, is_parapet: false }],
                 slabs: Vec::new(),
                 zones: Vec::new(),
                 openings: Vec::new(),
+                columns: Vec::new(),
             }],
         };
         let step = write(&building).expect("writes");
@@ -978,5 +1054,72 @@ mod tests {
     fn an_empty_building_is_an_error() {
         let building = Building { name: "Empty".to_string(), timestamp: 100, storeys: Vec::new() };
         assert!(matches!(write(&building), Err(BimError::Empty)));
+    }
+
+    #[test]
+    fn slab_holes_are_exported_as_openings_and_self_check_passes() {
+        let building = Building {
+            name: "SlabHoles".to_string(),
+            timestamp: 100,
+            storeys: vec![BuildingStorey {
+                name: "Storey 1".to_string(),
+                elevation: 0.0,
+                height: 2.8,
+                walls: Vec::new(),
+                slabs: vec![Slab {
+                    base_z: 0.0,
+                    top_z: 0.20,
+                    thickness: 0.20,
+                    polygon: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+                    holes: vec![vec![[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0]]],
+                    single_sided: false,
+                }],
+                zones: Vec::new(),
+                openings: Vec::new(),
+                columns: Vec::new(),
+            }],
+        };
+        let step = write(&building).expect("writes");
+        assert!(step.contains("IFCSLAB"));
+        assert!(step.contains("IFCOPENINGELEMENT"));
+        assert!(step.contains("IFCRELVOIDSELEMENT"));
+        let chk = check(&step).expect("self-check resolves all references");
+        assert_eq!(chk.slabs, 1);
+        assert_eq!(chk.openings, 1);
+    }
+    #[test]
+    fn ifccolumn_generation_with_rotation_vectors_and_check() {
+        let building = Building {
+            name: "ColumnBuilding".to_string(),
+            timestamp: 123456,
+            storeys: vec![BuildingStorey {
+                name: "Storey 1".to_string(),
+                elevation: 0.0,
+                height: 2.80,
+                walls: Vec::new(),
+                slabs: Vec::new(),
+                zones: Vec::new(),
+                openings: Vec::new(),
+                columns: vec![
+                    Column {
+                        center: [2.0, 3.0],
+                        base_z: 0.0,
+                        height: 2.80,
+                        shape: ColumnShape::Rectangular { width: 0.50, depth: 0.30, rotation_deg: 45.0 },
+                    },
+                    Column { center: [5.0, 5.0], base_z: 0.0, height: 2.80, shape: ColumnShape::Circular { diameter: 0.40 } },
+                ],
+            }],
+        };
+
+        let step = write(&building).expect("write IFC with columns");
+        assert!(step.contains("IFCCOLUMN"));
+        assert!(step.contains("IFCRECTANGLEPROFILEDEF"));
+        assert!(step.contains("IFCCIRCLEPROFILEDEF"));
+        // 45 degrees: cos(45 deg) = sin(45 deg) = ~0.707107
+        assert!(step.contains("0.707107"));
+
+        let chk = check(&step).expect("check passes without dangling refs");
+        assert_eq!(chk.columns, 2);
     }
 }

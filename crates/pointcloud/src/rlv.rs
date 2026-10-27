@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::bim::{self, BimError, BimOptions, Slab, Storey, Wall, Zone};
+use crate::bim::{self, BimError, BimOptions, Column, Slab, Storey, Wall, Zone};
 
 /// Class code assigned to interior furniture / clutter points removed before RLV & 3D extraction.
 pub const CLASS_FURNITURE: u8 = 22;
@@ -59,6 +59,10 @@ pub struct StoreyModel {
     pub zones: Vec<Zone>,
     /// [`Self::zones`] as the schedule reads them, in the same order.
     pub rooms: Vec<RoomScheduleRow>,
+    /// The structural columns standing in the storey.
+    pub columns: Vec<Column>,
+    /// The detected wall openings (doors and windows).
+    pub openings: Vec<crate::bim::openings::Opening>,
 }
 
 /// Full output of the `AUTORLV` command: the slabs the scan has, and each storey's walls and rooms.
@@ -91,6 +95,21 @@ impl AutoRlvResult {
     pub fn rooms(&self) -> usize {
         self.storeys.iter().map(|s| s.rooms.len()).sum()
     }
+
+    /// How many structural columns were detected across every storey.
+    pub fn columns(&self) -> usize {
+        self.storeys.iter().map(|s| s.columns.len()).sum()
+    }
+
+    /// How many wall openings (doors and windows) were detected across every storey.
+    pub fn openings(&self) -> usize {
+        self.storeys.iter().map(|s| s.openings.len()).sum()
+    }
+
+    /// How many partial-height walls / parapets were detected across every storey.
+    pub fn parapets(&self) -> usize {
+        self.storeys.iter().flat_map(|s| &s.walls).filter(|w| w.is_parapet).count()
+    }
 }
 
 /// A 3D wall for `AUTO3D`, extruded from the axis between the storey's floor and ceiling.
@@ -108,6 +127,7 @@ pub struct Slab3d {
     /// `floor_slab`, `ceiling_slab` or `slab`.
     pub kind: &'static str,
     pub vertices: Vec<[f64; 3]>,
+    pub holes: Vec<Vec<[f64; 3]>>,
     pub elevation_m: f64,
     pub thickness_m: f64,
 }
@@ -121,6 +141,7 @@ pub struct Auto3dBuilding {
     pub ceiling_z: f64,
     pub walls_3d: Vec<Wall3d>,
     pub slabs: Vec<Slab3d>,
+    pub columns: Vec<Column>,
 }
 
 /// Filter out interior furniture and clutter from an apartment/building scan by checking vertical
@@ -220,7 +241,15 @@ pub fn extract_auto_rlv(points: &[[f64; 3]], opts: &BimOptions) -> Result<AutoRl
     let mut code = 1usize;
     for storey in &storeys {
         let walls = bim::walls::extract(points, storey, opts)?;
+        let storey_pts = bim::storeys::points_in(points, storey, opts);
+        let mut openings = Vec::new();
+        for (i, wall) in walls.iter().enumerate() {
+            if let Ok(mut found) = bim::openings::detect(&storey_pts, wall, i, opts) {
+                openings.append(&mut found);
+            }
+        }
         let zones = bim::zones::build(&walls, opts)?;
+        let columns = bim::detect_columns(points, storey, &walls, opts)?;
         let clear_height = round2(storey.top_z - storey.base_z);
         let mut rooms = Vec::with_capacity(zones.len());
         for zone in &zones {
@@ -235,7 +264,7 @@ pub fn extract_auto_rlv(points: &[[f64; 3]], opts: &BimOptions) -> Result<AutoRl
             });
             code = code.saturating_add(1);
         }
-        models.push(StoreyModel { storey: *storey, walls, zones, rooms });
+        models.push(StoreyModel { storey: *storey, walls, zones, rooms, columns, openings });
     }
     let floor_z = slabs.first().map(|s| round2(s.top_z)).unwrap_or(0.0);
     let ceiling_z = slabs.last().map(|s| round2(s.base_z)).unwrap_or(floor_z);
@@ -281,10 +310,12 @@ pub fn extract_auto_3d_building(points: &[[f64; 3]], opts: &BimOptions) -> Resul
                 "slab"
             };
             let z = if i == 0 { s.top_z } else { s.base_z };
-            Slab3d { kind, vertices: s.polygon.iter().map(|p| [p[0], p[1], z]).collect(), elevation_m: z, thickness_m: s.thickness }
+            let holes = s.holes.iter().map(|h| h.iter().map(|p| [p[0], p[1], z]).collect()).collect();
+            Slab3d { kind, vertices: s.polygon.iter().map(|p| [p[0], p[1], z]).collect(), holes, elevation_m: z, thickness_m: s.thickness }
         })
         .collect();
-    Ok(Auto3dBuilding { floor_z: rlv.floor_z, ceiling_z: rlv.ceiling_z, walls_3d, slabs })
+    let columns: Vec<Column> = rlv.storeys.iter().flat_map(|s| s.columns.iter().cloned()).collect();
+    Ok(Auto3dBuilding { floor_z: rlv.floor_z, ceiling_z: rlv.ceiling_z, walls_3d, slabs, columns })
 }
 
 /// The area centroid of a closed ring, in world metres.
@@ -390,7 +421,7 @@ mod tests {
             }
             i += 1;
         }
-        let levels = [0.1, 0.9, 1.7, 2.45, 2.55, 2.65];
+        let levels = [0.1, 0.5, 0.9, 1.3, 1.7, 2.1, 2.45, 2.55, 2.65];
         let mut k = 0;
         while k <= 300 {
             let t = -0.01 + 0.02 * f64::from(k);
@@ -430,6 +461,7 @@ mod tests {
         assert_eq!(rlv.storeys.len(), 1, "one void between them");
         assert_eq!(rlv.walls(), 5, "four outer faces, synthesised, and one measured partition");
         assert_eq!(rlv.zones(), 2, "the partition splits the room");
+        assert_eq!(rlv.openings(), 0, "no openings in solid room scan");
         assert_eq!(rlv.rooms(), 2);
         assert!((rlv.total_usable_area_m2 - 19.44).abs() <= 0.2, "two 2.7 x 3.6 rooms, got {}", rlv.total_usable_area_m2);
         let codes: Vec<&str> = rlv.storeys[0].rooms.iter().map(|r| r.code.as_str()).collect();
