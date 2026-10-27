@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::bim::{self, BimError, BimOptions, Column, Slab, Storey, Wall, Zone};
+use crate::bim::{self, BimError, BimOptions, Column, Slab, Stair, Storey, Wall, Zone};
 
 /// Class code assigned to interior furniture / clutter points removed before RLV & 3D extraction.
 pub const CLASS_FURNITURE: u8 = 22;
@@ -63,6 +63,8 @@ pub struct StoreyModel {
     pub columns: Vec<Column>,
     /// The detected wall openings (doors and windows).
     pub openings: Vec<crate::bim::openings::Opening>,
+    /// The stairs detected within this storey.
+    pub stairs: Vec<Stair>,
 }
 
 /// Full output of the `AUTORLV` command: the slabs the scan has, and each storey's walls and rooms.
@@ -78,6 +80,8 @@ pub struct AutoRlvResult {
     pub storeys: Vec<StoreyModel>,
     pub total_usable_area_m2: f64,
     pub total_perimeter_m: f64,
+    /// All stairs detected across storeys.
+    pub stairs: Vec<Stair>,
 }
 
 impl AutoRlvResult {
@@ -109,6 +113,11 @@ impl AutoRlvResult {
     /// How many partial-height walls / parapets were detected across every storey.
     pub fn parapets(&self) -> usize {
         self.storeys.iter().flat_map(|s| &s.walls).filter(|w| w.is_parapet).count()
+    }
+
+    /// How many stairs were detected across every storey.
+    pub fn stairs(&self) -> usize {
+        self.stairs.len()
     }
 }
 
@@ -235,9 +244,14 @@ pub fn filter_interior_furniture(points: &[[f64; 3]], cell_xy: f64, slab_margin:
 /// Whatever the stages refuse: [`BimError::InvalidCell`] for an unusable option,
 /// [`BimError::TooLarge`] for a budget, [`BimError::Empty`] when nothing can be built.
 pub fn extract_auto_rlv(points: &[[f64; 3]], opts: &BimOptions) -> Result<AutoRlvResult, BimError> {
-    let slabs = bim::slabs::find(points, opts)?;
+    let mut slabs = bim::slabs::find(points, opts)?;
+    for slab in &mut slabs {
+        let regions = bim::slabs::detect_split_levels(points, slab, opts);
+        slab.regions = regions;
+    }
     let storeys = bim::storeys::split(&slabs, opts);
     let mut models = Vec::with_capacity(storeys.len());
+    let mut all_stairs = Vec::new();
     let mut code = 1usize;
     for storey in &storeys {
         let walls = bim::walls::extract(points, storey, opts)?;
@@ -250,6 +264,8 @@ pub fn extract_auto_rlv(points: &[[f64; 3]], opts: &BimOptions) -> Result<AutoRl
         }
         let zones = bim::zones::build(&walls, opts)?;
         let columns = bim::detect_columns(points, storey, &walls, opts)?;
+        let stairs = bim::slabs::detect_stairs(points, &slabs, storey.index, storey.base_z, storey.top_z);
+        all_stairs.extend(stairs.clone());
         let clear_height = round2(storey.top_z - storey.base_z);
         let mut rooms = Vec::with_capacity(zones.len());
         for zone in &zones {
@@ -264,13 +280,13 @@ pub fn extract_auto_rlv(points: &[[f64; 3]], opts: &BimOptions) -> Result<AutoRl
             });
             code = code.saturating_add(1);
         }
-        models.push(StoreyModel { storey: *storey, walls, zones, rooms, columns, openings });
+        models.push(StoreyModel { storey: *storey, walls, zones, rooms, columns, openings, stairs });
     }
     let floor_z = slabs.first().map(|s| round2(s.top_z)).unwrap_or(0.0);
     let ceiling_z = slabs.last().map(|s| round2(s.base_z)).unwrap_or(floor_z);
     let total_usable_area_m2 = round2(models.iter().flat_map(|m| m.rooms.iter()).map(|r| r.area_m2).sum());
     let total_perimeter_m = round2(models.iter().flat_map(|m| m.rooms.iter()).map(|r| r.perimeter_m).sum());
-    Ok(AutoRlvResult { floor_z, ceiling_z, slabs, storeys: models, total_usable_area_m2, total_perimeter_m })
+    Ok(AutoRlvResult { floor_z, ceiling_z, slabs, storeys: models, total_usable_area_m2, total_perimeter_m, stairs: all_stairs })
 }
 
 /// Reconstruct a 3D structural model (`Auto3dBuilding`: the wall planes and the slab faces) from

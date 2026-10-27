@@ -441,6 +441,7 @@ mod tests {
                 polygon: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]],
                 holes: Vec::new(),
                 single_sided: true,
+                regions: Vec::new(),
             },
             Slab {
                 base_z: 2.8,
@@ -449,6 +450,7 @@ mod tests {
                 polygon: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]],
                 holes: Vec::new(),
                 single_sided: true,
+                regions: Vec::new(),
             },
         ];
         (walls, slabs)
@@ -589,6 +591,7 @@ mod tests {
             polygon: vec![[0.0, 0.0], [1.0, 1.0]], // only 2 vertices
             holes: Vec::new(),
             single_sided: false,
+            regions: Vec::new(),
         });
         let r = measure(&pts, &walls, &slabs, &o).expect("bad geometry and points skipped");
         assert_eq!(r.points, 1, "NaN point is skipped");
@@ -621,6 +624,7 @@ mod tests {
             polygon: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
             holes: vec![vec![[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0]]],
             single_sided: false,
+            regions: Vec::new(),
         };
         // Point in solid part of slab (e.g. [2.0, 2.0, 0.10]) -> d == 0
         // Point in void hole (e.g. [5.0, 5.0, 0.10]) -> d == 1.0 m (dist to hole edge at x=4 or x=6, y=4 or y=6)

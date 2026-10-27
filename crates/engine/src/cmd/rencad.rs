@@ -304,6 +304,7 @@ fn building_from_rlv(rlv: &AutoRlvResult, per_storey: &[Vec<openings::Opening>])
                 zones: model.zones.clone(),
                 openings: per_storey.get(i).cloned().unwrap_or_default(),
                 columns: model.columns.clone(),
+                stairs: model.stairs.clone(),
             }
         })
         .collect();
@@ -344,6 +345,7 @@ fn write_ifc_file(path: &str, building: &ifc::Building) -> Result<Value> {
         "openings": checked.openings,
         "doors": checked.doors,
         "windows": checked.windows,
+        "stairs": checked.stairs,
     }))
 }
 
@@ -486,6 +488,15 @@ fn autorlv(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
 
+    let mut stair_handles = Vec::new();
+    for stair in &rlv.stairs {
+        let p1 = Vec2::new(stair.flight_axis[0][0], stair.flight_axis[0][1]);
+        let p2 = Vec2::new(stair.flight_axis[1][0], stair.flight_axis[1][1]);
+        if !p1.near(p2, 1e-6) {
+            stair_handles.push(add_on_layer(s, "RLV_STAIRS", line(p1, p2))?);
+        }
+    }
+
     let (opening_count, doors, windows) = opening_counts(&per_storey);
     let ifc_json = match ifc_param(p)? {
         Some(path) => Some(write_ifc_file(&path, &building_from_rlv(&rlv, &per_storey))?),
@@ -511,6 +522,7 @@ fn autorlv(s: &mut Session, p: &Value) -> Result<Value> {
         "slabs": rlv.slabs.len(),
         "columns": rlv.columns(),
         "parapets": rlv.parapets(),
+        "stairs": rlv.stairs.len(),
         "roomCount": rlv.rooms(),
         "totalUsableAreaM2": rlv.total_usable_area_m2,
         "totalPerimeterM": rlv.total_perimeter_m,
@@ -540,6 +552,7 @@ fn autorlv(s: &mut Session, p: &Value) -> Result<Value> {
             "slabs": slab_handles.len(),
             "columns": col_handles.len(),
             "parapets": rlv.parapets(),
+            "stairs": stair_handles.len(),
             "openings": opening_lines,
             "furniture": furniture_rects,
             "labels": label_handles.len(),
@@ -644,6 +657,31 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
         slab_faces += 1;
     }
 
+    let mut stair_count = 0usize;
+    for stair in &rlv.stairs {
+        let dx = stair.flight_axis[1][0] - stair.flight_axis[0][0];
+        let dy = stair.flight_axis[1][1] - stair.flight_axis[0][1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > 1e-6 {
+            let udx = dx / len;
+            let udy = dy / len;
+            let nx = -udy * stair.width * 0.5;
+            let ny = udx * stair.width * 0.5;
+            for k in 0..stair.num_risers {
+                let zk = stair.base_z + k as f64 * stair.riser_height;
+                let t0 = k as f64 * stair.tread_depth;
+                let t1 = (k + 1) as f64 * stair.tread_depth;
+                let p1 = [stair.flight_axis[0][0] + udx * t0 - nx, stair.flight_axis[0][1] + udy * t0 - ny, zk];
+                let p2 = [stair.flight_axis[0][0] + udx * t0 + nx, stair.flight_axis[0][1] + udy * t0 + ny, zk];
+                let p3 = [stair.flight_axis[0][0] + udx * t1 + nx, stair.flight_axis[0][1] + udy * t1 + ny, zk];
+                let p4 = [stair.flight_axis[0][0] + udx * t1 - nx, stair.flight_axis[0][1] + udy * t1 - ny, zk];
+                let face = [p1, p2, p3, p4];
+                s.sketch.add(&face, "RLV_3D_STAIRS", true);
+            }
+            stair_count += 1;
+        }
+    }
+
     let (opening_count, doors, windows) = opening_counts(&per_storey);
     let ifc_json = match ifc_param(p)? {
         Some(path) => Some(write_ifc_file(&path, &building_from_rlv(&rlv, &per_storey))?),
@@ -652,8 +690,13 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
 
     let mut reply = json!({
         "message": format!(
-            "Auto-3D Building: {} wall planes (two faces each), {} slab faces, {} openings ({} doors, {} windows)",
-            wall_planes, slab_faces, opening_count, doors, windows
+            "Auto-3D Building: {} wall planes (two faces each), {} slab faces, {} openings ({} doors, {} windows){}",
+            wall_planes,
+            slab_faces,
+            opening_count,
+            doors,
+            windows,
+            if stair_count > 0 { format!(", {} stairs", stair_count) } else { String::new() }
         ),
         "floorZ": rlv.floor_z,
         "ceilingZ": rlv.ceiling_z,
@@ -661,6 +704,7 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
         "slabs": slab_faces,
         "columns": col_count,
         "parapets": rlv.parapets(),
+        "stairs": stair_count,
         "openings": {
             "count": opening_count,
             "doors": doors,
@@ -669,7 +713,7 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
             "fineBands": if path.is_empty() { "unavailable" } else { "streamed" },
         },
         "notAvailable": [],
-        "drawn": {"walls": wall_planes, "slabs": slab_faces, "columns": col_count, "parapets": rlv.parapets()},
+        "drawn": {"walls": wall_planes, "slabs": slab_faces, "columns": col_count, "parapets": rlv.parapets(), "stairs": stair_count},
     });
     if let Some(ifc) = ifc_json {
         reply["ifc"] = ifc;
@@ -1291,5 +1335,56 @@ mod tests {
         assert!(reply["parapets"].as_u64().is_some());
         assert!(reply["drawn"]["columns"].as_u64().is_some());
         assert!(reply["drawn"]["parapets"].as_u64().is_some());
+    }
+
+    #[test]
+    fn auto3d_draws_stairs_on_rlv_3d_stairs_layer_when_present() {
+        let mut pts = room_points();
+        // The stairwell opening in the ceiling at z = 2.80: omit ceiling points above the stair flight [0.8..2.4] x [0.8..2.2]
+        pts.retain(|p| !((p[2] - 2.8).abs() < 0.05 && p[0] >= 0.8 && p[0] <= 2.4 && p[1] >= 0.8 && p[1] <= 2.2));
+        // Add 4 stair steps in the first room: x in [1.0, 2.2], y in [1.0, 2.0]
+        for k in 0..4 {
+            let zk = 0.20 + k as f64 * 0.18;
+            let cx = 1.0 + k as f64 * 0.28;
+            for ix in 0..6 {
+                let x = cx - 0.06 + ix as f64 * 0.02;
+                for iy in 0..6 {
+                    let y = 1.0 + iy as f64 * 0.15;
+                    pts.push([x, y, zk]);
+                }
+            }
+        }
+        let mut bounds = Bounds3::EMPTY;
+        let mut sliced = Vec::with_capacity(pts.len());
+        let mut on_disk = Vec::with_capacity(pts.len());
+        for p in &pts {
+            bounds.add(p[0], p[1], p[2]);
+            sliced.push(Pt { x: p[0], y: p[1], z: p[2], rgb: None, intensity: 100, class: 1 });
+            on_disk.push((p[0], p[1], p[2], 1u8));
+        }
+        let dir = std::env::temp_dir().join("cadcraft-autorlv-stairs-test");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("room_stairs.las");
+        write_test_las(&path, &on_disk);
+        let total = sliced.len() as u64;
+        let slice = Slice { points: sliced, total, in_band: total, bounds };
+        let cloud = Cloud::from_slice(
+            "room_stairs".to_string(),
+            path.display().to_string(),
+            0.0,
+            2.8,
+            None,
+            slice,
+            DEFAULT_MAX_POINTS,
+            CloudColor::Elevation,
+        );
+        let mut s = Session::new();
+        s.clouds.push(cloud);
+
+        let r = s.execute("auto3d", &json!({"index": 0}));
+        assert!(r.is_ok(), "the 3d pipeline runs with stairs: {r:?}");
+        let reply = r.expect("the reply");
+        assert!(reply["stairs"].as_u64().is_some_and(|n| n >= 1), "reports detected stairs: {reply}");
+        assert!(reply["drawn"]["stairs"].as_u64().is_some_and(|n| n >= 1), "reports drawn stairs: {reply}");
     }
 }

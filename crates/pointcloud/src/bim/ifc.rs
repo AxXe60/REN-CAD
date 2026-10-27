@@ -21,7 +21,7 @@
 use crate::bim::BimError;
 use crate::bim::columns::{Column, ColumnShape};
 use crate::bim::openings::{Opening, OpeningKind};
-use crate::bim::slabs::Slab;
+use crate::bim::slabs::{Slab, Stair};
 use crate::bim::walls::{Wall, WallArc};
 use crate::bim::zones::Zone;
 
@@ -35,6 +35,7 @@ pub struct BuildingStorey {
     pub zones: Vec<Zone>,
     pub openings: Vec<Opening>,
     pub columns: Vec<Column>,
+    pub stairs: Vec<Stair>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -55,6 +56,7 @@ pub struct IfcCheck {
     pub doors: usize,
     pub windows: usize,
     pub columns: usize,
+    pub stairs: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -375,49 +377,82 @@ pub fn write(building: &Building) -> Result<String, BimError> {
 
         // --- Slabs ---
         for (sli, slab) in storey.slabs.iter().enumerate() {
-            // Validate polygon
-            let valid: Vec<[f64; 2]> = slab.polygon.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).copied().collect();
-            if valid.len() < 3 {
-                continue;
-            }
-
-            // Slab placement at (0, 0, base_z), X = world X
-            let slab_place = write_element_placement(&mut w, storey_place, 0.0, 0.0, slab.base_z, 1.0, 0.0, 0.0, z_dir);
-
-            // Slab body: profile = polygon, extruded by thickness
-            let (shape, pds) = write_element_body(&mut w, &valid, slab.thickness, z_dir, body_ctx);
-
-            // Determine predefined type
-            let pred_type = match (lowest_slab_z, highest_slab_z) {
-                (Some(lo), Some(hi)) if (slab.base_z - lo).abs() < 1e-9 && (lo - hi).abs() > 1e-9 => ".FLOOR.",
-                (Some(_lo), Some(hi)) if (slab.base_z - hi).abs() < 1e-9 => ".CEILING.",
-                (Some(lo), Some(hi)) if (lo - hi).abs() < 1e-9 => ".FLOOR.", // single slab
-                _ => ".BASESLAB.",
-            };
-
-            let slab_guid = w.next_guid();
-            let slab_name = step_string(&format!("Slab {}", sli + 1));
-            let slab_ent = w.entity("IFCSLAB", &format!("'{}',#{},{},$,$,#{},#{},$,{}", slab_guid, owner, slab_name, slab_place, pds, pred_type));
-
-            sd.element_ids.push(slab_ent);
-
-            for (hi, hole) in slab.holes.iter().enumerate() {
-                let valid_hole: Vec<[f64; 2]> = hole.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).copied().collect();
-                if valid_hole.len() < 3 {
+            if !slab.regions.is_empty() {
+                for (ri, region) in slab.regions.iter().enumerate() {
+                    let valid: Vec<[f64; 2]> = region.polygon.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).copied().collect();
+                    if valid.len() < 3 {
+                        continue;
+                    }
+                    let reg_thickness = (region.top_z - region.base_z).abs().max(slab.thickness);
+                    let slab_place = write_element_placement(&mut w, storey_place, 0.0, 0.0, region.base_z, 1.0, 0.0, 0.0, z_dir);
+                    let (shape, pds) = write_element_body(&mut w, &valid, reg_thickness, z_dir, body_ctx);
+                    let pred_type = if region.is_sloped {
+                        ".USERDEFINED."
+                    } else {
+                        match (lowest_slab_z, highest_slab_z) {
+                            (Some(lo), Some(hi)) if (region.base_z - lo).abs() < 1e-9 && (lo - hi).abs() > 1e-9 => ".FLOOR.",
+                            (Some(_lo), Some(hi)) if (region.base_z - hi).abs() < 1e-9 => ".CEILING.",
+                            (Some(lo), Some(hi)) if (lo - hi).abs() < 1e-9 => ".FLOOR.",
+                            _ => ".BASESLAB.",
+                        }
+                    };
+                    let slab_guid = w.next_guid();
+                    let desc = if region.is_sloped {
+                        step_string(&format!("Sloped slab {:.1} deg", region.slope_deg))
+                    } else {
+                        step_string(&format!("Split level region {}", ri + 1))
+                    };
+                    let slab_name = step_string(&format!("Slab {} Region {}", sli + 1, ri + 1));
+                    let slab_ent =
+                        w.entity("IFCSLAB", &format!("'{}',#{},{},{},$,#{},#{},$,{}", slab_guid, owner, slab_name, desc, slab_place, pds, pred_type));
+                    sd.element_ids.push(slab_ent);
+                    let _ = shape;
+                }
+            } else {
+                // Validate polygon
+                let valid: Vec<[f64; 2]> = slab.polygon.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).copied().collect();
+                if valid.len() < 3 {
                     continue;
                 }
-                let hole_place = write_element_placement(&mut w, storey_place, 0.0, 0.0, slab.base_z, 1.0, 0.0, 0.0, z_dir);
-                let (hole_shape, hole_pds) = write_element_body(&mut w, &valid_hole, slab.thickness, z_dir, body_ctx);
-                let hole_guid = w.next_guid();
-                let hole_name = step_string(&format!("Slab Opening {}", hi + 1));
-                let hole_ent = w.entity(
-                    "IFCOPENINGELEMENT",
-                    &format!("'{}',#{},{},{},#{},#{},$,.OPENING.", hole_guid, owner, hole_name, "$", hole_place, hole_pds),
-                );
-                sd.void_rels.push((slab_ent, hole_ent));
-                let _ = hole_shape;
+
+                // Slab placement at (0, 0, base_z), X = world X
+                let slab_place = write_element_placement(&mut w, storey_place, 0.0, 0.0, slab.base_z, 1.0, 0.0, 0.0, z_dir);
+
+                // Slab body: profile = polygon, extruded by thickness
+                let (shape, pds) = write_element_body(&mut w, &valid, slab.thickness, z_dir, body_ctx);
+
+                // Determine predefined type
+                let pred_type = match (lowest_slab_z, highest_slab_z) {
+                    (Some(lo), Some(hi)) if (slab.base_z - lo).abs() < 1e-9 && (lo - hi).abs() > 1e-9 => ".FLOOR.",
+                    (Some(_lo), Some(hi)) if (slab.base_z - hi).abs() < 1e-9 => ".CEILING.",
+                    (Some(lo), Some(hi)) if (lo - hi).abs() < 1e-9 => ".FLOOR.", // single slab
+                    _ => ".BASESLAB.",
+                };
+
+                let slab_guid = w.next_guid();
+                let slab_name = step_string(&format!("Slab {}", sli + 1));
+                let slab_ent = w.entity("IFCSLAB", &format!("'{}',#{},{},$,$,#{},#{},$,{}", slab_guid, owner, slab_name, slab_place, pds, pred_type));
+
+                sd.element_ids.push(slab_ent);
+
+                for (hi, hole) in slab.holes.iter().enumerate() {
+                    let valid_hole: Vec<[f64; 2]> = hole.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).copied().collect();
+                    if valid_hole.len() < 3 {
+                        continue;
+                    }
+                    let hole_place = write_element_placement(&mut w, storey_place, 0.0, 0.0, slab.base_z, 1.0, 0.0, 0.0, z_dir);
+                    let (hole_shape, hole_pds) = write_element_body(&mut w, &valid_hole, slab.thickness, z_dir, body_ctx);
+                    let hole_guid = w.next_guid();
+                    let hole_name = step_string(&format!("Slab Opening {}", hi + 1));
+                    let hole_ent = w.entity(
+                        "IFCOPENINGELEMENT",
+                        &format!("'{}',#{},{},{},#{},#{},$,.OPENING.", hole_guid, owner, hole_name, "$", hole_place, hole_pds),
+                    );
+                    sd.void_rels.push((slab_ent, hole_ent));
+                    let _ = hole_shape;
+                }
+                let _ = shape;
             }
-            let _ = shape;
         }
 
         // --- Spaces (from zones) ---
@@ -594,6 +629,45 @@ pub fn write(building: &Building) -> Result<String, BimError> {
             let col_ent = w.entity("IFCCOLUMN", &format!("'{}',#{},{},$,$,#{},#{},$,.COLUMN.", col_guid, owner, col_name, col_place, pds));
 
             sd.element_ids.push(col_ent);
+        }
+
+        // --- Stairs ---
+        for (sti, stair) in storey.stairs.iter().enumerate() {
+            let stair_name = step_string(&format!("Stair Flight {}", sti + 1));
+            let stair_guid = w.next_guid();
+
+            let dx = stair.flight_axis[1][0] - stair.flight_axis[0][0];
+            let dy = stair.flight_axis[1][1] - stair.flight_axis[0][1];
+            let len = (dx * dx + dy * dy).sqrt();
+            let (udx, udy) = if len.is_finite() && len > 1e-6 { (dx / len, dy / len) } else { (1.0, 0.0) };
+
+            let stair_place =
+                write_element_placement(&mut w, storey_place, stair.flight_axis[0][0], stair.flight_axis[0][1], stair.base_z, udx, udy, 0.0, z_dir);
+
+            let hw = stair.width / 2.0;
+            let flight_len = if len.is_finite() && len > 0.0 { len } else { stair.tread_depth * stair.num_risers as f64 };
+            let flight_height = (stair.top_z - stair.base_z).abs().max(0.10);
+            let profile_pts = [[0.0, -hw], [flight_len, -hw], [flight_len, hw], [0.0, hw]];
+            let (shape, pds) = write_element_body(&mut w, &profile_pts, flight_height, z_dir, body_ctx);
+
+            let stair_ent = w.entity(
+                "IFCSTAIRFLIGHT",
+                &format!(
+                    "'{}',#{},{},$,$,#{},#{},$,{},{},{},{},.STRAIGHT.",
+                    stair_guid,
+                    owner,
+                    stair_name,
+                    stair_place,
+                    pds,
+                    stair.num_risers,
+                    stair.num_risers.saturating_sub(1),
+                    fmt_real(stair.riser_height),
+                    fmt_real(stair.tread_depth),
+                ),
+            );
+
+            sd.element_ids.push(stair_ent);
+            let _ = shape;
         }
 
         storey_data.push(sd);
@@ -884,6 +958,7 @@ pub fn check(step: &str) -> Result<IfcCheck, BimError> {
                 door_window_count += 1;
             }
             "IFCCOLUMN" => check.columns += 1,
+            "IFCSTAIR" | "IFCSTAIRFLIGHT" => check.stairs += 1,
             "IFCRELVOIDSELEMENT" => has_void_rel = true,
             "IFCRELFILLSELEMENT" => fill_rel_count += 1,
             _ => {}
@@ -951,7 +1026,7 @@ mod tests {
     use super::*;
     use crate::bim::columns::{Column, ColumnShape};
     use crate::bim::openings::{Opening, OpeningKind, OpeningShape};
-    use crate::bim::slabs::Slab;
+    use crate::bim::slabs::{Slab, Stair};
     use crate::bim::walls::Wall;
     use crate::bim::zones::Zone;
 
@@ -973,6 +1048,7 @@ mod tests {
                     polygon: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]],
                     holes: Vec::new(),
                     single_sided: true,
+                    regions: Vec::new(),
                 }],
                 zones: vec![Zone { ring: vec![[0.1, 0.1], [3.9, 0.1], [3.9, 3.9], [0.1, 3.9]], area: 14.44, perimeter: 15.2 }],
                 openings: vec![Opening {
@@ -986,6 +1062,7 @@ mod tests {
                     head_z: 2.1,
                 }],
                 columns: Vec::new(),
+                stairs: Vec::new(),
             }],
         }
     }
@@ -1054,6 +1131,7 @@ mod tests {
                         polygon: vec![[0.0, 0.0], [4.0, f64::NAN], [4.0, 4.0]],
                         holes: Vec::new(),
                         single_sided: true,
+                        regions: Vec::new(),
                     },
                 ],
                 zones: vec![
@@ -1074,6 +1152,7 @@ mod tests {
                     },
                 ],
                 columns: Vec::new(),
+                stairs: Vec::new(),
             }],
         };
         let step = write(&building).expect("hostile geometry does not prevent writing");
@@ -1113,6 +1192,7 @@ mod tests {
                 zones: Vec::new(),
                 openings: Vec::new(),
                 columns: Vec::new(),
+                stairs: Vec::new(),
             }],
         };
         let step = write(&building).expect("writes");
@@ -1159,10 +1239,12 @@ mod tests {
                     polygon: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
                     holes: vec![vec![[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0]]],
                     single_sided: false,
+                    regions: Vec::new(),
                 }],
                 zones: Vec::new(),
                 openings: Vec::new(),
                 columns: Vec::new(),
+                stairs: Vec::new(),
             }],
         };
         let step = write(&building).expect("writes");
@@ -1195,6 +1277,7 @@ mod tests {
                     },
                     Column { center: [5.0, 5.0], base_z: 0.0, height: 2.80, shape: ColumnShape::Circular { diameter: 0.40 } },
                 ],
+                stairs: Vec::new(),
             }],
         };
 
@@ -1241,6 +1324,7 @@ mod tests {
                     head_z: 2.10,
                 }],
                 columns: Vec::new(),
+                stairs: Vec::new(),
             }],
         };
 
@@ -1254,5 +1338,68 @@ mod tests {
         assert_eq!(chk.walls, 1);
         assert_eq!(chk.doors, 1);
         assert_eq!(chk.openings, 1);
+    }
+
+    #[test]
+    fn ifc_writes_slab_regions_and_stairs() {
+        use crate::bim::slabs::SlabRegion;
+        let building = Building {
+            name: "SplitLevelAndStairs".to_string(),
+            timestamp: 1_761_350_400,
+            storeys: vec![BuildingStorey {
+                name: "Storey 1".to_string(),
+                elevation: 0.0,
+                height: 2.80,
+                walls: Vec::new(),
+                slabs: vec![Slab {
+                    base_z: -0.20,
+                    top_z: 0.0,
+                    thickness: 0.20,
+                    polygon: vec![[0.0, 0.0], [8.0, 0.0], [8.0, 4.0], [0.0, 4.0]],
+                    holes: Vec::new(),
+                    single_sided: true,
+                    regions: vec![
+                        SlabRegion {
+                            polygon: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]],
+                            base_z: -0.20,
+                            top_z: 0.0,
+                            is_sloped: false,
+                            slope_deg: 0.0,
+                        },
+                        SlabRegion {
+                            polygon: vec![[4.0, 0.0], [8.0, 0.0], [8.0, 4.0], [4.0, 4.0]],
+                            base_z: 0.30,
+                            top_z: 0.50,
+                            is_sloped: true,
+                            slope_deg: 5.7,
+                        },
+                    ],
+                }],
+                zones: Vec::new(),
+                openings: Vec::new(),
+                columns: Vec::new(),
+                stairs: vec![Stair {
+                    storey_index: 0,
+                    base_z: 0.0,
+                    top_z: 0.90,
+                    num_risers: 5,
+                    riser_height: 0.18,
+                    tread_depth: 0.28,
+                    flight_axis: [[1.30, 2.0], [2.42, 2.0]],
+                    width: 1.0,
+                }],
+            }],
+        };
+
+        let step = write(&building).expect("write IFC with split levels and stairs");
+        assert!(step.contains("IFCSLAB"));
+        assert!(step.contains("Split level region 1"));
+        assert!(step.contains("Sloped slab 5.7 deg"));
+        assert!(step.contains("IFCSTAIRFLIGHT"));
+        assert!(step.contains(".STRAIGHT."));
+
+        let chk = check(&step).expect("check passes");
+        assert_eq!(chk.slabs, 2, "two regions exported as separate slabs");
+        assert_eq!(chk.stairs, 1, "one stair flight exported and counted");
     }
 }

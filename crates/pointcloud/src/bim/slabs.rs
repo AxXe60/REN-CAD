@@ -9,6 +9,9 @@
 //! Nothing here is measured from a file: the stage takes the plain points its caller already holds
 //! and hands back owned geometry, so the crate keeps compiling for wasm.
 
+use std::collections::{HashMap, VecDeque};
+
+use crate::bim::columns::convex_hull_2d;
 use crate::bim::raster::{Raster, close, contours, mask};
 use crate::bim::{BimError, BimOptions, MAX_CLOSE_RADIUS, MAX_RASTER_CELLS};
 use cadcraft_geom::{Vec2, point_in_polygon, shoelace};
@@ -25,6 +28,29 @@ pub(crate) mod fixture;
 /// band needs 20 001 and is refused. The quotient is compared in `f64` *before* it is cast, so a
 /// hostile range is refused rather than allocated.
 pub const MAX_Z_BINS: usize = 20_000;
+
+/// A sub-region of a slab at a distinct elevation or inclination (e.g. split-levels or ramps).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlabRegion {
+    pub polygon: Vec<[f64; 2]>,
+    pub base_z: f64,
+    pub top_z: f64,
+    pub is_sloped: bool,
+    pub slope_deg: f64,
+}
+
+/// A flight of stairs detected between storeys.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stair {
+    pub storey_index: usize,
+    pub base_z: f64,
+    pub top_z: f64,
+    pub num_risers: usize,
+    pub riser_height: f64,
+    pub tread_depth: f64,
+    pub flight_axis: [[f64; 2]; 2],
+    pub width: f64,
+}
 
 /// One horizontal surface found in the cloud, and the plan shape that goes with it.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +72,8 @@ pub struct Slab {
     /// True when only one face of this body was scanned, so the other face is the option's
     /// thickness rather than a measurement.
     pub single_sided: bool,
+    /// Any sub-regions at distinct elevations or inclinations (split-levels / ramps).
+    pub regions: Vec<SlabRegion>,
 }
 
 /// The scan's horizontal surfaces, ordered by [`Slab::base_z`].
@@ -225,7 +253,7 @@ impl Body {
             }
             (None, _) => return None,
         };
-        Some(Slab { base_z, top_z, thickness, polygon: Vec::new(), holes: Vec::new(), single_sided: self.single_sided })
+        Some(Slab { base_z, top_z, thickness, polygon: Vec::new(), holes: Vec::new(), single_sided: self.single_sided, regions: Vec::new() })
     }
 }
 
@@ -440,12 +468,491 @@ fn finite(p: &[f64; 3]) -> bool {
     p.iter().all(|v| v.is_finite())
 }
 
+/// Fit a plane z = A*x + B*y + C to 3D points. Returns (A, B, inclination_deg) if successful.
+fn fit_plane_slope(points: &[[f64; 3]]) -> Option<(f64, f64, f64)> {
+    let n = points.len();
+    if n < 3 {
+        return None;
+    }
+    let nf = n as f64;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_z = 0.0;
+    for p in points {
+        sum_x += p[0];
+        sum_y += p[1];
+        sum_z += p[2];
+    }
+    let mean_x = sum_x / nf;
+    let mean_y = sum_y / nf;
+    let mean_z = sum_z / nf;
+
+    let mut s_uu = 0.0;
+    let mut s_uv = 0.0;
+    let mut s_vv = 0.0;
+    let mut s_uw = 0.0;
+    let mut s_vw = 0.0;
+    for p in points {
+        let u = p[0] - mean_x;
+        let v = p[1] - mean_y;
+        let w = p[2] - mean_z;
+        s_uu += u * u;
+        s_uv += u * v;
+        s_vv += v * v;
+        s_uw += u * w;
+        s_vw += v * w;
+    }
+
+    let det = s_uu * s_vv - s_uv * s_uv;
+    if !det.is_finite() || det.abs() < 1e-9 {
+        return None;
+    }
+
+    let a = (s_uw * s_vv - s_vw * s_uv) / det;
+    let b = (s_vw * s_uu - s_uw * s_uv) / det;
+    if !a.is_finite() || !b.is_finite() {
+        return None;
+    }
+
+    let tan_alpha = (a * a + b * b).sqrt();
+    let alpha_rad = tan_alpha.atan();
+    let alpha_deg = alpha_rad.to_degrees();
+    Some((a, b, alpha_deg))
+}
+
+/// Detect split-levels, floor steps, and sloped slabs across the given slab's horizontal footprint.
+///
+/// Bins the XY plane into regular cells (1.0 m grid). Computes the median Z of floor points in each cell.
+/// When adjacent clusters show an elevation step Delta Z in [0.15, 1.50] m, emits distinct [`SlabRegion`]
+/// boundaries with local `base_z` / `top_z`.
+/// Checks normal vector inclination: if alpha in [3.0 deg, 45.0 deg], sets `is_sloped: true`, `slope_deg: alpha`.
+pub fn detect_split_levels(points: &[[f64; 3]], slab: &Slab, opts: &BimOptions) -> Vec<SlabRegion> {
+    let ref_z = slab.top_z;
+    let z_min_search = ref_z - 1.60;
+    let z_max_search = ref_z + 1.60;
+
+    let mut candidate_points: Vec<[f64; 3]> = Vec::new();
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+
+    for p in points {
+        if !finite(p) {
+            continue;
+        }
+        if p[2] >= z_min_search && p[2] <= z_max_search {
+            candidate_points.push(*p);
+            if p[0] < min_x {
+                min_x = p[0];
+            }
+            if p[0] > max_x {
+                max_x = p[0];
+            }
+            if p[1] < min_y {
+                min_y = p[1];
+            }
+            if p[1] > max_y {
+                max_y = p[1];
+            }
+        }
+    }
+
+    if candidate_points.len() < 8 || !min_x.is_finite() || !min_y.is_finite() || max_x <= min_x || max_y <= min_y {
+        return Vec::new();
+    }
+
+    let cell_size = 1.0;
+    let mut grid: HashMap<(i32, i32), Vec<[f64; 3]>> = HashMap::new();
+    for p in &candidate_points {
+        let ix = ((p[0] - min_x) / cell_size).floor() as i32;
+        let iy = ((p[1] - min_y) / cell_size).floor() as i32;
+        grid.entry((ix, iy)).or_default().push(*p);
+    }
+
+    struct CellData {
+        coord: (i32, i32),
+        median_z: f64,
+        pts: Vec<[f64; 3]>,
+    }
+
+    let mut valid_cells: Vec<CellData> = Vec::new();
+    let mut cell_map: HashMap<(i32, i32), usize> = HashMap::new();
+
+    for (coord, pts) in grid {
+        if pts.len() < 3 {
+            continue;
+        }
+        let mut z_vals: Vec<f64> = pts.iter().map(|p| p[2]).collect();
+        z_vals.sort_by(|a, b| a.total_cmp(b));
+        let median_z = z_vals.get(z_vals.len() / 2).copied().unwrap_or(0.0);
+        let idx = valid_cells.len();
+        valid_cells.push(CellData { coord, median_z, pts });
+        cell_map.insert(coord, idx);
+    }
+
+    if valid_cells.is_empty() {
+        return Vec::new();
+    }
+
+    // Connected components: two 4-adjacent cells belong to same cluster if |median_z_1 - median_z_2| < 0.12
+    let mut visited = vec![false; valid_cells.len()];
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+
+    for i in 0..valid_cells.len() {
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        let mut cluster = vec![i];
+        let mut queue = VecDeque::new();
+        queue.push_back(i);
+
+        while let Some(curr_idx) = queue.pop_front() {
+            let (cx, cy) = valid_cells[curr_idx].coord;
+            let cz = valid_cells[curr_idx].median_z;
+            let neighbors = [(cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)];
+            for n_coord in neighbors {
+                if let Some(&n_idx) = cell_map.get(&n_coord)
+                    && !visited[n_idx]
+                {
+                    let nz = valid_cells[n_idx].median_z;
+                    if (cz - nz).abs() < 0.12 {
+                        visited[n_idx] = true;
+                        cluster.push(n_idx);
+                        queue.push_back(n_idx);
+                    }
+                }
+            }
+        }
+        clusters.push(cluster);
+    }
+
+    // Check if any adjacent cells across clusters exhibit an elevation step Delta Z in [0.15, 1.50]
+    let mut cluster_of_cell = vec![0usize; valid_cells.len()];
+    for (ci, cl) in clusters.iter().enumerate() {
+        for &c_idx in cl {
+            if let Some(slot) = cluster_of_cell.get_mut(c_idx) {
+                *slot = ci;
+            }
+        }
+    }
+
+    let mut has_step = false;
+    for (i, cell) in valid_cells.iter().enumerate() {
+        let (cx, cy) = cell.coord;
+        let ci = cluster_of_cell.get(i).copied().unwrap_or(0);
+        let neighbors = [(cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)];
+        for n_coord in neighbors {
+            if let Some(&n_idx) = cell_map.get(&n_coord) {
+                let n_ci = cluster_of_cell.get(n_idx).copied().unwrap_or(0);
+                if ci != n_ci {
+                    let dz = (cell.median_z - valid_cells[n_idx].median_z).abs();
+                    if (0.15..=1.50).contains(&dz) {
+                        has_step = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if has_step {
+            break;
+        }
+    }
+
+    let thickness = if slab.thickness.is_finite() && slab.thickness > 0.0 { slab.thickness } else { opts.single_sided_slab_thickness };
+
+    if has_step {
+        let mut regions = Vec::new();
+        for cl in &clusters {
+            let mut cl_pts_2d = Vec::new();
+            let mut cl_pts_3d = Vec::new();
+            let mut z_sum = 0.0;
+            let mut count = 0usize;
+            for &c_idx in cl {
+                let cell = &valid_cells[c_idx];
+                for p in &cell.pts {
+                    cl_pts_2d.push([p[0], p[1]]);
+                    cl_pts_3d.push(*p);
+                    z_sum += p[2];
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            let mean_z = z_sum / count as f64;
+            let hull = convex_hull_2d(&cl_pts_2d);
+            let poly = if hull.len() >= 3 {
+                hull
+            } else if let Some(first_c) = cl.first().and_then(|&idx| valid_cells.get(idx)) {
+                let (ix, iy) = first_c.coord;
+                let x0 = min_x + ix as f64 * cell_size;
+                let y0 = min_y + iy as f64 * cell_size;
+                vec![[x0, y0], [x0 + cell_size, y0], [x0 + cell_size, y0 + cell_size], [x0, y0 + cell_size]]
+            } else {
+                continue;
+            };
+
+            let slope_info = fit_plane_slope(&cl_pts_3d);
+            let (is_sloped, slope_deg) = match slope_info {
+                Some((_, _, deg)) if (3.0..=45.0).contains(&deg) => (true, (deg * 10.0).round() / 10.0),
+                _ => (false, 0.0),
+            };
+
+            regions.push(SlabRegion { polygon: poly, base_z: mean_z - thickness, top_z: mean_z, is_sloped, slope_deg });
+        }
+        regions.sort_by(|a, b| a.base_z.total_cmp(&b.base_z));
+        return regions;
+    }
+
+    // No split step detected. Check if the entire slab is sloped (alpha in [3.0 deg, 45.0 deg])
+    if let Some((_, _, deg)) = fit_plane_slope(&candidate_points)
+        && (3.0..=45.0).contains(&deg)
+    {
+        let poly = if slab.polygon.len() >= 3 {
+            slab.polygon.clone()
+        } else {
+            let pts_2d: Vec<[f64; 2]> = candidate_points.iter().map(|p| [p[0], p[1]]).collect();
+            convex_hull_2d(&pts_2d)
+        };
+        return vec![SlabRegion { polygon: poly, base_z: slab.base_z, top_z: slab.top_z, is_sloped: true, slope_deg: (deg * 10.0).round() / 10.0 }];
+    }
+
+    Vec::new()
+}
+
+/// Detect stairs inside slab voids / openings or within storey volume.
+///
+/// For any hole in `slabs[i].holes`, analyzes point cloud within the hole cylinder.
+/// Detects periodic riser steps Delta z in [0.14, 0.22] m and horizontal run Delta x in [0.22, 0.35] m.
+/// When at least 3 consecutive steps are detected, emits a [`Stair`] record.
+pub fn detect_stairs(points: &[[f64; 3]], slabs: &[Slab], storey_idx: usize, base_z: f64, top_z: f64) -> Vec<Stair> {
+    let mut candidates: Vec<Vec<[f64; 3]>> = Vec::new();
+
+    // 1. Check all holes across slabs
+    for slab in slabs {
+        for hole in &slab.holes {
+            if hole.len() < 3 {
+                continue;
+            }
+            let hole_vec2: Vec<Vec2> = hole.iter().map(|p| Vec2::new(p[0], p[1])).collect();
+            let mut in_cyl = Vec::new();
+            for p in points {
+                if !finite(p) {
+                    continue;
+                }
+                if p[2] < base_z - 0.20 || p[2] > top_z + 0.20 {
+                    continue;
+                }
+                if point_in_polygon(&hole_vec2, Vec2::new(p[0], p[1])) {
+                    in_cyl.push(*p);
+                }
+            }
+            if in_cyl.len() >= 10 {
+                candidates.push(in_cyl);
+            }
+        }
+    }
+
+    // 2. If no hole candidates were found (or slabs has no holes), fallback to storey points
+    if candidates.is_empty() {
+        let in_vol: Vec<[f64; 3]> = points.iter().filter(|p| finite(p) && p[2] >= base_z - 0.10 && p[2] <= top_z + 0.10).copied().collect();
+        if in_vol.len() >= 10 {
+            candidates.push(in_vol);
+        }
+    }
+
+    let mut stairs = Vec::new();
+
+    for pts in candidates {
+        let z_step = 0.02;
+        let mut lo_z = f64::INFINITY;
+        let mut hi_z = f64::NEG_INFINITY;
+        for p in &pts {
+            if p[2] < lo_z {
+                lo_z = p[2];
+            }
+            if p[2] > hi_z {
+                hi_z = p[2];
+            }
+        }
+        if !lo_z.is_finite() || !hi_z.is_finite() || hi_z <= lo_z {
+            continue;
+        }
+
+        let num_bins = ((hi_z - lo_z) / z_step).ceil() as usize + 1;
+        if num_bins > 2000 {
+            continue;
+        }
+        let mut hist = vec![0u32; num_bins];
+        for p in &pts {
+            let bi = ((p[2] - lo_z) / z_step).floor() as usize;
+            if let Some(c) = hist.get_mut(bi) {
+                *c += 1;
+            }
+        }
+
+        // Find local peaks in the histogram (horizontal treads form density peaks)
+        let mut peak_zs = Vec::new();
+        for i in 0..num_bins {
+            let count = hist.get(i).copied().unwrap_or(0);
+            if count < 3 {
+                continue;
+            }
+            let prev = if i > 0 { hist.get(i - 1).copied().unwrap_or(0) } else { 0 };
+            let next = hist.get(i + 1).copied().unwrap_or(0);
+            if count >= prev && count >= next {
+                let pz = lo_z + (i as f64 + 0.5) * z_step;
+                peak_zs.push(pz);
+            }
+        }
+
+        if peak_zs.len() < 3 {
+            continue;
+        }
+
+        // Merge peaks that are closer than 0.08 m (min riser is 0.14 m)
+        let mut merged_peaks = Vec::new();
+        let mut curr_group = vec![peak_zs[0]];
+        for &pz in &peak_zs[1..] {
+            if let Some(&last_z) = curr_group.last() {
+                if (pz - last_z).abs() < 0.08 {
+                    curr_group.push(pz);
+                } else {
+                    let avg = curr_group.iter().sum::<f64>() / curr_group.len() as f64;
+                    merged_peaks.push(avg);
+                    curr_group.clear();
+                    curr_group.push(pz);
+                }
+            }
+        }
+        if !curr_group.is_empty() {
+            let avg = curr_group.iter().sum::<f64>() / curr_group.len() as f64;
+            merged_peaks.push(avg);
+        }
+
+        if merged_peaks.len() < 3 {
+            continue;
+        }
+
+        struct StepLevel {
+            z: f64,
+            centroid: [f64; 2],
+            points_2d: Vec<[f64; 2]>,
+        }
+
+        let mut step_levels: Vec<StepLevel> = Vec::new();
+        for &mz in &merged_peaks {
+            let mut sx = 0.0;
+            let mut sy = 0.0;
+            let mut p2d = Vec::new();
+            for p in &pts {
+                if (p[2] - mz).abs() <= 0.03 {
+                    sx += p[0];
+                    sy += p[1];
+                    p2d.push([p[0], p[1]]);
+                }
+            }
+            if p2d.len() >= 3 {
+                let n = p2d.len() as f64;
+                step_levels.push(StepLevel { z: mz, centroid: [sx / n, sy / n], points_2d: p2d });
+            }
+        }
+
+        if step_levels.len() < 3 {
+            continue;
+        }
+
+        // Search for a run of consecutive steps satisfying Delta z in [0.14, 0.22] and Delta run in [0.20, 0.38]
+        let mut best_run: Vec<usize> = Vec::new();
+        for start in 0..step_levels.len() {
+            let mut current_run = vec![start];
+            let mut prev = start;
+            for next in (start + 1)..step_levels.len() {
+                let dz = step_levels[next].z - step_levels[prev].z;
+                let dx = step_levels[next].centroid[0] - step_levels[prev].centroid[0];
+                let dy = step_levels[next].centroid[1] - step_levels[prev].centroid[1];
+                let dl = (dx * dx + dy * dy).sqrt();
+
+                if (0.14..=0.22).contains(&dz) && (0.20..=0.38).contains(&dl) {
+                    current_run.push(next);
+                    prev = next;
+                } else if dz > 0.22 {
+                    break;
+                }
+            }
+            if current_run.len() > best_run.len() {
+                best_run = current_run;
+            }
+        }
+
+        if best_run.len() >= 3 {
+            let Some(&first_idx) = best_run.first() else {
+                continue;
+            };
+            let Some(&last_idx) = best_run.last() else {
+                continue;
+            };
+            let s_first = &step_levels[first_idx];
+            let s_last = &step_levels[last_idx];
+
+            let n_transitions = (best_run.len() - 1) as f64;
+            if n_transitions <= 0.0 {
+                continue;
+            }
+            let total_dz = s_last.z - s_first.z;
+            let avg_riser = total_dz / n_transitions;
+
+            let total_dx = s_last.centroid[0] - s_first.centroid[0];
+            let total_dy = s_last.centroid[1] - s_first.centroid[1];
+            let total_run = (total_dx * total_dx + total_dy * total_dy).sqrt();
+            let avg_tread = total_run / n_transitions;
+
+            let flight_axis = [s_first.centroid, s_last.centroid];
+
+            let (ux, uy) = if total_run > 1e-6 { (total_dx / total_run, total_dy / total_run) } else { (1.0, 0.0) };
+            let (nx, ny) = (-uy, ux);
+            let mut v_min = f64::INFINITY;
+            let mut v_max = f64::NEG_INFINITY;
+            for &r_idx in &best_run {
+                if let Some(lvl) = step_levels.get(r_idx) {
+                    for p in &lvl.points_2d {
+                        let proj = (p[0] - s_first.centroid[0]) * nx + (p[1] - s_first.centroid[1]) * ny;
+                        if proj < v_min {
+                            v_min = proj;
+                        }
+                        if proj > v_max {
+                            v_max = proj;
+                        }
+                    }
+                }
+            }
+            let measured_w = if v_max > v_min { v_max - v_min } else { 1.0 };
+            let width = measured_w.clamp(0.60, 3.0);
+
+            stairs.push(Stair {
+                storey_index: storey_idx,
+                base_z: s_first.z - avg_riser,
+                top_z: s_last.z,
+                num_risers: best_run.len(),
+                riser_height: (avg_riser * 1000.0).round() / 1000.0,
+                tread_depth: (avg_tread * 1000.0).round() / 1000.0,
+                flight_axis,
+                width: (width * 100.0).round() / 100.0,
+            });
+        }
+    }
+
+    stairs
+}
+
 #[cfg(test)]
 mod tests {
     use super::fixture::{
         FACE_POINTS, Noise, PLAN_X, PLAN_Y, WALL_POINTS_PER_LEVEL, four_face_box, half_lower_face_box, plane_between, three_face_box,
     };
-    use super::{BimError, MAX_Z_BINS, Tuning, find, plan, ring_area};
+    use super::{BimError, MAX_Z_BINS, Slab, Tuning, find, plan, ring_area};
     use crate::bim::{BimOptions, MAX_CLOSE_RADIUS, MAX_RASTER_CELLS};
 
     #[test]
@@ -814,5 +1321,151 @@ mod tests {
         assert!((max_x - 7.0).abs() <= 0.2, "hole max x matches 7.0 within cell tolerance: {max_x}");
         assert!((min_y - 3.0).abs() <= 0.2, "hole min y matches 3.0 within cell tolerance: {min_y}");
         assert!((max_y - 7.0).abs() <= 0.2, "hole max y matches 7.0 within cell tolerance: {max_y}");
+    }
+
+    #[test]
+    fn detect_split_levels_finds_elevation_step_and_emits_regions() {
+        let mut pts = Vec::new();
+        // Left side: [0, 4] x [0, 4] at z = 0.0
+        // Right side: [4, 8] x [0, 4] at z = 0.50 (step = 0.50 m in [0.15, 1.50])
+        let step = 0.10;
+        for ix in 0..=80 {
+            let x = ix as f64 * step;
+            for iy in 0..=40 {
+                let y = iy as f64 * step;
+                let z = if x < 4.0 { 0.0 } else { 0.50 };
+                pts.push([x, y, z]);
+            }
+        }
+        let slab = Slab {
+            base_z: -0.20,
+            top_z: 0.0,
+            thickness: 0.20,
+            polygon: vec![[0.0, 0.0], [8.0, 0.0], [8.0, 4.0], [0.0, 4.0]],
+            holes: Vec::new(),
+            single_sided: true,
+            regions: Vec::new(),
+        };
+        let regions = super::detect_split_levels(&pts, &slab, &BimOptions::default());
+        assert_eq!(regions.len(), 2, "detects two distinct split-level regions: {regions:?}");
+        assert!((regions[0].top_z - 0.0).abs() <= 0.05, "lower region around z=0.0: got {}", regions[0].top_z);
+        assert!((regions[1].top_z - 0.50).abs() <= 0.05, "upper region around z=0.50: got {}", regions[1].top_z);
+        assert!(!regions[0].is_sloped, "lower region is flat");
+        assert!(!regions[1].is_sloped, "upper region is flat");
+        assert!(regions[0].polygon.len() >= 3);
+        assert!(regions[1].polygon.len() >= 3);
+    }
+
+    #[test]
+    fn detect_split_levels_detects_sloped_slab_ramp() {
+        let mut pts = Vec::new();
+        // Ramp: [0, 6] x [0, 3], z = 0.10 * x -> slope ~5.7 deg (in [3.0, 45.0])
+        let step = 0.10;
+        for ix in 0..=60 {
+            let x = ix as f64 * step;
+            for iy in 0..=30 {
+                let y = iy as f64 * step;
+                let z = 0.10 * x;
+                pts.push([x, y, z]);
+            }
+        }
+        let slab = Slab {
+            base_z: -0.20,
+            top_z: 0.30,
+            thickness: 0.20,
+            polygon: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 3.0], [0.0, 3.0]],
+            holes: Vec::new(),
+            single_sided: true,
+            regions: Vec::new(),
+        };
+        let regions = super::detect_split_levels(&pts, &slab, &BimOptions::default());
+        assert_eq!(regions.len(), 1, "detects 1 sloped region: {regions:?}");
+        assert!(regions[0].is_sloped, "marked as sloped");
+        assert!((regions[0].slope_deg - 5.7).abs() <= 0.6, "slope ~5.7 deg: got {}", regions[0].slope_deg);
+        assert!(regions[0].polygon.len() >= 3);
+    }
+
+    #[test]
+    fn detect_split_levels_flat_slab_returns_empty_regions() {
+        let mut pts = Vec::new();
+        let step = 0.10;
+        for ix in 0..=40 {
+            let x = ix as f64 * step;
+            for iy in 0..=40 {
+                let y = iy as f64 * step;
+                pts.push([x, y, 0.0]);
+            }
+        }
+        let slab = Slab {
+            base_z: -0.20,
+            top_z: 0.0,
+            thickness: 0.20,
+            polygon: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]],
+            holes: Vec::new(),
+            single_sided: true,
+            regions: Vec::new(),
+        };
+        let regions = super::detect_split_levels(&pts, &slab, &BimOptions::default());
+        assert!(regions.is_empty(), "flat uniform slab emits no split-level regions: {regions:?}");
+    }
+
+    #[test]
+    fn detect_stairs_in_hole_cylinder_finds_periodic_steps() {
+        let mut pts = Vec::new();
+        // 5 steps: riser dz = 0.18 m, tread dx = 0.28 m, width = 1.0 m (y in [1.5, 2.5])
+        for k in 0..5 {
+            let zk = 0.18 + k as f64 * 0.18;
+            let cx = 1.30 + k as f64 * 0.28;
+            for ix in 0..10 {
+                let x = cx - 0.10 + ix as f64 * 0.02;
+                for iy in 0..10 {
+                    let y = 1.55 + iy as f64 * 0.10;
+                    pts.push([x, y, zk]);
+                }
+            }
+        }
+
+        let slab_with_hole = Slab {
+            base_z: 2.80,
+            top_z: 3.00,
+            thickness: 0.20,
+            polygon: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 6.0], [0.0, 6.0]],
+            holes: vec![vec![[1.0, 1.0], [4.0, 1.0], [4.0, 4.0], [1.0, 4.0]]],
+            single_sided: false,
+            regions: Vec::new(),
+        };
+
+        let stairs = super::detect_stairs(&pts, &[slab_with_hole], 0, 0.0, 2.80);
+        assert_eq!(stairs.len(), 1, "detects exactly one stair flight: {stairs:?}");
+        let st = &stairs[0];
+        assert_eq!(st.storey_index, 0);
+        assert_eq!(st.num_risers, 5, "all 5 steps detected");
+        assert!((st.riser_height - 0.18).abs() <= 0.02, "riser height ~0.18: got {}", st.riser_height);
+        assert!((st.tread_depth - 0.28).abs() <= 0.03, "tread depth ~0.28: got {}", st.tread_depth);
+        assert!((st.width - 1.0).abs() <= 0.20, "stair width ~1.0: got {}", st.width);
+        assert!(st.top_z > st.base_z);
+    }
+
+    #[test]
+    fn detect_stairs_standalone_in_storey_points() {
+        let mut pts = Vec::new();
+        // 4 steps without hole
+        for k in 0..4 {
+            let zk = 0.20 + k as f64 * 0.17;
+            let cx = 2.0 + k as f64 * 0.26;
+            for ix in 0..8 {
+                let x = cx - 0.08 + ix as f64 * 0.02;
+                for iy in 0..8 {
+                    let y = 2.0 + iy as f64 * 0.12;
+                    pts.push([x, y, zk]);
+                }
+            }
+        }
+
+        let stairs = super::detect_stairs(&pts, &[], 1, 0.0, 2.80);
+        assert_eq!(stairs.len(), 1, "detects stair without holes: {stairs:?}");
+        assert_eq!(stairs[0].num_risers, 4);
+        assert_eq!(stairs[0].storey_index, 1);
+        assert!((stairs[0].riser_height - 0.17).abs() <= 0.02);
     }
 }

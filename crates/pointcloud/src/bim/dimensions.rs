@@ -119,6 +119,7 @@ mod tests {
             rooms: Vec::new(),
             columns: Vec::new(),
             openings: Vec::new(),
+            stairs: Vec::new(),
         }
     }
 

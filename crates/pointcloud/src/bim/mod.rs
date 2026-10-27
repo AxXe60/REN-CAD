@@ -24,7 +24,7 @@ pub use dimensions::{AutoDimension, generate_dimensions};
 pub use ifc::{Building as IfcBuilding, BuildingStorey as IfcStorey, IfcCheck, check as check_ifc, write as write_ifc};
 pub use openings::{Opening, OpeningKind, OpeningShape, band as opening_band, detect as detect_openings, detect_all as detect_all_openings};
 pub use raster::{Contour, MAX_RASTER_CELLS, Raster, close, contours, mask};
-pub use slabs::{MAX_Z_BINS, Slab};
+pub use slabs::{MAX_Z_BINS, Slab, SlabRegion, Stair, detect_split_levels, detect_stairs};
 pub use storeys::Storey;
 pub use walls::{Wall, WallArc, detect_curved_walls, fit_circle_kasa};
 pub use zones::Zone;
