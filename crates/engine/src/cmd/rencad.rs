@@ -668,7 +668,7 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
             let nx = -udy * stair.width * 0.5;
             let ny = udx * stair.width * 0.5;
             for k in 0..stair.num_risers {
-                let zk = stair.base_z + k as f64 * stair.riser_height;
+                let zk = stair.base_z + (k + 1) as f64 * stair.riser_height;
                 let t0 = k as f64 * stair.tread_depth;
                 let t1 = (k + 1) as f64 * stair.tread_depth;
                 let p1 = [stair.flight_axis[0][0] + udx * t0 - nx, stair.flight_axis[0][1] + udy * t0 - ny, zk];

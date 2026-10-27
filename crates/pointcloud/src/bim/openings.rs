@@ -723,7 +723,33 @@ pub fn detect_closed_doors(points: &[[f64; 3]], wall: &Wall, wall_index: usize, 
         }
     }
 
-    detected
+    let get_u_mid = |op: &Opening| -> f64 {
+        let u_from = (op.from[0] - wall.from[0]) * dux + (op.from[1] - wall.from[1]) * duy;
+        let u_to = (op.to[0] - wall.from[0]) * dux + (op.to[1] - wall.from[1]) * duy;
+        (u_from + u_to) * 0.5
+    };
+
+    let get_recess = |op: &Opening| -> f64 {
+        match op.kind {
+            OpeningKind::ClosedDoor { recess_depth } => recess_depth,
+            _ => 0.0,
+        }
+    };
+
+    let mut deduped: Vec<Opening> = Vec::new();
+    for cand in detected {
+        let u_cand = get_u_mid(&cand);
+        let rec_cand = get_recess(&cand);
+        if let Some(existing_pos) = deduped.iter().position(|d| (get_u_mid(d) - u_cand).abs() <= 0.30) {
+            if rec_cand > get_recess(&deduped[existing_pos]) {
+                deduped[existing_pos] = cand;
+            }
+        } else {
+            deduped.push(cand);
+        }
+    }
+    deduped.sort_by(|a, b| get_u_mid(a).total_cmp(&get_u_mid(b)));
+    deduped
 }
 
 // ---------------------------------------------------------------------------
@@ -954,5 +980,40 @@ mod tests {
         assert_eq!(door.shape, OpeningShape::Rectangular);
         assert!((door.width() - 0.90).abs() <= 0.03, "width ~0.90 m: {}", door.width());
         assert!((door.height() - 2.10).abs() <= 0.03, "height ~2.10 m: {}", door.height());
+    }
+
+    #[test]
+    fn dual_face_scanned_closed_door_does_not_duplicate() {
+        let o = BimOptions::default();
+        let mut pts = Vec::new();
+        // Wall faces at y = -0.10 and y = +0.10.
+        // Recessed door at x in [1.50, 2.40], z in [0.0, 2.10]:
+        // Front face: recess 0.03 m (y = 0.07 m)
+        // Back face: recess 0.05 m (y = -0.05 m)
+        for i in 0..200 {
+            let x = 0.01 + (i as f64) * 0.02;
+            for k in 0..150 {
+                let z = 0.01 + (k as f64) * 0.02;
+                let is_door = (1.50..=2.40).contains(&x) && z <= 2.10;
+
+                // Back face (y = -0.10 normal, -0.05 recessed -> 0.05 m recess)
+                let y_back = if is_door { -0.05 } else { -0.10 };
+                pts.push([x, y_back, z]);
+
+                // Front face (y = +0.10 normal, 0.07 recessed -> 0.03 m recess)
+                let y_front = if is_door { 0.07 } else { 0.10 };
+                pts.push([x, y_front, z]);
+            }
+        }
+
+        let got = detect(&pts, &wall(), 0, &o).expect("closed door detection");
+        assert_eq!(got.len(), 1, "exactly one closed door detected despite dual-face scan: {got:?}");
+        let door = &got[0];
+        match door.kind {
+            OpeningKind::ClosedDoor { recess_depth } => {
+                assert!((recess_depth - 0.05).abs() <= 0.01, "keeps larger recess ~0.05 m: {recess_depth}");
+            }
+            _ => panic!("expected ClosedDoor, got {:?}", door.kind),
+        }
     }
 }

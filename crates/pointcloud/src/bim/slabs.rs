@@ -579,7 +579,14 @@ pub fn detect_split_levels(points: &[[f64; 3]], slab: &Slab, opts: &BimOptions) 
     let mut valid_cells: Vec<CellData> = Vec::new();
     let mut cell_map: HashMap<(i32, i32), usize> = HashMap::new();
 
-    for (coord, pts) in grid {
+    let mut sorted_keys: Vec<(i32, i32)> = grid.keys().copied().collect();
+    sorted_keys.sort();
+
+    for coord in sorted_keys {
+        let pts = match grid.remove(&coord) {
+            Some(p) => p,
+            None => continue,
+        };
         if pts.len() < 3 {
             continue;
         }
@@ -702,7 +709,15 @@ pub fn detect_split_levels(points: &[[f64; 3]], slab: &Slab, opts: &BimOptions) 
 
             regions.push(SlabRegion { polygon: poly, base_z: mean_z - thickness, top_z: mean_z, is_sloped, slope_deg });
         }
-        regions.sort_by(|a, b| a.base_z.total_cmp(&b.base_z));
+        regions.sort_by(|a, b| {
+            a.base_z.total_cmp(&b.base_z).then_with(|| {
+                let acx = a.polygon.iter().map(|p| p[0]).sum::<f64>() / a.polygon.len().max(1) as f64;
+                let acy = a.polygon.iter().map(|p| p[1]).sum::<f64>() / a.polygon.len().max(1) as f64;
+                let bcx = b.polygon.iter().map(|p| p[0]).sum::<f64>() / b.polygon.len().max(1) as f64;
+                let bcy = b.polygon.iter().map(|p| p[1]).sum::<f64>() / b.polygon.len().max(1) as f64;
+                acx.total_cmp(&bcx).then_with(|| acy.total_cmp(&bcy))
+            })
+        });
         return regions;
     }
 

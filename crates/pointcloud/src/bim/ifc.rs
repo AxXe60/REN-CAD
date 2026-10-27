@@ -20,10 +20,11 @@
 
 use crate::bim::BimError;
 use crate::bim::columns::{Column, ColumnShape};
-use crate::bim::openings::{Opening, OpeningKind};
+use crate::bim::openings::{Opening, OpeningKind, OpeningShape};
 use crate::bim::slabs::{Slab, Stair};
 use crate::bim::walls::{Wall, WallArc};
 use crate::bim::zones::Zone;
+use cadcraft_geom::{Vec2, point_in_polygon};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BuildingStorey {
@@ -377,6 +378,9 @@ pub fn write(building: &Building) -> Result<String, BimError> {
 
         // --- Slabs ---
         for (sli, slab) in storey.slabs.iter().enumerate() {
+            let mut region_targets: Vec<(usize, usize, f64, f64, Vec<Vec2>)> = Vec::new();
+            let mut main_slab_target: Option<(usize, f64, f64)> = None;
+
             if !slab.regions.is_empty() {
                 for (ri, region) in slab.regions.iter().enumerate() {
                     let valid: Vec<[f64; 2]> = region.polygon.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).copied().collect();
@@ -406,6 +410,8 @@ pub fn write(building: &Building) -> Result<String, BimError> {
                     let slab_ent =
                         w.entity("IFCSLAB", &format!("'{}',#{},{},{},$,#{},#{},$,{}", slab_guid, owner, slab_name, desc, slab_place, pds, pred_type));
                     sd.element_ids.push(slab_ent);
+                    let reg_vec2: Vec<Vec2> = valid.iter().map(|p| Vec2::new(p[0], p[1])).collect();
+                    region_targets.push((ri, slab_ent, region.base_z, reg_thickness, reg_vec2));
                     let _ = shape;
                 }
             } else {
@@ -434,24 +440,61 @@ pub fn write(building: &Building) -> Result<String, BimError> {
                 let slab_ent = w.entity("IFCSLAB", &format!("'{}',#{},{},$,$,#{},#{},$,{}", slab_guid, owner, slab_name, slab_place, pds, pred_type));
 
                 sd.element_ids.push(slab_ent);
+                main_slab_target = Some((slab_ent, slab.base_z, slab.thickness));
+                let _ = shape;
+            }
 
-                for (hi, hole) in slab.holes.iter().enumerate() {
-                    let valid_hole: Vec<[f64; 2]> = hole.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).copied().collect();
-                    if valid_hole.len() < 3 {
+            for (hi, hole) in slab.holes.iter().enumerate() {
+                let valid_hole: Vec<[f64; 2]> = hole.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).copied().collect();
+                if valid_hole.len() < 3 {
+                    continue;
+                }
+                let (target_slab_ent, hole_base_z, hole_thickness) = if !slab.regions.is_empty() {
+                    if region_targets.is_empty() {
                         continue;
                     }
-                    let hole_place = write_element_placement(&mut w, storey_place, 0.0, 0.0, slab.base_z, 1.0, 0.0, 0.0, z_dir);
-                    let (hole_shape, hole_pds) = write_element_body(&mut w, &valid_hole, slab.thickness, z_dir, body_ctx);
-                    let hole_guid = w.next_guid();
-                    let hole_name = step_string(&format!("Slab Opening {}", hi + 1));
-                    let hole_ent = w.entity(
-                        "IFCOPENINGELEMENT",
-                        &format!("'{}',#{},{},{},#{},#{},$,.OPENING.", hole_guid, owner, hole_name, "$", hole_place, hole_pds),
-                    );
-                    sd.void_rels.push((slab_ent, hole_ent));
-                    let _ = hole_shape;
-                }
-                let _ = shape;
+                    let cx = valid_hole.iter().map(|p| p[0]).sum::<f64>() / valid_hole.len() as f64;
+                    let cy = valid_hole.iter().map(|p| p[1]).sum::<f64>() / valid_hole.len() as f64;
+                    let c = Vec2::new(cx, cy);
+
+                    let matched = region_targets
+                        .iter()
+                        .find(|(_, _, _, _, poly)| {
+                            point_in_polygon(poly, c) || valid_hole.iter().any(|p| point_in_polygon(poly, Vec2::new(p[0], p[1])))
+                        })
+                        .or_else(|| {
+                            region_targets.iter().min_by(|a, b| {
+                                let acx = a.4.iter().map(|p| p.x).sum::<f64>() / a.4.len().max(1) as f64;
+                                let acy = a.4.iter().map(|p| p.y).sum::<f64>() / a.4.len().max(1) as f64;
+                                let bcx = b.4.iter().map(|p| p.x).sum::<f64>() / b.4.len().max(1) as f64;
+                                let bcy = b.4.iter().map(|p| p.y).sum::<f64>() / b.4.len().max(1) as f64;
+                                let da = (acx - cx).hypot(acy - cy);
+                                let db = (bcx - cx).hypot(bcy - cy);
+                                da.total_cmp(&db)
+                            })
+                        });
+
+                    match matched {
+                        Some((_, ent, bz, th, _)) => (*ent, *bz, *th),
+                        None => continue,
+                    }
+                } else {
+                    match main_slab_target {
+                        Some((ent, bz, th)) => (ent, bz, th),
+                        None => continue,
+                    }
+                };
+
+                let hole_place = write_element_placement(&mut w, storey_place, 0.0, 0.0, hole_base_z, 1.0, 0.0, 0.0, z_dir);
+                let (hole_shape, hole_pds) = write_element_body(&mut w, &valid_hole, hole_thickness, z_dir, body_ctx);
+                let hole_guid = w.next_guid();
+                let hole_name = step_string(&format!("Slab Opening {}", hi + 1));
+                let hole_ent = w.entity(
+                    "IFCOPENINGELEMENT",
+                    &format!("'{}',#{},{},{},#{},#{},$,.OPENING.", hole_guid, owner, hole_name, "$", hole_place, hole_pds),
+                );
+                sd.void_rels.push((target_slab_ent, hole_ent));
+                let _ = hole_shape;
             }
         }
 
@@ -528,10 +571,15 @@ pub fn write(building: &Building) -> Result<String, BimError> {
             let profile_pts = [[0.0, -t / 2.0], [ow, -t / 2.0], [ow, t / 2.0], [0.0, t / 2.0]];
             let (shape, pds) = write_element_body(&mut w, &profile_pts, oh, z_dir, body_ctx);
 
+            let open_desc = match opening.shape {
+                OpeningShape::Arched { arch_radius } => step_string(&format!("Arched opening R={:.3}m", arch_radius)),
+                OpeningShape::Rectangular => "$".to_string(),
+            };
+
             let open_guid = w.next_guid();
             let open_name = step_string(&format!("Opening {}", oi + 1));
-            let open_ent =
-                w.entity("IFCOPENINGELEMENT", &format!("'{}',#{},{},{},#{},#{},$,.OPENING.", open_guid, owner, open_name, "$", open_place, pds));
+            let open_ent = w
+                .entity("IFCOPENINGELEMENT", &format!("'{}',#{},{},{},#{},#{},$,.OPENING.", open_guid, owner, open_name, open_desc, open_place, pds));
 
             sd.void_rels.push((wall_ent, open_ent));
             let _ = shape;
@@ -544,9 +592,12 @@ pub fn write(building: &Building) -> Result<String, BimError> {
             match opening.kind {
                 OpeningKind::Door | OpeningKind::ClosedDoor { .. } => {
                     let door_name = step_string(&format!("Door {}", oi + 1));
-                    let door_desc = match opening.kind {
-                        OpeningKind::ClosedDoor { recess_depth } => step_string(&format!("Closed door recess={:.3}m", recess_depth)),
-                        _ => "$".to_string(),
+                    let door_desc = match opening.shape {
+                        OpeningShape::Arched { arch_radius } => step_string(&format!("Arched opening R={:.3}m", arch_radius)),
+                        OpeningShape::Rectangular => match opening.kind {
+                            OpeningKind::ClosedDoor { recess_depth } => step_string(&format!("Closed door recess={:.3}m", recess_depth)),
+                            _ => "$".to_string(),
+                        },
                     };
                     let door_ent = w.entity(
                         "IFCDOOR",
@@ -567,6 +618,10 @@ pub fn write(building: &Building) -> Result<String, BimError> {
                 }
                 OpeningKind::Window => {
                     let win_name = step_string(&format!("Window {}", oi + 1));
+                    let win_desc = match opening.shape {
+                        OpeningShape::Arched { arch_radius } => step_string(&format!("Arched opening R={:.3}m", arch_radius)),
+                        OpeningShape::Rectangular => "$".to_string(),
+                    };
                     let win_ent = w.entity(
                         "IFCWINDOW",
                         &format!(
@@ -574,7 +629,7 @@ pub fn write(building: &Building) -> Result<String, BimError> {
                             fill_guid,
                             owner,
                             win_name,
-                            "$",
+                            win_desc,
                             open_place,
                             fill_pds,
                             fmt_real(oh),
@@ -1401,5 +1456,105 @@ mod tests {
         let chk = check(&step).expect("check passes");
         assert_eq!(chk.slabs, 2, "two regions exported as separate slabs");
         assert_eq!(chk.stairs, 1, "one stair flight exported and counted");
+    }
+
+    #[test]
+    fn split_level_slab_with_holes_writes_void_rels() {
+        use crate::bim::slabs::SlabRegion;
+        let building = Building {
+            name: "SplitLevelHoles".to_string(),
+            timestamp: 100,
+            storeys: vec![BuildingStorey {
+                name: "Storey 1".to_string(),
+                elevation: 0.0,
+                height: 2.8,
+                walls: Vec::new(),
+                slabs: vec![Slab {
+                    base_z: 0.0,
+                    top_z: 0.20,
+                    thickness: 0.20,
+                    polygon: vec![[0.0, 0.0], [20.0, 0.0], [20.0, 10.0], [0.0, 10.0]],
+                    holes: vec![vec![[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0]]],
+                    single_sided: false,
+                    regions: vec![
+                        SlabRegion {
+                            polygon: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+                            base_z: 0.0,
+                            top_z: 0.20,
+                            is_sloped: false,
+                            slope_deg: 0.0,
+                        },
+                        SlabRegion {
+                            polygon: vec![[10.0, 0.0], [20.0, 0.0], [20.0, 10.0], [10.0, 10.0]],
+                            base_z: 0.40,
+                            top_z: 0.60,
+                            is_sloped: false,
+                            slope_deg: 0.0,
+                        },
+                    ],
+                }],
+                zones: Vec::new(),
+                openings: Vec::new(),
+                columns: Vec::new(),
+                stairs: Vec::new(),
+            }],
+        };
+        let step = write(&building).expect("writes");
+        assert!(step.contains("IFCSLAB"));
+        assert!(step.contains("IFCOPENINGELEMENT"));
+        assert!(step.contains("IFCRELVOIDSELEMENT"));
+        let chk = check(&step).expect("self-check resolves all references");
+        assert_eq!(chk.slabs, 2);
+        assert_eq!(chk.openings, 1);
+
+        let slab1_id = step
+            .lines()
+            .find(|l| l.contains("IFCSLAB") && l.contains("Slab 1 Region 1"))
+            .and_then(|l| l.split('=').next())
+            .expect("finds region 1 slab line");
+        let void_line = step.lines().find(|l| l.contains("IFCRELVOIDSELEMENT")).expect("finds void rel line");
+        assert!(void_line.contains(slab1_id), "void rel must link to region 1 slab: {void_line} with {slab1_id}");
+    }
+
+    #[test]
+    fn arched_opening_writes_description() {
+        let building = Building {
+            name: "Arched".to_string(),
+            timestamp: 100,
+            storeys: vec![BuildingStorey {
+                name: "Storey 1".to_string(),
+                elevation: 0.0,
+                height: 2.8,
+                walls: vec![Wall {
+                    from: [0.0, 0.0],
+                    to: [5.0, 0.0],
+                    thickness: 0.20,
+                    height: 2.8,
+                    base_z: 0.0,
+                    exterior: true,
+                    is_parapet: false,
+                    arc: None,
+                }],
+                slabs: Vec::new(),
+                zones: Vec::new(),
+                openings: vec![Opening {
+                    wall: 0,
+                    kind: OpeningKind::Door,
+                    shape: OpeningShape::Arched { arch_radius: 0.45 },
+                    from: [1.0, 0.0],
+                    to: [1.9, 0.0],
+                    thickness: 0.20,
+                    sill_z: 0.0,
+                    head_z: 2.1,
+                }],
+                columns: Vec::new(),
+                stairs: Vec::new(),
+            }],
+        };
+        let step = write(&building).expect("writes");
+        assert!(step.contains("Arched opening R=0.450m"));
+        let chk = check(&step).expect("self-check passes");
+        assert_eq!(chk.openings, 1);
+        assert_eq!(chk.doors, 1);
     }
 }
