@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use cadcraft_doc::{Common, DimKind, EntityKind, HAlign, Space, Text, VAlign};
+use cadcraft_doc::{Common, DimKind, EntityKind, Face3d, HAlign, Space, Text, VAlign};
 use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use cadcraft_pointcloud::bim::{deviate, dimensions, ifc, openings};
 use cadcraft_pointcloud::{AutoRlvResult, BimOptions, StoreyModel, slice_bands_capped};
@@ -137,6 +137,36 @@ fn add_on_layer(s: &mut Session, layer_name: &str, kind: EntityKind) -> Result<S
     let common = Common { layer: layer_name.to_string(), ..Common::default() };
     let h = d.add(&Space::Model, common, kind)?;
     Ok(h.hex())
+}
+
+fn add_quad_face(s: &mut Session, layer: &str, pts: [[f64; 3]; 4]) -> Result<()> {
+    let face = Face3d {
+        corners: [
+            Vec3::new(pts[0][0], pts[0][1], pts[0][2]),
+            Vec3::new(pts[1][0], pts[1][1], pts[1][2]),
+            Vec3::new(pts[2][0], pts[2][1], pts[2][2]),
+            Vec3::new(pts[3][0], pts[3][1], pts[3][2]),
+        ],
+        hidden_edges: 0,
+    };
+    let _ = add_on_layer(s, layer, EntityKind::Face3d(face))?;
+    s.sketch.add(&pts, layer, true);
+    Ok(())
+}
+
+fn add_tri_face(s: &mut Session, layer: &str, pts: [[f64; 3]; 3]) -> Result<()> {
+    let face = Face3d {
+        corners: [
+            Vec3::new(pts[0][0], pts[0][1], pts[0][2]),
+            Vec3::new(pts[1][0], pts[1][1], pts[1][2]),
+            Vec3::new(pts[2][0], pts[2][1], pts[2][2]),
+            Vec3::new(pts[2][0], pts[2][1], pts[2][2]),
+        ],
+        hidden_edges: 0,
+    };
+    let _ = add_on_layer(s, layer, EntityKind::Face3d(face))?;
+    s.sketch.add(&pts, layer, true);
+    Ok(())
 }
 
 fn add_label(s: &mut Session, layer_name: &str, at: [f64; 2], height: f64, value: String) -> Result<String> {
@@ -572,34 +602,136 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
     let rlv = cadcraft_pointcloud::extract_auto_rlv(&pts, &opts).map_err(|e| EngineError::Other(format!("Auto-3D: {e}")))?;
     let per_storey = storey_openings(&path, &rlv.storeys, &opts);
 
-    let mut wall_planes = 0usize;
-    for model in &rlv.storeys {
-        for w in &model.walls {
-            let a = Vec2::new(w.from[0], w.from[1]);
-            let b = Vec2::new(w.to[0], w.to[1]);
-            if a.near(b, 1e-6) {
+    let mut wall_faces = 0usize;
+    let mut wall_count = 0usize;
+    for (s_idx, model) in rlv.storeys.iter().enumerate() {
+        let holes = per_storey.get(s_idx).cloned().unwrap_or_default();
+        for (w_idx, w) in model.walls.iter().enumerate() {
+            let dx = w.to[0] - w.from[0];
+            let dy = w.to[1] - w.from[1];
+            let len = dx.hypot(dy);
+            if !len.is_finite() || len <= 1e-6 {
                 continue;
             }
-            let _ = add_on_layer(s, "RLV_3D_WALLS", line(a, b))?;
-            let (dx, dy) = (w.to[0] - w.from[0], w.to[1] - w.from[1]);
-            let length = (dx * dx + dy * dy).sqrt();
-            if !length.is_finite() || length <= 0.0 {
-                continue;
+            let ux = dx / len;
+            let uy = dy / len;
+            let half_t = w.thickness / 2.0;
+            let nx = -uy * half_t;
+            let ny = ux * half_t;
+
+            struct WallOp {
+                u_a: f64,
+                u_b: f64,
+                kind: openings::OpeningKind,
+                sill_z: f64,
+                head_z: f64,
             }
-            let (nx, ny) = (-dy / length * w.thickness * 0.5, dx / length * w.thickness * 0.5);
-            for side in [1.0, -1.0] {
-                let x1 = w.from[0] + nx * side;
-                let y1 = w.from[1] + ny * side;
-                let x2 = w.to[0] + nx * side;
-                let y2 = w.to[1] + ny * side;
-                let face = [[x1, y1, w.base_z], [x2, y2, w.base_z], [x2, y2, w.base_z + w.height], [x1, y1, w.base_z + w.height]];
-                s.sketch.add(&face, "RLV_3D_WALLS", true);
+            let mut ops: Vec<WallOp> = Vec::new();
+            for op in &holes {
+                if op.wall != w_idx {
+                    continue;
+                }
+                let t_from = (op.from[0] - w.from[0]) * ux + (op.from[1] - w.from[1]) * uy;
+                let t_to = (op.to[0] - w.from[0]) * ux + (op.to[1] - w.from[1]) * uy;
+                let ua = t_from.min(t_to).clamp(0.0, len);
+                let ub = t_from.max(t_to).clamp(0.0, len);
+                if ub - ua > 1e-4 {
+                    ops.push(WallOp { u_a: ua, u_b: ub, kind: op.kind, sill_z: op.sill_z, head_z: op.head_z });
+                }
             }
-            wall_planes += 1;
+
+            ops.sort_by(|a, b| a.u_a.total_cmp(&b.u_a).then(a.u_b.total_cmp(&b.u_b)));
+
+            let mut merged: Vec<WallOp> = Vec::new();
+            for op in ops {
+                if let Some(prev) = merged.last_mut()
+                    && op.u_a < prev.u_b
+                {
+                    if op.u_b > prev.u_b {
+                        let mut truncated = op;
+                        truncated.u_a = prev.u_b;
+                        if truncated.u_b - truncated.u_a > 1e-4 {
+                            merged.push(truncated);
+                        }
+                    }
+                    continue;
+                }
+                merged.push(op);
+            }
+
+            let mut blocks: Vec<(f64, f64, f64, f64)> = Vec::new();
+            let wall_top_z = w.base_z + w.height;
+            let mut u_cur = 0.0;
+
+            for op in &merged {
+                if op.u_a > u_cur + 1e-4 {
+                    blocks.push((u_cur, op.u_a, w.base_z, wall_top_z));
+                }
+                match op.kind {
+                    openings::OpeningKind::Door | openings::OpeningKind::ClosedDoor { .. } => {
+                        let z0 = op.head_z;
+                        let z1 = wall_top_z;
+                        if z1 - z0 > 0.05 {
+                            blocks.push((op.u_a, op.u_b, z0, z1));
+                        }
+                    }
+                    openings::OpeningKind::Window => {
+                        let sill_z0 = w.base_z;
+                        let sill_z1 = op.sill_z;
+                        if sill_z1 - sill_z0 > 0.05 {
+                            blocks.push((op.u_a, op.u_b, sill_z0, sill_z1));
+                        }
+                        let head_z0 = op.head_z;
+                        let head_z1 = wall_top_z;
+                        if head_z1 - head_z0 > 0.05 {
+                            blocks.push((op.u_a, op.u_b, head_z0, head_z1));
+                        }
+                    }
+                }
+                u_cur = op.u_b;
+            }
+            if len > u_cur + 1e-4 {
+                blocks.push((u_cur, len, w.base_z, wall_top_z));
+            }
+
+            for (u1, u2, z0, z1) in blocks {
+                if u2 - u1 <= 1e-4 || z1 - z0 <= 1e-4 {
+                    continue;
+                }
+                let pa_x = w.from[0] + ux * u1;
+                let pa_y = w.from[1] + uy * u1;
+                let pb_x = w.from[0] + ux * u2;
+                let pb_y = w.from[1] + uy * u2;
+
+                let v0 = [pa_x + nx, pa_y + ny, z0];
+                let v1 = [pb_x + nx, pb_y + ny, z0];
+                let v2 = [pb_x - nx, pb_y - ny, z0];
+                let v3 = [pa_x - nx, pa_y - ny, z0];
+
+                let v4 = [pa_x + nx, pa_y + ny, z1];
+                let v5 = [pb_x + nx, pb_y + ny, z1];
+                let v6 = [pb_x - nx, pb_y - ny, z1];
+                let v7 = [pa_x - nx, pa_y - ny, z1];
+
+                let faces = [
+                    [v0, v1, v5, v4], // Front
+                    [v2, v3, v7, v6], // Back
+                    [v3, v0, v4, v7], // Left cap
+                    [v1, v2, v6, v5], // Right cap
+                    [v4, v5, v6, v7], // Top cap
+                    [v3, v2, v1, v0], // Bottom base
+                ];
+                for f in &faces {
+                    add_quad_face(s, "3D_WALLS", *f)?;
+                    wall_faces += 1;
+                }
+            }
+            wall_count += 1;
         }
     }
 
     let mut col_count = 0usize;
+    let mut col_faces = 0usize;
     for model in &rlv.storeys {
         for col in &model.columns {
             let z0 = col.base_z;
@@ -608,13 +740,19 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
                 cadcraft_pointcloud::bim::ColumnShape::Circular { diameter } => {
                     let r = diameter / 2.0;
                     let segments = 16;
+                    let mut ring = Vec::with_capacity(segments);
                     for i in 0..segments {
-                        let a1 = (i as f64 * 360.0 / segments as f64).to_radians();
-                        let a2 = ((i + 1) as f64 * 360.0 / segments as f64).to_radians();
-                        let p1 = [col.center[0] + r * a1.cos(), col.center[1] + r * a1.sin()];
-                        let p2 = [col.center[0] + r * a2.cos(), col.center[1] + r * a2.sin()];
+                        let a = (i as f64 * 360.0 / segments as f64).to_radians();
+                        ring.push([col.center[0] + r * a.cos(), col.center[1] + r * a.sin()]);
+                    }
+                    for i in 0..segments {
+                        let p1 = ring[i];
+                        let p2 = ring[(i + 1) % segments];
                         let face = [[p1[0], p1[1], z0], [p2[0], p2[1], z0], [p2[0], p2[1], z1], [p1[0], p1[1], z1]];
-                        s.sketch.add(&face, "RLV_3D_COLUMNS", true);
+                        add_quad_face(s, "3D_COLUMNS", face)?;
+                        add_tri_face(s, "3D_COLUMNS", [[col.center[0], col.center[1], z0], [p2[0], p2[1], z0], [p1[0], p1[1], z0]])?;
+                        add_tri_face(s, "3D_COLUMNS", [[col.center[0], col.center[1], z1], [p1[0], p1[1], z1], [p2[0], p2[1], z1]])?;
+                        col_faces += 3;
                     }
                 }
                 cadcraft_pointcloud::bim::ColumnShape::Rectangular { width, depth, rotation_deg } => {
@@ -624,37 +762,89 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
                     let hw = width / 2.0;
                     let hd = depth / 2.0;
                     let corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]];
-                    let world_pts: Vec<[f64; 2]> =
+                    let pts: Vec<[f64; 2]> =
                         corners.iter().map(|[lx, ly]| [col.center[0] + lx * cos_a - ly * sin_a, col.center[1] + lx * sin_a + ly * cos_a]).collect();
                     for i in 0..4 {
-                        let p1 = world_pts[i];
-                        let p2 = world_pts[(i + 1) % 4];
+                        let p1 = pts[i];
+                        let p2 = pts[(i + 1) % 4];
                         let face = [[p1[0], p1[1], z0], [p2[0], p2[1], z0], [p2[0], p2[1], z1], [p1[0], p1[1], z1]];
-                        s.sketch.add(&face, "RLV_3D_COLUMNS", true);
+                        add_quad_face(s, "3D_COLUMNS", face)?;
+                        col_faces += 1;
                     }
+                    // Bottom base face
+                    add_quad_face(
+                        s,
+                        "3D_COLUMNS",
+                        [[pts[3][0], pts[3][1], z0], [pts[2][0], pts[2][1], z0], [pts[1][0], pts[1][1], z0], [pts[0][0], pts[0][1], z0]],
+                    )?;
+                    // Top cap face
+                    add_quad_face(
+                        s,
+                        "3D_COLUMNS",
+                        [[pts[0][0], pts[0][1], z1], [pts[1][0], pts[1][1], z1], [pts[2][0], pts[2][1], z1], [pts[3][0], pts[3][1], z1]],
+                    )?;
+                    col_faces += 2;
                 }
             }
             col_count += 1;
         }
     }
 
+    let mut slab_count = 0usize;
     let mut slab_faces = 0usize;
     for (i, slab) in rlv.slabs.iter().enumerate() {
         if slab.polygon.len() < 3 {
             continue;
         }
-        // The face a person sees from the room: the walking surface for the lowest slab, the
-        // underside for every slab above it.
-        let z = if i == 0 { slab.top_z } else { slab.base_z };
-        let face: Vec<[f64; 3]> = slab.polygon.iter().map(|pt| [pt[0], pt[1], z]).collect();
-        s.sketch.add(&face, "RLV_3D_SLABS", true);
+        let (z0, z1) = if i == 0 { (slab.top_z - 0.20, slab.top_z) } else { (slab.base_z, slab.base_z + 0.20) };
+
+        let n_pts = slab.polygon.len();
+        for k in 0..n_pts {
+            let p1 = slab.polygon[k];
+            let p2 = slab.polygon[(k + 1) % n_pts];
+            let side_face = [[p1[0], p1[1], z0], [p2[0], p2[1], z0], [p2[0], p2[1], z1], [p1[0], p1[1], z1]];
+            add_quad_face(s, "3D_SLABS", side_face)?;
+            slab_faces += 1;
+        }
+
         for hole in &slab.holes {
             if hole.len() >= 3 {
-                let hface: Vec<[f64; 3]> = hole.iter().map(|pt| [pt[0], pt[1], z]).collect();
-                s.sketch.add(&hface, "RLV_3D_SLABS", true);
+                let n_hole = hole.len();
+                for k in 0..n_hole {
+                    let p1 = hole[k];
+                    let p2 = hole[(k + 1) % n_hole];
+                    let hole_rim = [[p1[0], p1[1], z0], [p2[0], p2[1], z0], [p2[0], p2[1], z1], [p1[0], p1[1], z1]];
+                    add_quad_face(s, "3D_SLABS", hole_rim)?;
+                    slab_faces += 1;
+                }
             }
         }
-        slab_faces += 1;
+
+        let outer: Vec<Vec2> = slab.polygon.iter().map(|pt| Vec2::new(pt[0], pt[1])).collect();
+        let mut loops = vec![outer];
+        for hole in &slab.holes {
+            if hole.len() >= 3 {
+                loops.push(hole.iter().map(|pt| Vec2::new(pt[0], pt[1])).collect());
+            }
+        }
+        let tris = cadcraft_render::triangulate_evenodd(&loops);
+        if !tris.is_empty() && tris.len().is_multiple_of(3) {
+            for chunk in tris.chunks_exact(3) {
+                add_tri_face(s, "3D_SLABS", [[chunk[0].x, chunk[0].y, z1], [chunk[1].x, chunk[1].y, z1], [chunk[2].x, chunk[2].y, z1]])?;
+                add_tri_face(s, "3D_SLABS", [[chunk[0].x, chunk[0].y, z0], [chunk[2].x, chunk[2].y, z0], [chunk[1].x, chunk[1].y, z0]])?;
+                slab_faces += 2;
+            }
+        } else {
+            for k in 1..n_pts.saturating_sub(1) {
+                let p0 = slab.polygon[0];
+                let pk = slab.polygon[k];
+                let pk1 = slab.polygon[k + 1];
+                add_tri_face(s, "3D_SLABS", [[p0[0], p0[1], z1], [pk[0], pk[1], z1], [pk1[0], pk1[1], z1]])?;
+                add_tri_face(s, "3D_SLABS", [[p0[0], p0[1], z0], [pk1[0], pk1[1], z0], [pk[0], pk[1], z0]])?;
+                slab_faces += 2;
+            }
+        }
+        slab_count += 1;
     }
 
     let mut stair_count = 0usize;
@@ -676,7 +866,7 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
                 let p3 = [stair.flight_axis[0][0] + udx * t1 + nx, stair.flight_axis[0][1] + udy * t1 + ny, zk];
                 let p4 = [stair.flight_axis[0][0] + udx * t1 - nx, stair.flight_axis[0][1] + udy * t1 - ny, zk];
                 let face = [p1, p2, p3, p4];
-                s.sketch.add(&face, "RLV_3D_STAIRS", true);
+                add_quad_face(s, "RLV_3D_STAIRS", face)?;
             }
             stair_count += 1;
         }
@@ -690,9 +880,13 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
 
     let mut reply = json!({
         "message": format!(
-            "Auto-3D Building: {} wall planes (two faces each), {} slab faces, {} openings ({} doors, {} windows){}",
-            wall_planes,
+            "Auto-3D Building: {} solid walls ({} faces), {} slabs ({} faces), {} columns ({} faces), {} openings ({} doors, {} windows){}",
+            wall_count,
+            wall_faces,
+            slab_count,
             slab_faces,
+            col_count,
+            col_faces,
             opening_count,
             doors,
             windows,
@@ -700,8 +894,8 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
         ),
         "floorZ": rlv.floor_z,
         "ceilingZ": rlv.ceiling_z,
-        "walls3d": wall_planes,
-        "slabs": slab_faces,
+        "walls3d": wall_count,
+        "slabs": slab_count,
         "columns": col_count,
         "parapets": rlv.parapets(),
         "stairs": stair_count,
@@ -713,7 +907,7 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
             "fineBands": if path.is_empty() { "unavailable" } else { "streamed" },
         },
         "notAvailable": [],
-        "drawn": {"walls": wall_planes, "slabs": slab_faces, "columns": col_count, "parapets": rlv.parapets(), "stairs": stair_count},
+        "drawn": {"walls": wall_count, "slabs": slab_count, "columns": col_count, "parapets": rlv.parapets(), "stairs": stair_count},
     });
     if let Some(ifc) = ifc_json {
         reply["ifc"] = ifc;

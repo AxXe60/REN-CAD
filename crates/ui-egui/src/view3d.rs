@@ -998,16 +998,117 @@ fn draw_sketch(painter: &egui::Painter, view: &View3d, vp: &[f32; 16], rect: Rec
         return;
     }
     let screen = Screen::new(view, *vp, rect);
+
+    // Light direction normalized: [0.4, 0.6, 0.8]
+    let l_len = (0.4_f64 * 0.4 + 0.6 * 0.6 + 0.8 * 0.8).sqrt();
+    let (lx, ly, lz) = (0.4 / l_len, 0.6 / l_len, 0.8 / l_len);
+
+    struct ShadedFace {
+        pts_2d: Vec<Pos2>,
+        shaded_color: egui::Color32,
+        edge_stroke: egui::Color32,
+        dist: f64,
+    }
+
+    let mut faces: Vec<ShadedFace> = Vec::new();
+
+    for stroke in sketch.strokes() {
+        if stroke.closed && (stroke.points.len() == 3 || stroke.points.len() == 4) {
+            let mut pts_2d = Vec::with_capacity(stroke.points.len());
+            let mut all_projected = true;
+            let mut sum = [0.0; 3];
+            for p in &stroke.points {
+                if let Some(pos) = screen.project(*p) {
+                    pts_2d.push(pos);
+                    sum[0] += p[0];
+                    sum[1] += p[1];
+                    sum[2] += p[2];
+                } else {
+                    all_projected = false;
+                    break;
+                }
+            }
+            if !all_projected || pts_2d.len() < 3 {
+                continue;
+            }
+
+            // 3D face normal: E1 = P1 - P0, E2 = P2 - P0, N = E1 x E2, normalize N
+            let p0 = stroke.points[0];
+            let p1 = stroke.points[1];
+            let p2 = stroke.points[2];
+            let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+            let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+            let nx = e1[1] * e2[2] - e1[2] * e2[1];
+            let ny = e1[2] * e2[0] - e1[0] * e2[2];
+            let nz = e1[0] * e2[1] - e1[1] * e2[0];
+            let n_len = (nx * nx + ny * ny + nz * nz).sqrt();
+            let (nx, ny, nz) = if n_len > 1e-9 { (nx / n_len, ny / n_len, nz / n_len) } else { (0.0, 0.0, 1.0) };
+
+            // Directional diffuse lighting: diffuse = |N · L|, shade = 0.35 + 0.65 * diffuse
+            let diffuse = (nx * lx + ny * ly + nz * lz).abs();
+            let shade = (0.35 + 0.65 * diffuse).clamp(0.0, 1.0);
+
+            // Determine base color from layer
+            let base_color = match stroke.layer.as_str() {
+                "3D_WALLS" | "RLV_3D_WALLS" => egui::Color32::from_rgb(225, 220, 210),
+                "3D_SLABS" | "RLV_3D_SLABS" => egui::Color32::from_rgb(175, 180, 185),
+                "3D_COLUMNS" | "RLV_3D_COLUMNS" => egui::Color32::from_rgb(150, 165, 185),
+                _ => egui::Color32::from_rgb(210, 205, 195),
+            };
+
+            // Multiply base RGB by shade
+            let shaded_color = egui::Color32::from_rgb(
+                ((base_color.r() as f64) * shade).clamp(0.0, 255.0).round() as u8,
+                ((base_color.g() as f64) * shade).clamp(0.0, 255.0).round() as u8,
+                ((base_color.b() as f64) * shade).clamp(0.0, 255.0).round() as u8,
+            );
+
+            let edge_stroke = egui::Color32::from_rgb(
+                ((shaded_color.r() as f64) * 0.70).round() as u8,
+                ((shaded_color.g() as f64) * 0.70).round() as u8,
+                ((shaded_color.b() as f64) * 0.70).round() as u8,
+            );
+
+            // Centroid distance to camera eye
+            let count_p = stroke.points.len() as f64;
+            let c = [sum[0] / count_p, sum[1] / count_p, sum[2] / count_p];
+            let eye_d = [c[0] - screen.eye[0], c[1] - screen.eye[1], c[2] - screen.eye[2]];
+            let dist = (eye_d[0] * eye_d[0] + eye_d[1] * eye_d[1] + eye_d[2] * eye_d[2]).sqrt();
+
+            faces.push(ShadedFace { pts_2d, shaded_color, edge_stroke, dist });
+        }
+    }
+
+    // Painter's algorithm: sort descending by centroid distance to camera (eye) (furthest first)
+    faces.sort_by(|a, b| b.dist.total_cmp(&a.dist));
+
+    for face in faces {
+        painter.add(egui::Shape::convex_polygon(face.pts_2d, face.shaded_color, egui::Stroke::new(1.0, face.edge_stroke)));
+    }
+
+    // Draw non-solid drafting strokes as wireframe
     let color = egui::Color32::from_rgb(0xF2, 0x7A, 0x1A);
     // The casing: a dark line under every stroke, so a traced line reads over a bright cloud.
     let casing = egui::Color32::from_black_alpha(215);
-    for (a, b) in sketch.iter_segments() {
-        if let (Some(pa), Some(pb)) = (screen.project(a), screen.project(b)) {
+    for stroke in sketch.strokes() {
+        if stroke.closed && (stroke.points.len() == 3 || stroke.points.len() == 4) {
+            continue;
+        }
+        let n = stroke.points.len();
+        for i in 0..n.saturating_sub(1) {
+            if let (Some(pa), Some(pb)) = (screen.project(stroke.points[i]), screen.project(stroke.points[i + 1])) {
+                painter.line_segment([pa, pb], egui::Stroke::new(4.5, casing));
+                painter.line_segment([pa, pb], egui::Stroke::new(2.0, color));
+            }
+        }
+        if stroke.closed
+            && n >= 2
+            && stroke.points[n - 1] != stroke.points[0]
+            && let (Some(pa), Some(pb)) = (screen.project(stroke.points[n - 1]), screen.project(stroke.points[0]))
+        {
             painter.line_segment([pa, pb], egui::Stroke::new(4.5, casing));
             painter.line_segment([pa, pb], egui::Stroke::new(2.0, color));
         }
-    }
-    for stroke in sketch.strokes() {
         for p in &stroke.points {
             if let Some(q) = screen.project(*p) {
                 painter.circle_filled(q, 2.5, color);
