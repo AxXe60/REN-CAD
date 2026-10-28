@@ -829,7 +829,7 @@ fn auto3d(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let tris = cadcraft_render::triangulate_evenodd(&loops);
         if !tris.is_empty() && tris.len().is_multiple_of(3) {
-            for chunk in tris.chunks_exact(3) {
+            for chunk in tris.chunks(3) {
                 add_tri_face(s, "3D_SLABS", [[chunk[0].x, chunk[0].y, z1], [chunk[1].x, chunk[1].y, z1], [chunk[2].x, chunk[2].y, z1]])?;
                 add_tri_face(s, "3D_SLABS", [[chunk[0].x, chunk[0].y, z0], [chunk[2].x, chunk[2].y, z0], [chunk[1].x, chunk[1].y, z0]])?;
                 slab_faces += 2;
