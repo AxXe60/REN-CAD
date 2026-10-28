@@ -257,8 +257,29 @@ impl Body {
     }
 }
 
-/// The face heights, ascending: the Z histogram, the candidate cut, the runs merged, the means.
+/// The face heights, ascending: the Z histogram, humps with prominence, the means.
+///
+/// A section scan of a real apartment changed the shape of the problem: between the floor and
+/// the ceiling the walls fill bin after bin at 45–70 % of the ceiling's own tallest bin, so a
+/// global cut over the histogram has no band to bite — every cut that keeps the surfaces also
+/// keeps the wall plateau, and the cut-relative runs that used to find the faces then read the
+/// plateau as faces (the room shrank to the sliver between a face at head height and a face at
+/// waist height, and the openings stage found nothing in it). So the faces are not cuts, they
+/// are *humps*: a bin at or above the `slab_ratio` gate that also tops its own short
+/// neighbourhood (a real plane tops its 10 cm, the wall plateau's small wiggles do not), and
+/// whose topographic prominence — how far it stands above the deep valley that separates it
+/// from the nearest higher bin, per side, the standard A-min-both-sides reading — clears
+/// [`FACE_PROMINENCE`] of the tallest bin. Two kept peaks closer than [`FACE_SEPARATION`] bins
+/// are one surface seen twice and merge into the taller of the two. A face's mean Z is the mean
+/// over the peak's flank (the adjacent bins above [`FACE_FLANK`] of the peak itself, so a rough
+/// plane is still one mean and the walls' plateau is not read into it). All of this is linear in
+/// the bins per kept peak, and bounded by the same bin budget the histogram itself enforces.
 fn faces(points: &[[f64; 3]], tuning: &Tuning) -> Result<Vec<f64>, BimError> {
+    const FACE_LOCAL_HALF: usize = 2;
+    const FACE_PROMINENCE: f64 = 0.15;
+    const FACE_FLANK: f64 = 0.75;
+    const FACE_SEPARATION: usize = 3;
+
     let step = tuning.z_step;
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     let mut counted = 0usize;
@@ -307,37 +328,105 @@ fn faces(points: &[[f64; 3]], tuning: &Tuning) -> Result<Vec<f64>, BimError> {
         return Err(BimError::Empty);
     }
     let cut = f64::from(tallest) * tuning.slab_ratio;
-    // A real plane is a hump, not a plateau: scan noise spreads the floor of a 41.7-million-point
-    // building over a decimetre, and the tallest bin belongs to another surface (the ceiling), so
-    // the 50 % cut can fall through one trough inside the hump. Applied bin by bin it splits that
-    // floor into two faces, the upper half pairs with the ceiling and the stage reports a slab
-    // metres thick instead of the room it stands in. So a lone bin below the cut that still holds
-    // points, with a candidate on each side, is the flank of the same surface and joins the run.
-    // Both neighbours are what keeps two real faces apart: a gap of one *empty* bin, or of two
-    // bins at all, still ends the run, so a 15 cm slab is still two faces.
-    let over_cut = |i: usize| hist.get(i).copied().is_some_and(|c| c > 0 && f64::from(c) >= cut);
-    let mut in_run = vec![false; bins];
-    for i in 0..bins {
-        let bridge = i > 0 && i + 1 < bins && over_cut(i - 1) && over_cut(i + 1) && hist.get(i).copied().is_some_and(|c| c > 0);
-        if let Some(slot) = in_run.get_mut(i) {
-            *slot = over_cut(i) || bridge;
-        }
-    }
-    let mut out: Vec<f64> = Vec::new();
-    let mut run = None;
-    let mut last = 0usize;
-    for i in 0..bins {
-        if in_run.get(i).copied().unwrap_or(false) {
-            if run.is_none() {
-                run = Some(i);
+    // A candidate tops its own short neighbourhood: every bin within FACE_LOCAL_HALF on both
+    // sides is at or below it. Ties inside the window are fine — the separation pass below
+    // merges the two halves of one rough plane again — but an hump crowned by a higher bin one
+    // step to the side is not a face, it is the flank of that higher one.
+    let local_max = |i: usize| {
+        let own = hist.get(i).copied().unwrap_or(0);
+        own > 0 && !(0..bins).filter(|j| *j + FACE_LOCAL_HALF >= i && *j <= i + FACE_LOCAL_HALF).any(|j| hist.get(j).copied().unwrap_or(0) > own)
+    };
+    // Topographic prominence, one two-pointer walk per side: the peak's own height less the
+    // lowest bin between it and the nearest bin at least its height (a histogram edge on a side
+    // is the sea, and a sea on both sides leaves the peak's own height as its prominence — a
+    // single-point cloud is one face). The walk over one side is bounded by the bins the
+    // histogram already bounds, so a hostile cloud cannot run this past O(bins).
+    let prominence = |i: usize, own: u32| -> f64 {
+        let mut valley = u32::MAX;
+        let mut bounded = false;
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            let h = hist.get(j).copied().unwrap_or(0);
+            if h >= own {
+                bounded = true;
+                break;
             }
-            last = i;
-        } else if let Some(from) = run.take() {
-            push_face(&mut out, &hist, &zsum, from, last, lo, step);
+            if valley > h {
+                valley = h;
+            }
+        }
+        let left = bounded.then(|| f64::from(own.saturating_sub(valley)));
+        valley = u32::MAX;
+        bounded = false;
+        j = i;
+        while j + 1 < bins {
+            j += 1;
+            let h = hist.get(j).copied().unwrap_or(0);
+            if h >= own {
+                bounded = true;
+                break;
+            }
+            if valley > h {
+                valley = h;
+            }
+        }
+        // A side that stops at a higher bin without walking any valley first is a shoulder of
+        // that higher bin, not an independent face — its prominence is zero, and
+        // `saturating_sub` of the empty `u32::MAX` valley says exactly that.
+        let right = bounded.then(|| f64::from(own.saturating_sub(valley)));
+        match (left, right) {
+            (Some(l), Some(r)) => l.min(r),
+            (Some(v), None) | (None, Some(v)) => v,
+            (None, None) => f64::from(own),
+        }
+    };
+    let mut peaks: Vec<(usize, u32)> = Vec::new();
+    for i in 0..bins {
+        let Some(count) = hist.get(i).copied() else {
+            continue;
+        };
+        if f64::from(count) < cut || !local_max(i) || prominence(i, count) < FACE_PROMINENCE * f64::from(tallest) {
+            continue;
+        }
+        peaks.push((i, count));
+    }
+    // Two peaks a step apart are one plane whose points split across two bins; keep the taller
+    // of every such pair (ties keep the first, so a merged pair is deterministic).
+    let mut kept: Vec<(usize, u32)> = Vec::new();
+    for (i, count) in peaks {
+        match kept.last_mut() {
+            Some((prev, prev_count)) if i < *prev + FACE_SEPARATION => {
+                if count > *prev_count {
+                    *prev = i;
+                    *prev_count = count;
+                }
+            }
+            _ => kept.push((i, count)),
         }
     }
-    if let Some(from) = run.take() {
-        push_face(&mut out, &hist, &zsum, from, last, lo, step);
+    // The mean Z per face runs over the peak's flank: the adjacent bins at or above FACE_FLANK of
+    // the peak itself, so a plane scanned across two bins is still one mean and its floor does
+    // not drift toward the walls' plateau, which sits below the flank cut. The zone stops at the
+    // bins the histogram bounds and never climbs over a neighbouring kept peak.
+    let mut out: Vec<f64> = Vec::new();
+    for (k, (peak_bin, count)) in kept.iter().enumerate() {
+        let flank = FACE_FLANK * f64::from(*count);
+        let mut zone_lo = *peak_bin;
+        while zone_lo > 0 && f64::from(hist.get(zone_lo - 1).copied().unwrap_or(0)) >= flank {
+            zone_lo -= 1;
+        }
+        let mut zone_hi = *peak_bin;
+        while zone_hi + 1 < bins && f64::from(hist.get(zone_hi + 1).copied().unwrap_or(0)) >= flank {
+            zone_hi += 1;
+        }
+        if k > 0 {
+            zone_lo = zone_lo.max(kept[k - 1].0 + 1);
+        }
+        if k + 1 < kept.len() {
+            zone_hi = zone_hi.min(kept[k + 1].0.saturating_sub(1));
+        }
+        push_face(&mut out, &hist, &zsum, zone_lo, zone_hi, lo, step);
     }
     if out.is_empty() {
         return Err(BimError::Empty);
@@ -1021,7 +1110,12 @@ mod tests {
         assert!((floor.thickness - 0.20).abs() < 1e-9, "a found floor takes the named single-sided thickness");
         let ceiling = &slabs[1];
         assert!(ceiling.single_sided, "the ceiling's partner must not be the floor's upper half");
-        assert!((ceiling.base_z - 3.5729).abs() < 0.001, "the ceiling stands at the mean of its own five bins: {}", ceiling.base_z);
+        assert!(
+            (ceiling.base_z - 3.5718).abs() < 0.005,
+            "the ceiling stands at the mean of its own flank — the bins the peak's own 75 % cut \
+             keeps, here four of the five the old run held — got {}",
+            ceiling.base_z
+        );
         assert!((ceiling.thickness - 0.20).abs() < 1e-9, "the body is the named thickness, not the 2.4 m gap the split floor used to measure");
         let storeys = crate::bim::storeys::split(&slabs, &BimOptions::default());
         assert_eq!(storeys.len(), 1, "the room between the floor and the ceiling exists");
@@ -1041,6 +1135,90 @@ mod tests {
                 // A 6 x 4 m footprint on the 5 cm lattice, so the plan stage grids a real room.
                 pts.push([(k % 121) as f64 * 0.05, ((k / 121) % 81) as f64 * 0.05, z]);
             }
+        }
+        pts
+    }
+
+    #[test]
+    fn a_wall_plateau_between_floor_and_ceiling_yields_the_room_and_no_phantom_faces() {
+        // The Ap 11 section scan's shape, the one the run-based detector was lost in: between the
+        // floor and the ceiling the walls hold 35 bins at 40–70 % of the ceiling's own tallest
+        // bin, and the wiggles on that plateau top their own 10 cm just as a real plane does. The
+        // old cut-relative runs read two phantom faces out of the plateau — a face at head height
+        // and one at waist height — so the room shrank to the sliver between them and the
+        // openings stage found nothing in a 0.5 m "storey". With the faces read as humps of
+        // prominence, there is exactly one floor and one ceiling and a room-high storey between
+        // them.
+        //
+        // The fixture's own z lattice is the 6.25 cm power of two below: `(z - lo) / 0.05` cannot
+        // floor one bin below its own, so the histogram this test calibrates against is the one
+        // the points say they sit on, bin for bin — the 5 cm decimal lattice is not exact in
+        // `f64` and its boundary rounds one bin down.
+        let opts = BimOptions { z_step: 0.0625, ..BimOptions::default() };
+        let pts = furnished_apartment_section_scan();
+        let slabs = find(&pts, &opts).expect("the scan has slabs");
+        assert_eq!(slabs.len(), 2, "one floor face and one ceiling face, the wiggles stay walls: {slabs:?}");
+        let floor = &slabs[0];
+        assert!(floor.single_sided, "the floor stands alone under the room");
+        assert!(
+            (floor.top_z - 0.5859).abs() < 0.005,
+            "the floor's face is its hump's flank mean — bins 6..12 at and above 75 % of the peak — got {}",
+            floor.top_z
+        );
+        let ceiling = &slabs[1];
+        assert!(ceiling.single_sided, "the ceiling stands alone over the room");
+        assert!((ceiling.base_z - 3.4388).abs() < 0.005, "the ceiling's face is its own flank mean, got {}", ceiling.base_z);
+        let storeys = crate::bim::storeys::split(&slabs, &opts);
+        assert_eq!(storeys.len(), 1, "the room between them exists");
+        let height = storeys[0].top_z - storeys[0].base_z;
+        assert!(height > 2.0 && height < 3.0, "a floor-to-ceiling room, not the 0.5 m sliver the old runs shrank it to: {height}");
+    }
+
+    /// The Ap 11 scan's vertical histogram, one wiggly wall plateau and two real humps. Every bin
+    /// spans the test's 6.25 cm `z_step`; the floor's and the ceiling's bins carry an even
+    /// footprint over a 2400-cell lattice so the plan stage can grid them, the plateau bins carry
+    /// a single point each.
+    fn furnished_apartment_section_scan() -> Vec<[f64; 3]> {
+        const CELLS: usize = 2400;
+        let mut pts = Vec::new();
+        let floor = [
+            (0u32, 176u64),
+            (1, 180),
+            (2, 269),
+            (3, 317),
+            (4, 402),
+            (5, 422),
+            (6, 601),
+            (7, 621),
+            (8, 692),
+            (9, 581),
+            (10, 568),
+            (11, 547),
+            (12, 519),
+            (13, 436),
+            (14, 424),
+            (15, 454),
+        ];
+        let plateau: [u64; 35] = [
+            437, 421, 407, 396, 429, 413, 447, 421, 407, 429, 441, 396, 421, 407, 429, 413, 441, 421, 407, 429, 441, 413, 421, 396, 429, 413, 407,
+            421, 429, 453, 441, 421, 407, 429, 413,
+        ];
+        let ceiling = [(51u32, 487u64), (52, 604), (53, 587), (54, 673), (55, 700), (56, 665), (57, 583), (58, 489), (59, 435), (60, 385), (61, 172)];
+        let mut bin = |b: u32, count: u64, plan: bool| {
+            let z = (b as f64 + 0.5) * 0.0625;
+            for k in 0..count {
+                let cell = if plan { (k as usize * CELLS) / count as usize } else { (k as usize) % CELLS };
+                pts.push([(cell % 121) as f64 * 0.05, (cell / 121) as f64 * 0.05, z]);
+            }
+        };
+        for (b, c) in floor {
+            bin(b, c, true);
+        }
+        for (k, c) in plateau.iter().enumerate() {
+            bin(16 + k as u32, *c, false);
+        }
+        for (b, c) in ceiling {
+            bin(b, c, true);
         }
         pts
     }
