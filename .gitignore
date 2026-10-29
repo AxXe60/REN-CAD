@@ -23,5 +23,11 @@
 /.aistudio/
 /public/
 /.superpowers/
-/docs/superpowers/
 /.playwright-cli/
+.env
+.env.local
+.env.*.local
+firebase-applet-config.json
+firebase_applet_config.xml
+*.token
+*.key
