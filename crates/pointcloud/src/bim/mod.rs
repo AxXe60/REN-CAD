@@ -7,6 +7,7 @@
 //! The numbers come from the design doc §5: Table 6 of the paper is adopted verbatim, and where
 //! the paper is silent or contradicts itself the choice is ours and is labelled as ours.
 
+pub mod assistive;
 pub mod columns;
 pub mod deviate;
 pub mod dimensions;
@@ -18,6 +19,10 @@ pub mod storeys;
 pub mod walls;
 pub mod zones;
 
+pub use assistive::{
+    AssistiveOperation, CandidateWall, CandidateWallClass, WallJoinKind, enumerate_candidate_walls, order_metric_kendall_tau, plan_natural_sequence,
+    predict_next_walls, synthesize_bim_operations,
+};
 pub use columns::{Column, ColumnShape, detect_columns};
 pub use deviate::{DeviationReport, FurnitureCluster, measure as measure_deviation};
 pub use dimensions::{AutoDimension, generate_dimensions};
