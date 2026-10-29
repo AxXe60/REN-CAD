@@ -21,6 +21,7 @@
 /index.html
 /bun.lock
 /.aistudio/
+/public/
 /.superpowers/
 /docs/superpowers/
 /.playwright-cli/

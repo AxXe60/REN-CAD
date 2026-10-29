@@ -26,10 +26,12 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo(),
         CommandSpec::new("autorlv", "Auto-RLV 2D & Room Schedule from Point Cloud", autorlv)
+            .alias(&["rlv"])
             .menu(&["Tools", "Point Cloud & RLV", "Auto-RLV 2D (Apartment Releveu)"])
             .params("{index?: int, ifc?: string, params?: {cell?, z_step?, slab_ratio?, slice_from?, slice_to?, threshold?, close_radius?, epsilon?, safety_margin?, single_sided_slab_thickness?, min_wall_length?, min_wall_thickness?, max_wall_thickness?, angle_tolerance_deg?, exterior_wall_thickness?, exterior_scan?, zone_gap?, min_zone_area?, opening_cell?, opening_threshold?, opening_rank?, min_opening_width?, max_opening_width?, door_min_height?, door_max_sill?, window_min_sill?, opening_band?, opening_decimate?, max_wall_band_points?, deviation_threshold?, deviation_cell?, min_furniture_points?, max_furniture_clusters?, min_column_size?, max_column_size?, max_column_aspect_ratio?}}")
             .enabled(always),
         CommandSpec::new("auto3d", "Auto-3D Building Structure from Point Cloud", auto3d)
+            .alias(&["scan2bim", "bim"])
             .menu(&["Tools", "Point Cloud & RLV", "Auto-3D Building (Walls, Slabs)"])
             .params("{index?: int, ifc?: string, params?: {cell?, z_step?, slab_ratio?, slice_from?, slice_to?, threshold?, close_radius?, epsilon?, safety_margin?, single_sided_slab_thickness?, min_wall_length?, min_wall_thickness?, max_wall_thickness?, angle_tolerance_deg?, exterior_wall_thickness?, exterior_scan?, zone_gap?, min_zone_area?, opening_cell?, opening_threshold?, opening_rank?, min_opening_width?, max_opening_width?, door_min_height?, door_max_sill?, window_min_sill?, opening_band?, opening_decimate?, max_wall_band_points?, min_column_size?, max_column_size?, max_column_aspect_ratio?}}")
             .enabled(always),
